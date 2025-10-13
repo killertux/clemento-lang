@@ -1,0 +1,6 @@
+def greet (String -> ) { println }
+def dupstring (String -> String String) { dup }
+
+def main {
+    "Hello" dupstring greet greet
+}

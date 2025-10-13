@@ -1,0 +1,28 @@
+import std
+import math as math
+
+def string {
+    type String [char]
+    type StringOrNumber String [char] | Number (i32)
+
+    trait Printable<A> = {
+        toString (A -> String)
+    }
+
+    def toString (String -> String) noop
+}
+
+def greet (string.String -> +IO) {
+    "Hello, " toList push "!" push println
+}
+
+def main {
+    "Bruno" greet
+}
+
+def pow2 (i32 -> i32) {
+    dup math.*
+}
+def pow2 (i64 -> i64) {
+    dup *
+}
