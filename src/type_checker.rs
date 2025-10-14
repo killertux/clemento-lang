@@ -276,6 +276,11 @@ fn infer_type_definition(
             node.position.clone(),
             Type::string(),
         )),
+        AstNodeType::Boolean(bool) => Ok(AstNodeWithType::new(
+            AstNodeType::Boolean(bool),
+            node.position.clone(),
+            Type::boolean(),
+        )),
         AstNodeType::Symbol(symbol) => {
             let type_definition = scope.get_definition(&symbol, &type_stack).ok_or(
                 TypeCheckerError::SymbolNotFound(
@@ -313,6 +318,67 @@ fn infer_type_definition(
                 node.position.clone(),
                 Type::empty(),
             ))
+        }
+        AstNodeType::If(true_body, false_body) => {
+            let type_stack_without_last_element = &type_stack[..type_stack.len() - 1].to_vec();
+            let true_body =
+                infer_type_definition(scope, type_stack_without_last_element.clone(), *true_body)?;
+            if let Some(false_body) = false_body {
+                let false_body = infer_type_definition(
+                    scope,
+                    type_stack_without_last_element.clone(),
+                    *false_body,
+                )?;
+
+                let true_push_types = validate_and_get_push_types(
+                    &type_stack_without_last_element,
+                    true_body.type_definition.clone(),
+                    true_body.position.clone(),
+                )?;
+                let false_push_types = validate_and_get_push_types(
+                    &type_stack_without_last_element,
+                    false_body.type_definition.clone(),
+                    false_body.position.clone(),
+                )?;
+
+                let true_type =
+                    Type::new(true_body.type_definition.pop_types.clone(), true_push_types);
+                let false_type = Type::new(
+                    false_body.type_definition.pop_types.clone(),
+                    false_push_types,
+                );
+
+                if true_type.pop_types.len() != false_type.pop_types.len()
+                    || true_type.push_types != false_type.push_types
+                {
+                    return Err(TypeCheckerError::InvalidIfElseBody(
+                        node.position.clone(),
+                        true_type,
+                        false_type,
+                    ));
+                }
+
+                let mut pop_type = vec![UnitType::Literal(LiteralType::Boolean)];
+                pop_type.extend(true_type.pop_types);
+
+                Ok(AstNodeWithType::new(
+                    AstNodeType::If(Box::new(true_body), Some(Box::new(false_body))),
+                    node.position.clone(),
+                    Type::new(pop_type, true_type.push_types),
+                ))
+            } else {
+                if true_body.type_definition != Type::empty() {
+                    return Err(TypeCheckerError::InvalidIfBody(
+                        node.position.clone(),
+                        true_body.type_definition,
+                    ));
+                }
+                Ok(AstNodeWithType::new(
+                    AstNodeType::If(Box::new(true_body), None),
+                    node.position.clone(),
+                    Type::new(vec![UnitType::Literal(LiteralType::Boolean)], vec![]),
+                ))
+            }
         }
     }?;
     Ok(match node.type_definition.clone() {
@@ -352,6 +418,12 @@ pub enum TypeCheckerError {
     InvalidMainDefinition(Type),
     #[error("Invalid module definition {0}. It should always be (->)")]
     InvalidModuleDefinition(Type),
+    #[error("Invalid if body at {0}. If cannot change the type stack. It tried to change to {1}")]
+    InvalidIfBody(Position, Type),
+    #[error(
+        "Invalid if else body at {0}.If and else bodies need to pop and push the same types. {1} != {2}"
+    )]
+    InvalidIfElseBody(Position, Type, Type),
 }
 
 struct TypeScope<'a> {

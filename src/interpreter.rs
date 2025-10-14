@@ -55,6 +55,7 @@ fn execute_scope(
         match node.node_type {
             AstNodeType::Number(_) => stack.push(try_into_value(&scope, node)?),
             AstNodeType::String(_) => stack.push(try_into_value(&scope, node)?),
+            AstNodeType::Boolean(_) => stack.push(try_into_value(&scope, node)?),
             AstNodeType::Definition(name, body) => {
                 let ty = body.type_definition.clone();
                 scope.add_definition(name, scope.clone(), try_into_value(&scope, *body)?, ty);
@@ -64,6 +65,23 @@ fn execute_scope(
             }
             AstNodeType::Symbol(symbol) => {
                 scope.call_symbol(symbol.as_str(), node.type_definition, node.position, stack)?
+            }
+            AstNodeType::If(true_body, false_body) => {
+                if stack.len() < 1 {
+                    return Err(RuntimeError::StackUnderflow);
+                }
+
+                let Some(Value::Boolean(bool)) = stack.pop() else {
+                    return Err(RuntimeError::Unexpected("Unexpected value type".into()));
+                };
+
+                if bool {
+                    execute_scope(scope.clone(), stack, vec![*true_body].into_iter())?;
+                } else {
+                    if let Some(false_body) = false_body {
+                        execute_scope(scope.clone(), stack, vec![*false_body].into_iter())?;
+                    }
+                }
             }
         }
     }
@@ -79,6 +97,7 @@ fn try_into_value(scope: &Scope, node: AstNodeWithType) -> Result<Value, Runtime
             })?))
         }
         AstNodeType::String(string) => Ok(Value::String(string)),
+        AstNodeType::Boolean(boolean) => Ok(Value::Boolean(boolean)),
         AstNodeType::Block(block) => Ok(Value::Block(block)),
         AstNodeType::Symbol(symbol) => Ok(scope
             .get_symbol(symbol.as_str(), node.type_definition, node.position)?
@@ -235,6 +254,7 @@ pub enum Value {
     IntegerNumber(IntegerNumber),
     FloatNumber(f64),
     String(String),
+    Boolean(bool),
     Block(Vec<AstNodeWithType>),
     InternalFunction(InternalFunction),
 }
@@ -242,7 +262,10 @@ pub enum Value {
 impl Value {
     pub fn execute(self, scope: Scope, stack: &mut Vec<Value>) -> Result<(), RuntimeError> {
         match self {
-            Value::IntegerNumber(_) | Value::FloatNumber(_) | Value::String(_) => stack.push(self),
+            Value::IntegerNumber(_)
+            | Value::FloatNumber(_)
+            | Value::String(_)
+            | Value::Boolean(_) => stack.push(self),
             Value::Block(nodes) => execute_scope(scope, stack, nodes.into_iter())?,
             Value::InternalFunction(function) => {
                 let args = stack.split_off(stack.len() - function.arity);
@@ -263,6 +286,7 @@ impl Debug for Value {
             Value::IntegerNumber(number) => write!(f, "{:?}", number),
             Value::FloatNumber(number) => write!(f, "{}", number),
             Value::String(string) => write!(f, "{}", string),
+            Value::Boolean(boolean) => write!(f, "{}", boolean),
             Value::Block(nodes) => write!(f, "{:?}", nodes),
             Value::InternalFunction(_) => write!(f, "<internal function>"),
         }

@@ -51,9 +51,15 @@ impl<'a> Parser<'a> {
                     position: token.position,
                     type_definition: Some(Type::string()),
                 })),
+                TokenType::Boolean(boolean) => Ok(Some(AstNode {
+                    node_type: AstNodeType::Boolean(boolean),
+                    position: token.position,
+                    type_definition: Some(Type::boolean()),
+                })),
                 TokenType::LeftBrace => self.parse_block(token.position),
                 TokenType::Symbol(symbol) => match symbol.as_str() {
                     "def" => self.parse_definition(token.position),
+                    "if" => self.parse_if(token.position),
                     _ => Ok(Some(AstNode {
                         node_type: AstNodeType::Symbol(symbol),
                         position: token.position,
@@ -168,6 +174,29 @@ impl<'a> Parser<'a> {
             type_definition: Some(Type::new(pop_types, push_types)),
         }))
     }
+
+    fn parse_if(&mut self, position: Position) -> Result<Option<AstNode>, ParserError> {
+        let true_body = self
+            .parse()?
+            .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
+        let mut false_body = None;
+        if self.tokens.peek().map_or(false, |t| {
+            t.as_ref()
+                .map_or(false, |t| t.token_type == TokenType::Symbol("else".into()))
+        }) {
+            self.parse()?;
+            false_body = Some(Box::new(
+                self.parse()?
+                    .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?,
+            ));
+        }
+
+        Ok(Some(AstNode {
+            node_type: AstNodeType::If(Box::new(true_body), false_body),
+            position,
+            type_definition: None,
+        }))
+    }
 }
 
 fn parse_unit_type(node: AstNode) -> Option<UnitType> {
@@ -185,6 +214,7 @@ fn parse_unit_type(node: AstNode) -> Option<UnitType> {
             "I64" => Some(UnitType::Literal(LiteralType::Number(NumberType::I64))),
             "I128" => Some(UnitType::Literal(LiteralType::Number(NumberType::I128))),
             "F64" => Some(UnitType::Literal(LiteralType::Number(NumberType::F64))),
+            "Boolean" => Some(UnitType::Literal(LiteralType::Boolean)),
             _ => None,
         },
         _ => None,
@@ -195,9 +225,11 @@ fn parse_unit_type(node: AstNode) -> Option<UnitType> {
 pub enum AstNodeType<T> {
     Number(Number),
     String(String),
+    Boolean(bool),
     Symbol(String),
     Definition(String, Box<T>),
     Block(Vec<T>),
+    If(Box<T>, Option<Box<T>>),
 }
 
 impl<T> Display for AstNodeType<T>
@@ -208,8 +240,15 @@ where
         match self {
             AstNodeType::Number(number) => write!(f, "{}", number),
             AstNodeType::String(string) => write!(f, "\"{}\"", string),
+            AstNodeType::Boolean(boolean) => write!(f, "{}", boolean),
             AstNodeType::Symbol(symbol) => write!(f, "{}", symbol),
             AstNodeType::Definition(symbol, body) => write!(f, "def {} {}\n", symbol, body),
+            AstNodeType::If(true_body, Some(false_body)) => {
+                write!(f, "if {} else {}", true_body, false_body)
+            }
+            AstNodeType::If(true_body, None) => {
+                write!(f, "if {}", true_body)
+            }
             AstNodeType::Block(nodes) => write!(
                 f,
                 "{{{}}}",
@@ -247,6 +286,7 @@ pub enum UnitType {
 pub enum LiteralType {
     Number(NumberType),
     String,
+    Boolean,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -293,6 +333,7 @@ impl Display for UnitType {
             UnitType::Literal(LiteralType::Number(NumberType::I128)) => write!(f, "I128"),
             UnitType::Literal(LiteralType::Number(NumberType::F64)) => write!(f, "F64"),
             UnitType::Literal(LiteralType::String) => write!(f, "String"),
+            UnitType::Literal(LiteralType::Boolean) => write!(f, "Boolean"),
             UnitType::Var(VarType { identifier }) => write!(f, "Var {}", identifier),
             UnitType::Type(ty) => {
                 write!(f, "{}", ty)
@@ -389,6 +430,13 @@ impl Type {
         Self {
             pop_types: vec![],
             push_types: vec![UnitType::Literal(LiteralType::String)],
+        }
+    }
+
+    pub fn boolean() -> Self {
+        Self {
+            pop_types: vec![],
+            push_types: vec![UnitType::Literal(LiteralType::Boolean)],
         }
     }
 
@@ -538,6 +586,258 @@ mod tests {
                     position: Position::new(1, 3, None),
                     type_definition: None,
                 }]),
+                position: Position::new(1, 1, None),
+                type_definition: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn test_parse_if_simple() {
+        let input = "if true";
+        let mut parser = Parser::new_from_str(input);
+        assert_eq!(
+            parser.next(),
+            Some(Ok(AstNode {
+                node_type: AstNodeType::If(
+                    Box::new(AstNode {
+                        node_type: AstNodeType::Boolean(true),
+                        position: Position::new(1, 4, None),
+                        type_definition: Some(Type::boolean()),
+                    }),
+                    None
+                ),
+                position: Position::new(1, 1, None),
+                type_definition: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn test_parse_if_with_number() {
+        let input = "if 42";
+        let mut parser = Parser::new_from_str(input);
+        assert_eq!(
+            parser.next(),
+            Some(Ok(AstNode {
+                node_type: AstNodeType::If(
+                    Box::new(AstNode {
+                        node_type: AstNodeType::Number(Number::Integer(IntegerNumber::I64(42))),
+                        position: Position::new(1, 4, None),
+                        type_definition: Some(Type::i64()),
+                    }),
+                    None
+                ),
+                position: Position::new(1, 1, None),
+                type_definition: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn test_parse_if_with_block() {
+        let input = "if { hello world }";
+        let mut parser = Parser::new_from_str(input);
+        assert_eq!(
+            parser.next(),
+            Some(Ok(AstNode {
+                node_type: AstNodeType::If(
+                    Box::new(AstNode {
+                        node_type: AstNodeType::Block(vec![
+                            AstNode {
+                                node_type: AstNodeType::Symbol(String::from("hello")),
+                                position: Position::new(1, 6, None),
+                                type_definition: None,
+                            },
+                            AstNode {
+                                node_type: AstNodeType::Symbol(String::from("world")),
+                                position: Position::new(1, 12, None),
+                                type_definition: None,
+                            }
+                        ]),
+                        position: Position::new(1, 4, None),
+                        type_definition: None,
+                    }),
+                    None
+                ),
+                position: Position::new(1, 1, None),
+                type_definition: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn test_parse_if_else_simple() {
+        let input = "if true else false";
+        let mut parser = Parser::new_from_str(input);
+        assert_eq!(
+            parser.next(),
+            Some(Ok(AstNode {
+                node_type: AstNodeType::If(
+                    Box::new(AstNode {
+                        node_type: AstNodeType::Boolean(true),
+                        position: Position::new(1, 4, None),
+                        type_definition: Some(Type::boolean()),
+                    }),
+                    Some(Box::new(AstNode {
+                        node_type: AstNodeType::Boolean(false),
+                        position: Position::new(1, 14, None),
+                        type_definition: Some(Type::boolean()),
+                    }))
+                ),
+                position: Position::new(1, 1, None),
+                type_definition: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn test_parse_if_else_with_numbers() {
+        let input = "if 1 else 0";
+        let mut parser = Parser::new_from_str(input);
+        assert_eq!(
+            parser.next(),
+            Some(Ok(AstNode {
+                node_type: AstNodeType::If(
+                    Box::new(AstNode {
+                        node_type: AstNodeType::Number(Number::Integer(IntegerNumber::I64(1))),
+                        position: Position::new(1, 4, None),
+                        type_definition: Some(Type::i64()),
+                    }),
+                    Some(Box::new(AstNode {
+                        node_type: AstNodeType::Number(Number::Integer(IntegerNumber::I64(0))),
+                        position: Position::new(1, 11, None),
+                        type_definition: Some(Type::i64()),
+                    }))
+                ),
+                position: Position::new(1, 1, None),
+                type_definition: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn test_parse_if_else_with_blocks() {
+        let input = "if { print \"true\" } else { print \"false\" }";
+        let mut parser = Parser::new_from_str(input);
+        assert_eq!(
+            parser.next(),
+            Some(Ok(AstNode {
+                node_type: AstNodeType::If(
+                    Box::new(AstNode {
+                        node_type: AstNodeType::Block(vec![
+                            AstNode {
+                                node_type: AstNodeType::Symbol(String::from("print")),
+                                position: Position::new(1, 6, None),
+                                type_definition: None,
+                            },
+                            AstNode {
+                                node_type: AstNodeType::String(String::from("true")),
+                                position: Position::new(1, 12, None),
+                                type_definition: Some(Type::string()),
+                            }
+                        ]),
+                        position: Position::new(1, 4, None),
+                        type_definition: None,
+                    }),
+                    Some(Box::new(AstNode {
+                        node_type: AstNodeType::Block(vec![
+                            AstNode {
+                                node_type: AstNodeType::Symbol(String::from("print")),
+                                position: Position::new(1, 28, None),
+                                type_definition: None,
+                            },
+                            AstNode {
+                                node_type: AstNodeType::String(String::from("false")),
+                                position: Position::new(1, 34, None),
+                                type_definition: Some(Type::string()),
+                            }
+                        ]),
+                        position: Position::new(1, 26, None),
+                        type_definition: None,
+                    }))
+                ),
+                position: Position::new(1, 1, None),
+                type_definition: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn test_parse_nested_if() {
+        let input = "if if true else false else false";
+        let mut parser = Parser::new_from_str(input);
+        assert_eq!(
+            parser.next(),
+            Some(Ok(AstNode {
+                node_type: AstNodeType::If(
+                    Box::new(AstNode {
+                        node_type: AstNodeType::If(
+                            Box::new(AstNode {
+                                node_type: AstNodeType::Boolean(true),
+                                position: Position::new(1, 7, None),
+                                type_definition: Some(Type::boolean()),
+                            }),
+                            Some(Box::new(AstNode {
+                                node_type: AstNodeType::Boolean(false),
+                                position: Position::new(1, 17, None),
+                                type_definition: Some(Type::boolean()),
+                            }))
+                        ),
+                        position: Position::new(1, 4, None),
+                        type_definition: None,
+                    }),
+                    Some(Box::new(AstNode {
+                        node_type: AstNodeType::Boolean(false),
+                        position: Position::new(1, 28, None),
+                        type_definition: Some(Type::boolean()),
+                    }))
+                ),
+                position: Position::new(1, 1, None),
+                type_definition: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn test_parse_if_incomplete() {
+        let input = "if";
+        let mut parser = Parser::new_from_str(input);
+        assert_eq!(
+            parser.next(),
+            Some(Err(ParserError::UnexpectedEndOfInput(Position::new(
+                1, 1, None
+            ))))
+        );
+    }
+
+    #[test]
+    fn test_parse_if_else_incomplete() {
+        let input = "if true else";
+        let mut parser = Parser::new_from_str(input);
+        assert_eq!(
+            parser.next(),
+            Some(Err(ParserError::UnexpectedEndOfInput(Position::new(
+                1, 1, None
+            ))))
+        );
+    }
+
+    #[test]
+    fn test_parse_if_with_string_body() {
+        let input = "if \"hello\"";
+        let mut parser = Parser::new_from_str(input);
+        assert_eq!(
+            parser.next(),
+            Some(Ok(AstNode {
+                node_type: AstNodeType::If(
+                    Box::new(AstNode {
+                        node_type: AstNodeType::String(String::from("hello")),
+                        position: Position::new(1, 4, None),
+                        type_definition: Some(Type::string()),
+                    }),
+                    None
+                ),
                 position: Position::new(1, 1, None),
                 type_definition: None,
             }))

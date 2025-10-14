@@ -2,5 +2,5 @@ def greet (String I64 -> ) { swap print println}
 def greet (String I32 -> ) { print println }
 
 def main {
-    " The answer for the meaning of life is " dup 40i32 2i32 + greet 40 2 + greet
+    true if "True" else "False" println
 }
