@@ -2,6 +2,7 @@ use std::{path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand};
 
+mod internal_functions;
 mod interpreter;
 mod lexer;
 mod parser;
@@ -36,7 +37,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
             .map_err(|err| err.to_string())?
             .into()),
         Commands::TypePrinter { path } => {
-            type_printer::print_type(path)?;
+            type_printer::print_type(path).map_err(|err| err.to_string())?;
             Ok(0.into())
         }
     }
