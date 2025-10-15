@@ -181,9 +181,9 @@ impl<'a> Parser<'a> {
             .parse()?
             .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
         let mut false_body = None;
-        if self.tokens.peek().map_or(false, |t| {
+        if self.tokens.peek().is_some_and(|t| {
             t.as_ref()
-                .map_or(false, |t| t.token_type == TokenType::Symbol("else".into()))
+                .is_ok_and(|t| t.token_type == TokenType::Symbol("else".into()))
         }) {
             self.parse()?;
             false_body = Some(Box::new(
@@ -243,7 +243,7 @@ where
             AstNodeType::String(string) => write!(f, "\"{}\"", string),
             AstNodeType::Boolean(boolean) => write!(f, "{}", boolean),
             AstNodeType::Symbol(symbol) => write!(f, "{}", symbol),
-            AstNodeType::Definition(symbol, body) => write!(f, "def {} {}\n", symbol, body),
+            AstNodeType::Definition(symbol, body) => writeln!(f, "def {} {}", symbol, body),
             AstNodeType::If(true_body, Some(false_body)) => {
                 write!(f, "if {} else {}", true_body, false_body)
             }

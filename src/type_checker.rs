@@ -38,21 +38,23 @@ impl AstNodeWithType {
     }
 }
 
-pub fn type_check<'a>(
+pub fn type_check(
     program: AstNode,
     check_for_main: bool,
 ) -> Result<AstNodeWithType, TypeCheckerError> {
     let scope = TypeScope::root();
     let AstNodeType::Block(nodes) = program.node_type else {
-        return Err(TypeCheckerError::InvalidModuleDefinition(Type::empty()));
+        return Err(TypeCheckerError::InvalidModuleDefinition(Box::new(
+            Type::empty(),
+        )));
     };
 
     let (block_type_check_result, nodes_with_types) =
         type_check_block(&scope, Vec::new(), nodes, check_for_main)?;
     if block_type_check_result != Type::empty() {
-        return Err(TypeCheckerError::InvalidModuleDefinition(
+        return Err(TypeCheckerError::InvalidModuleDefinition(Box::new(
             block_type_check_result,
-        ));
+        )));
     }
     Ok(AstNodeWithType::new(
         AstNodeType::Block(nodes_with_types),
@@ -61,7 +63,7 @@ pub fn type_check<'a>(
     ))
 }
 
-fn type_check_block<'a>(
+fn type_check_block(
     scope: &TypeScope,
     mut type_stack: Vec<UnitType>,
     program: Vec<AstNode>,
@@ -77,12 +79,12 @@ fn type_check_block<'a>(
         let pop_size = type_definition.pop_types.len();
         if pop_size > type_stack.len() {
             let new_types = &type_definition.pop_types[0..(pop_size - type_stack.len())];
-            type_stack = vec![new_types.to_vec(), type_stack.clone()].concat();
+            type_stack = [new_types.to_vec(), type_stack.clone()].concat();
         }
         if pop_size > local_stack.len() {
             let new_types = &type_definition.pop_types[0..(pop_size - local_stack.len())];
-            pop_type_stack = vec![new_types.to_vec(), pop_type_stack.clone()].concat();
-            local_stack = vec![new_types.to_vec(), local_stack.clone()].concat();
+            pop_type_stack = [new_types.to_vec(), pop_type_stack.clone()].concat();
+            local_stack = [new_types.to_vec(), local_stack.clone()].concat();
         }
         let push_types = validate_and_get_push_types(
             &type_stack,
@@ -96,21 +98,16 @@ fn type_check_block<'a>(
         node_results.push(node);
     }
 
-    if check_for_main {
-        match scope.get_definition("main", &[]) {
-            Some(main) => {
-                let valid_main_definitions = vec![
-                    Type::new(vec![], vec![]),
-                    Type::new(
-                        vec![],
-                        vec![UnitType::Literal(LiteralType::Number(NumberType::U8))],
-                    ),
-                ];
-                if !valid_main_definitions.contains(&main) {
-                    return Err(TypeCheckerError::InvalidMainDefinition(main));
-                }
-            }
-            None => {}
+    if check_for_main && let Some(main) = scope.get_definition("main", &[]) {
+        let valid_main_definitions = [
+            Type::new(vec![], vec![]),
+            Type::new(
+                vec![],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::U8))],
+            ),
+        ];
+        if !valid_main_definitions.contains(&main) {
+            return Err(TypeCheckerError::InvalidMainDefinition(Box::new(main)));
         }
     }
     let block_type = Type::new(pop_type_stack, local_stack);
@@ -125,7 +122,7 @@ fn validate_and_get_push_types(
     let variable_substitution =
         validate_type_against_type_stack(type_stack, &type_definition, position)?;
 
-    return Ok(type_definition
+    Ok(type_definition
         .push_types
         .into_iter()
         .map(|ty| match ty {
@@ -135,7 +132,7 @@ fn validate_and_get_push_types(
                 .unwrap_or(UnitType::Var(var)),
             other => other,
         })
-        .collect());
+        .collect())
 }
 
 fn substitute_types(
@@ -146,7 +143,7 @@ fn substitute_types(
     let variable_substitution =
         validate_type_against_type_stack(type_stack, &type_definition, position)?;
 
-    return Ok(Type::new(
+    Ok(Type::new(
         type_definition
             .pop_types
             .into_iter()
@@ -169,7 +166,7 @@ fn substitute_types(
                 other => other,
             })
             .collect(),
-    ));
+    ))
 }
 
 pub fn validate_type_against_type_stack(
@@ -192,8 +189,8 @@ pub fn validate_type_against_type_stack(
                 {
                     return Err(TypeCheckerError::TypeConflict(
                         position,
-                        existent,
-                        UnitType::Literal(lit.clone()),
+                        Box::new(existent),
+                        Box::new(UnitType::Literal(lit.clone())),
                     ));
                 }
             }
@@ -201,8 +198,8 @@ pub fn validate_type_against_type_stack(
                 if ty1 != ty2 {
                     return Err(TypeCheckerError::TypeConflict(
                         position,
-                        UnitType::Type(ty1.clone()),
-                        UnitType::Type(ty2.clone()),
+                        Box::new(UnitType::Type(ty1.clone())),
+                        Box::new(UnitType::Type(ty2.clone())),
                     ));
                 }
             }
@@ -214,8 +211,8 @@ pub fn validate_type_against_type_stack(
                 {
                     return Err(TypeCheckerError::TypeConflict(
                         position,
-                        existent,
-                        UnitType::Type(ty.clone()),
+                        Box::new(existent),
+                        Box::new(UnitType::Type(ty.clone())),
                     ));
                 }
             }
@@ -227,16 +224,16 @@ pub fn validate_type_against_type_stack(
                 {
                     return Err(TypeCheckerError::TypeConflict(
                         position,
-                        existent,
-                        UnitType::Var(var2.clone()),
+                        Box::new(existent),
+                        Box::new(UnitType::Var(var2.clone())),
                     ));
                 }
             }
             (other1, other2) => {
                 return Err(TypeCheckerError::TypeConflict(
                     position,
-                    other1.clone(),
-                    other2.clone(),
+                    Box::new(other1.clone()),
+                    Box::new(other2.clone()),
                 ));
             }
         }
@@ -376,7 +373,7 @@ fn infer_type_definition(
             let mut true_body =
                 infer_type_definition(scope, type_stack_without_last_element.clone(), *true_body)?;
             true_body.type_definition = substitute_types(
-                &type_stack_without_last_element,
+                type_stack_without_last_element,
                 true_body.type_definition,
                 node.position.clone(),
             )?;
@@ -387,18 +384,18 @@ fn infer_type_definition(
                     *false_body,
                 )?;
                 false_body.type_definition = substitute_types(
-                    &type_stack_without_last_element,
+                    type_stack_without_last_element,
                     false_body.type_definition,
                     node.position.clone(),
                 )?;
 
                 let true_push_types = validate_and_get_push_types(
-                    &type_stack_without_last_element,
+                    type_stack_without_last_element,
                     true_body.type_definition.clone(),
                     true_body.position.clone(),
                 )?;
                 let false_push_types = validate_and_get_push_types(
-                    &type_stack_without_last_element,
+                    type_stack_without_last_element,
                     false_body.type_definition.clone(),
                     false_body.position.clone(),
                 )?;
@@ -415,8 +412,8 @@ fn infer_type_definition(
                 {
                     return Err(TypeCheckerError::InvalidIfElseBody(
                         node.position.clone(),
-                        true_type,
-                        false_type,
+                        Box::new(true_type),
+                        Box::new(false_type),
                     ));
                 }
 
@@ -440,7 +437,7 @@ fn infer_type_definition(
                 {
                     return Err(TypeCheckerError::InvalidIfBody(
                         node.position.clone(),
-                        true_body.type_definition,
+                        Box::new(true_body.type_definition),
                     ));
                 }
                 let mut pop_types = true_body.type_definition.pop_types.clone();
@@ -466,11 +463,11 @@ fn infer_type_definition(
             {
                 return Err(TypeCheckerError::TypeConflict(
                     node.position.clone(),
-                    UnitType::Type(ty.clone()),
-                    UnitType::Type(Type::new(
+                    Box::new(UnitType::Type(ty.clone())),
+                    Box::new(UnitType::Type(Type::new(
                         ty.pop_types,
                         inferred_type.type_definition.push_types,
-                    )),
+                    ))),
                 ));
             }
             AstNodeWithType::new(inferred_type.node_type, node.position, ty)
@@ -482,21 +479,21 @@ fn infer_type_definition(
 #[derive(Debug, Error)]
 pub enum TypeCheckerError {
     #[error("Type conflict at {0}: expected {1}, got {2}")]
-    TypeConflict(Position, UnitType, UnitType),
+    TypeConflict(Position, Box<UnitType>, Box<UnitType>),
     #[error(
         "Symbol {0} not found at {1} with type stack {2}. Maybe it is defined after the current position"
     )]
     SymbolNotFound(String, Position, String),
     #[error("Invalid main definition {0}")]
-    InvalidMainDefinition(Type),
+    InvalidMainDefinition(Box<Type>),
     #[error("Invalid module definition {0}. It should always be (->)")]
-    InvalidModuleDefinition(Type),
+    InvalidModuleDefinition(Box<Type>),
     #[error("Invalid if body at {0}. If cannot change the type stack. It tried to change to {1}")]
-    InvalidIfBody(Position, Type),
+    InvalidIfBody(Position, Box<Type>),
     #[error(
         "Invalid if else body at {0}.If and else bodies need to pop and push the same types. {1} != {2}"
     )]
-    InvalidIfElseBody(Position, Type, Type),
+    InvalidIfElseBody(Position, Box<Type>, Box<Type>),
 }
 
 struct TypeScope<'a> {
@@ -551,7 +548,7 @@ impl<'a> TypeScope<'a> {
         if let Some(parent) = &self.parent {
             return parent.get_definition(symbol, stack);
         }
-        return None;
+        None
     }
 }
 

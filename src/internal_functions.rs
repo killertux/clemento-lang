@@ -6,12 +6,14 @@ use crate::{
     parser::{LiteralType, NumberType, Type, UnitType, VarType},
 };
 
+type Function = Rc<Box<dyn Fn(Vec<Value>) -> Result<Vec<Value>, RuntimeError>>>;
+
 #[derive(Clone)]
 pub struct InternalFunction {
     pub arity: usize,
     pub name: String,
     pub ty: Type,
-    pub function: Rc<Box<dyn Fn(Vec<Value>) -> Result<Vec<Value>, RuntimeError>>>,
+    pub function: Function,
 }
 
 pub fn builtins_functions() -> Vec<InternalFunction> {
@@ -612,11 +614,7 @@ pub fn builtins_functions() -> Vec<InternalFunction> {
     .concat()
 }
 
-fn pop1_push0(
-    types: &[UnitType],
-    name: String,
-    function: Rc<Box<dyn Fn(Vec<Value>) -> Result<Vec<Value>, RuntimeError>>>,
-) -> Vec<InternalFunction> {
+fn pop1_push0(types: &[UnitType], name: String, function: Function) -> Vec<InternalFunction> {
     let mut result = Vec::new();
     for ty in types {
         result.push(InternalFunction {
@@ -633,7 +631,7 @@ fn pop2_push1(
     pop_types: &[UnitType],
     push_type: Option<UnitType>,
     name: String,
-    function: Rc<Box<dyn Fn(Vec<Value>) -> Result<Vec<Value>, RuntimeError>>>,
+    function: Function,
 ) -> Vec<InternalFunction> {
     let mut result = Vec::new();
     for ty in pop_types {

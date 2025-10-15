@@ -138,16 +138,14 @@ impl<'a> Lexer<'a> {
             Some('}') => Ok(Some(self.create_token_here(TokenType::RightBrace))),
             Some('[') => Ok(Some(self.create_token_here(TokenType::LeftBracket))),
             Some(']') => Ok(Some(self.create_token_here(TokenType::RightBracket))),
-            Some('/') if self.input.peek().map_or(false, |c| *c == '/') => {
+            Some('/') if self.input.peek().is_some_and(|c| *c == '/') => {
                 self.lex_single_line_comment()
             }
-            Some('/') if self.input.peek().map_or(false, |c| *c == '*') => {
+            Some('/') if self.input.peek().is_some_and(|c| *c == '*') => {
                 self.lex_multi_line_comment()
             }
-            Some('-') if self.input.peek().map_or(false, |c| c.is_numeric()) => {
-                self.lex_number('-')
-            }
-            Some('-') if self.input.peek().map_or(false, |c| *c == '>') => {
+            Some('-') if self.input.peek().is_some_and(|c| c.is_numeric()) => self.lex_number('-'),
+            Some('-') if self.input.peek().is_some_and(|c| *c == '>') => {
                 let position = Position::new(self.line, self.column, self.path.clone());
                 assert!(self.advance() == Some('>'), "We checked for a '>' before");
                 Ok(Some(Token {
@@ -310,7 +308,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn lex_single_line_comment(&mut self) -> Result<Option<Token>, LexerError> {
-        while self.input.peek().map_or(false, |c| *c != '\n') {
+        while self.input.peek().is_some_and(|c| *c != '\n') {
             self.advance();
         }
         self.lex()
@@ -319,7 +317,7 @@ impl<'a> Lexer<'a> {
     fn lex_multi_line_comment(&mut self) -> Result<Option<Token>, LexerError> {
         self.advance();
         while let Some(c) = self.advance() {
-            if c == '*' && self.input.peek().map_or(false, |c| *c == '/') {
+            if c == '*' && self.input.peek().is_some_and(|c| *c == '/') {
                 break;
             }
         }
