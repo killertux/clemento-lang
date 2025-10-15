@@ -1,0 +1,23 @@
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        BUILD_TARGET: [dev]
+    outputs:
+      release_built: ${{ steps.set-output.outputs.release_built }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run tests in "${{ matrix.BUILD_TARGET }}" mode
+        run: cargo test --profile ${{ matrix.BUILD_TARGET }}
+      - name: Validate examples in "${{ matrix.BUILD_TARGET }}" mode
+        run: ./examples/test_all_examples.sh
+      - name: Run fmt in "${{ matrix.BUILD_TARGET }}" mode
+        run: cargo fmt --all  -- --check
+      - name: Run clippy in "${{ matrix.BUILD_TARGET }}" mode
+        run: cargo clippy --profile ${{ matrix.BUILD_TARGET }} -- -D warnings
