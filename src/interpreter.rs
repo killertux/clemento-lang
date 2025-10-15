@@ -35,7 +35,7 @@ pub fn interpret(file: impl AsRef<Path>) -> Result<u8, RuntimeError> {
     if scope.has_main() {
         scope.call_main(&mut stack)?;
     }
-    if stack.len() != 0 {
+    if !stack.is_empty() {
         return match stack[0] {
             Value::IntegerNumber(IntegerNumber::U8(number)) => Ok(number),
             _ => Err(RuntimeError::Unexpected(
@@ -67,7 +67,7 @@ fn execute_scope(
                 scope.call_symbol(symbol.as_str(), node.type_definition, node.position, stack)?
             }
             AstNodeType::If(true_body, false_body) => {
-                if stack.len() < 1 {
+                if stack.is_empty() {
                     return Err(RuntimeError::StackUnderflow);
                 }
 
@@ -77,10 +77,8 @@ fn execute_scope(
 
                 if bool {
                     execute_scope(scope.clone(), stack, vec![*true_body].into_iter())?;
-                } else {
-                    if let Some(false_body) = false_body {
-                        execute_scope(scope.clone(), stack, vec![*false_body].into_iter())?;
-                    }
+                } else if let Some(false_body) = false_body {
+                    execute_scope(scope.clone(), stack, vec![*false_body].into_iter())?;
                 }
             }
         }
@@ -230,12 +228,12 @@ fn match_types(left: &[UnitType], right: &[UnitType]) -> bool {
         return false;
     }
     let mut var_type_map: HashMap<VarType, UnitType> = HashMap::new();
-    for (left, right) in left.into_iter().zip(right.into_iter()) {
+    for (left, right) in left.iter().zip(right.iter()) {
         let match_ty = match (left, right) {
             (UnitType::Literal(a), UnitType::Literal(b)) => a == b,
             (UnitType::Var(a), UnitType::Var(b)) => var_type_map
                 .insert(a.clone(), UnitType::Var(b.clone()))
-                .map_or(true, |previous| previous == UnitType::Var(b.clone())),
+                .is_none_or(|previous| previous == UnitType::Var(b.clone())),
             (type_left, UnitType::Var(a)) => {
                 let previous = var_type_map.insert(a.clone(), type_left.clone());
                 previous.map(|p| p == *type_left).unwrap_or(true)
