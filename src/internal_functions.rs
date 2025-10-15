@@ -279,6 +279,60 @@ pub fn builtins_functions() -> Vec<InternalFunction> {
         pop2_push1(
             &all_number_types,
             None,
+            "*".into(),
+            Rc::new(Box::new(|args: Vec<Value>| match (&args[0], &args[1]) {
+                (
+                    Value::IntegerNumber(IntegerNumber::U8(n1)),
+                    Value::IntegerNumber(IntegerNumber::U8(n2)),
+                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::U8(n1 * n2))]),
+                (
+                    Value::IntegerNumber(IntegerNumber::U16(n1)),
+                    Value::IntegerNumber(IntegerNumber::U16(n2)),
+                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::U16(n1 * n2))]),
+                (
+                    Value::IntegerNumber(IntegerNumber::U32(n1)),
+                    Value::IntegerNumber(IntegerNumber::U32(n2)),
+                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::U32(n1 * n2))]),
+                (
+                    Value::IntegerNumber(IntegerNumber::U64(n1)),
+                    Value::IntegerNumber(IntegerNumber::U64(n2)),
+                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::U64(n1 * n2))]),
+                (
+                    Value::IntegerNumber(IntegerNumber::U128(n1)),
+                    Value::IntegerNumber(IntegerNumber::U128(n2)),
+                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::U128(n1 * n2))]),
+                (
+                    Value::IntegerNumber(IntegerNumber::I8(n1)),
+                    Value::IntegerNumber(IntegerNumber::I8(n2)),
+                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::I8(n1 * n2))]),
+                (
+                    Value::IntegerNumber(IntegerNumber::I16(n1)),
+                    Value::IntegerNumber(IntegerNumber::I16(n2)),
+                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::I16(n1 * n2))]),
+                (
+                    Value::IntegerNumber(IntegerNumber::I32(n1)),
+                    Value::IntegerNumber(IntegerNumber::I32(n2)),
+                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::I32(n1 * n2))]),
+                (
+                    Value::IntegerNumber(IntegerNumber::I64(n1)),
+                    Value::IntegerNumber(IntegerNumber::I64(n2)),
+                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::I64(n1 * n2))]),
+                (
+                    Value::IntegerNumber(IntegerNumber::I128(n1)),
+                    Value::IntegerNumber(IntegerNumber::I128(n2)),
+                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::I128(n1 * n2))]),
+                (Value::FloatNumber(n1), Value::FloatNumber(n2)) => {
+                    Ok(vec![Value::FloatNumber(n1 * n2)])
+                }
+                (other1, other2) => Err(RuntimeError::Unexpected(format!(
+                    "Unexpected types used in + function. {:?} {:?}",
+                    other1, other2
+                ))),
+            })),
+        ),
+        pop2_push1(
+            &all_number_types,
+            None,
             "%".into(),
             Rc::new(Box::new(|args: Vec<Value>| match (&args[0], &args[1]) {
                 (

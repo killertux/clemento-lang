@@ -2,9 +2,9 @@ def fizz_buzz (I64 ->) {
     dup 3 % 0 = if { "Fizz" print }
     dup 5 % 0 = if { "Buzz" print }
     dup 3 % 0 != swap dup 5 % 0 != rot && if { dup print }
-    1 + dup 20 > if { "Done" println } else { "" println fizz_buzz }
+    1 + dup 30 > if { drop "\nDone!!" println } else { "\n" print fizz_buzz }
 }
 
 def main {
-    0 fizz_buzz
+    1 fizz_buzz
 }

@@ -138,18 +138,53 @@ fn validate_and_get_push_types(
         .collect());
 }
 
+fn substitute_types(
+    type_stack: &[UnitType],
+    type_definition: Type,
+    position: Position,
+) -> Result<Type, TypeCheckerError> {
+    let variable_substitution =
+        validate_type_against_type_stack(type_stack, &type_definition, position)?;
+
+    return Ok(Type::new(
+        type_definition
+            .pop_types
+            .into_iter()
+            .map(|ty| match ty {
+                UnitType::Var(var) => variable_substitution
+                    .get(&var)
+                    .cloned()
+                    .unwrap_or(UnitType::Var(var)),
+                other => other,
+            })
+            .collect(),
+        type_definition
+            .push_types
+            .into_iter()
+            .map(|ty| match ty {
+                UnitType::Var(var) => variable_substitution
+                    .get(&var)
+                    .cloned()
+                    .unwrap_or(UnitType::Var(var)),
+                other => other,
+            })
+            .collect(),
+    ));
+}
+
 pub fn validate_type_against_type_stack(
     type_stack: &[UnitType],
     type_definition: &Type,
     position: Position,
 ) -> Result<HashMap<VarType, UnitType>, TypeCheckerError> {
     let mut variable_substitution: HashMap<VarType, UnitType> = HashMap::new();
-    let stack_pop_types = &type_stack[(type_stack.len() - type_definition.pop_types.len())..];
-    for (i, ty) in type_definition.pop_types.iter().enumerate() {
-        match (&stack_pop_types[i], ty) {
+    let stack_pop_types = &type_stack[type_stack
+        .len()
+        .saturating_sub(type_definition.pop_types.len())..];
+    for (i, ty) in stack_pop_types.iter().enumerate() {
+        match (ty, &type_definition.pop_types[i]) {
             (UnitType::Literal(lit1), UnitType::Literal(lit2)) if lit1 == lit2 => {}
-            (UnitType::Literal(lit), UnitType::Var(var))
-            /*| (UnitType::Var(var), UnitType::Literal(lit))*/ => {
+            (UnitType::Literal(lit), UnitType::Var(var)) => {
                 let existent =
                     variable_substitution.insert(var.clone(), UnitType::Literal(lit.clone()));
                 if let Some(existent) = existent
@@ -200,8 +235,8 @@ pub fn validate_type_against_type_stack(
             (other1, other2) => {
                 return Err(TypeCheckerError::TypeConflict(
                     position,
-                    other2.clone(),
                     other1.clone(),
+                    other2.clone(),
                 ));
             }
         }
@@ -301,7 +336,7 @@ fn infer_type_definition(
             Ok(AstNodeWithType::new(
                 AstNodeType::Symbol(symbol),
                 node.position.clone(),
-                type_definition,
+                substitute_types(&type_stack, type_definition, node.position.clone())?,
             ))
         }
         AstNodeType::Block(nodes) => {
@@ -309,12 +344,26 @@ fn infer_type_definition(
             Ok(AstNodeWithType::new(
                 AstNodeType::Block(nodes),
                 node.position.clone(),
-                ty,
+                substitute_types(&type_stack, ty, node.position.clone())?,
             ))
         }
         AstNodeType::Definition(symbol, body) => {
-            let body = infer_type_definition(scope, type_stack.clone(), *body)?;
-            scope.insert_definition(symbol.clone(), body.type_definition.clone());
+            let body = if let Some(ty) = body.type_definition.as_ref() {
+                // We use this to allow recursive types. We should probably create a better implementation latter
+                scope.insert_definition(symbol.clone(), ty.clone());
+                let mut body = infer_type_definition(scope, type_stack.clone(), *body)?;
+                let body_type =
+                    substitute_types(&type_stack, body.type_definition, node.position.clone())?;
+                body.type_definition = body_type.clone();
+                body
+            } else {
+                let mut body = infer_type_definition(scope, type_stack.clone(), *body)?;
+                let body_type =
+                    substitute_types(&type_stack, body.type_definition, node.position.clone())?;
+                body.type_definition = body_type.clone();
+                scope.insert_definition(symbol.clone(), body_type.clone());
+                body
+            };
             Ok(AstNodeWithType::new(
                 AstNodeType::Definition(symbol, Box::new(body)),
                 node.position.clone(),
@@ -322,14 +371,25 @@ fn infer_type_definition(
             ))
         }
         AstNodeType::If(true_body, false_body) => {
-            let type_stack_without_last_element = &type_stack[..type_stack.len() - 1].to_vec();
-            let true_body =
+            let type_stack_without_last_element =
+                &type_stack[..type_stack.len().saturating_sub(1)].to_vec();
+            let mut true_body =
                 infer_type_definition(scope, type_stack_without_last_element.clone(), *true_body)?;
+            true_body.type_definition = substitute_types(
+                &type_stack_without_last_element,
+                true_body.type_definition,
+                node.position.clone(),
+            )?;
             if let Some(false_body) = false_body {
-                let false_body = infer_type_definition(
+                let mut false_body = infer_type_definition(
                     scope,
                     type_stack_without_last_element.clone(),
                     *false_body,
+                )?;
+                false_body.type_definition = substitute_types(
+                    &type_stack_without_last_element,
+                    false_body.type_definition,
+                    node.position.clone(),
                 )?;
 
                 let true_push_types = validate_and_get_push_types(
@@ -360,8 +420,8 @@ fn infer_type_definition(
                     ));
                 }
 
-                let mut pop_type = vec![UnitType::Literal(LiteralType::Boolean)];
-                pop_type.extend(true_type.pop_types);
+                let mut pop_type = true_type.pop_types;
+                pop_type.push(UnitType::Literal(LiteralType::Boolean));
 
                 Ok(AstNodeWithType::new(
                     AstNodeType::If(Box::new(true_body), Some(Box::new(false_body))),
@@ -369,16 +429,27 @@ fn infer_type_definition(
                     Type::new(pop_type, true_type.push_types),
                 ))
             } else {
-                if true_body.type_definition != Type::empty() {
+                if true_body.type_definition.pop_types
+                    != true_body
+                        .type_definition
+                        .push_types
+                        .iter()
+                        .rev()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                {
                     return Err(TypeCheckerError::InvalidIfBody(
                         node.position.clone(),
                         true_body.type_definition,
                     ));
                 }
+                let mut pop_types = true_body.type_definition.pop_types.clone();
+                pop_types.push(UnitType::Literal(LiteralType::Boolean));
+                let push_types = true_body.type_definition.push_types.clone();
                 Ok(AstNodeWithType::new(
                     AstNodeType::If(Box::new(true_body), None),
                     node.position.clone(),
-                    Type::new(vec![UnitType::Literal(LiteralType::Boolean)], vec![]),
+                    Type::new(pop_types, push_types),
                 ))
             }
         }
@@ -521,7 +592,7 @@ mod test {
     }"#;
 
         let program = parse_and_type_check(contents, true).unwrap();
-        let expected_output = "( -> ) {( -> ) def greet (String, I64 -> ) {(a, b -> b, a) swap (String -> ) print (I64 -> ) println}\n ( -> ) def greet (String, I32 -> ) {(I32 -> ) print (String -> ) println}\n ( -> ) def main ( -> ) {( -> String) \" The answer for the meaning of life is \" (a -> a, a) dup ( -> I32) 40i32 ( -> I32) 2i32 (I32, I32 -> I32) + (String, I32 -> ) greet ( -> I64) 40i64 ( -> I64) 2i64 (I64, I64 -> I64) + (String, I64 -> ) greet}\n}";
+        let expected_output = "( -> ) {( -> ) def greet (String, I64 -> ) {(String, I64 -> I64, String) swap (String -> ) print (I64 -> ) println}\n ( -> ) def greet (String, I32 -> ) {(I32 -> ) print (String -> ) println}\n ( -> ) def main ( -> ) {( -> String) \" The answer for the meaning of life is \" (String -> String, String) dup ( -> I32) 40i32 ( -> I32) 2i32 (I32, I32 -> I32) + (String, I32 -> ) greet ( -> I64) 40i64 ( -> I64) 2i64 (I64, I64 -> I64) + (String, I64 -> ) greet}\n}";
 
         assert_eq!(program, expected_output);
     }
@@ -701,7 +772,7 @@ mod test {
         let result = parse_and_type_check(contents, true).unwrap();
         assert_eq!(
             result,
-            "( -> ) {( -> ) def main ( -> ) {( -> I32) 5i32 ( -> I32) 3i32 (I32, I32 -> I32) + ( -> I32) 10i32 ( -> I32) 2i32 (I32, I32 -> I32) - ( -> I32) 15i32 ( -> I32) 3i32 (I32, I32 -> I32) + (a -> ) drop (a -> ) drop (a -> ) drop}\n}"
+            "( -> ) {( -> ) def main ( -> ) {( -> I32) 5i32 ( -> I32) 3i32 (I32, I32 -> I32) + ( -> I32) 10i32 ( -> I32) 2i32 (I32, I32 -> I32) - ( -> I32) 15i32 ( -> I32) 3i32 (I32, I32 -> I32) + (I32 -> ) drop (I32 -> ) drop (I32 -> ) drop}\n}"
         );
     }
 
@@ -731,7 +802,7 @@ mod test {
         let result = parse_and_type_check(contents, true).unwrap();
         assert_eq!(
             result,
-            "( -> ) {( -> ) def main ( -> ) {( -> U8) 1u8 ( -> U8) 2u8 (a -> a, a) dup (U8 -> ) print (a, b -> b, a) swap (U8 -> ) print (U8 -> ) print}\n}"
+            "( -> ) {( -> ) def main ( -> ) {( -> U8) 1u8 ( -> U8) 2u8 (U8 -> U8, U8) dup (U8 -> ) print (U8, U8 -> U8, U8) swap (U8 -> ) print (U8 -> ) print}\n}"
         );
     }
 
