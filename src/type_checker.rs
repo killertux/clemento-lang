@@ -5,7 +5,10 @@ use thiserror::Error;
 use crate::{
     internal_functions::builtins_functions,
     lexer::{IntegerNumber, Number, Position},
-    parser::{AstNode, AstNodeType, LiteralType, NumberType, Type, UnitType, VarType},
+    parser::{
+        AstNode, AstNodeType, LiteralType, NumberType, Type, UnitType, VarType,
+        VarTypeToCharContainer,
+    },
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,18 +286,17 @@ fn infer_type_definition(
         )),
         AstNodeType::Symbol(symbol) => {
             let type_definition = scope.get_definition(&symbol, &type_stack).ok_or(
-                TypeCheckerError::SymbolNotFound(
-                    symbol.clone(),
-                    node.position.clone(),
+                TypeCheckerError::SymbolNotFound(symbol.clone(), node.position.clone(), {
+                    let mut var_t_container = VarTypeToCharContainer::new();
                     format!(
                         "<...{}>",
                         type_stack[type_stack.len().saturating_sub(5)..]
                             .iter()
-                            .map(|t| t.to_string())
+                            .map(|t| t.to_consistent_string(&mut var_t_container))
                             .collect::<Vec<String>>()
                             .join(",")
-                    ),
-                ),
+                    )
+                }),
             )?;
             Ok(AstNodeWithType::new(
                 AstNodeType::Symbol(symbol),
@@ -489,31 +491,265 @@ mod test {
         parser::{AstNode, AstNodeType, Parser, ParserError},
     };
 
+    use super::TypeCheckerError;
+
+    fn parse_and_type_check(
+        contents: &str,
+        check_for_main: bool,
+    ) -> Result<String, TypeCheckerError> {
+        let program = Parser::new_from_str(&contents)
+            .collect::<Result<Vec<AstNode>, ParserError>>()
+            .unwrap();
+        super::type_check(
+            AstNode {
+                node_type: AstNodeType::Block(program),
+                position: Position::default(),
+                type_definition: None,
+            },
+            check_for_main,
+        )
+        .map(|ast_node| ast_node.to_string())
+    }
+
     #[test]
     fn program_with_multiple_definitions_with_different_types() {
         let contents = r#"def greet (String I64 -> ) { swap print println}
     def greet (String I32 -> ) { print println}
 
     def main {
-        " The answer for the meaning of life is " dup 40i32 2i32 + greet  40 2 + greet
+        " The answer for the meaning of life is " dup 40i32 2i32 + greet  40i64 2i64 + greet
     }"#;
 
-        let program = Parser::new_from_str(&contents)
-            .collect::<Result<Vec<AstNode>, ParserError>>()
-            .unwrap();
-        let program = super::type_check(
-            AstNode {
-                node_type: AstNodeType::Block(program),
-                position: Position::default(),
-                type_definition: None,
-            },
-            true,
+        let program = parse_and_type_check(contents, true).unwrap();
+        let expected_output = "( -> ) {( -> ) def greet (String, I64 -> ) {(a, b -> b, a) swap (String -> ) print (I64 -> ) println}\n ( -> ) def greet (String, I32 -> ) {(I32 -> ) print (String -> ) println}\n ( -> ) def main ( -> ) {( -> String) \" The answer for the meaning of life is \" (a -> a, a) dup ( -> I32) 40i32 ( -> I32) 2i32 (I32, I32 -> I32) + (String, I32 -> ) greet ( -> I64) 40i64 ( -> I64) 2i64 (I64, I64 -> I64) + (String, I64 -> ) greet}\n}";
+
+        assert_eq!(program, expected_output);
+    }
+
+    #[test]
+    fn basic_number_literals() {
+        let contents = "42u8 print 100u16 print 1000u32 print";
+        let program = parse_and_type_check(contents, false).unwrap();
+
+        assert_eq!(
+            program,
+            "( -> ) {( -> U8) 42u8 (U8 -> ) print ( -> U16) 100u16 (U16 -> ) print ( -> U32) 1000u32 (U32 -> ) print}"
+        );
+    }
+
+    #[test]
+    fn signed_number_literals() {
+        let contents = "-42i8 print -100i16 print -1000i32 print";
+        let program = parse_and_type_check(contents, false).unwrap();
+
+        assert_eq!(
+            program,
+            "( -> ) {( -> I8) -42i8 (I8 -> ) print ( -> I16) -100i16 (I16 -> ) print ( -> I32) -1000i32 (I32 -> ) print}"
         )
-        .unwrap();
+    }
 
-        let output = program.to_string();
-        let expected_output = "( -> ) {( -> ) def greet (String, I64 -> ) {(Var 1, Var 2 -> Var 2, Var 1) swap (String -> ) print (I64 -> ) println}\n ( -> ) def greet (String, I32 -> ) {(I32 -> ) print (String -> ) println}\n ( -> ) def main ( -> ) {( -> String) \" The answer for the meaning of life is \" (Var 0 -> Var 0, Var 0) dup ( -> I32) 40i32 ( -> I32) 2i32 (I32, I32 -> I32) + (String, I32 -> ) greet ( -> I64) 40i64 ( -> I64) 2i64 (I64, I64 -> I64) + (String, I64 -> ) greet}\n}";
+    #[test]
+    fn float_and_string_literals() {
+        let contents = r#"3.14 print "hello world" println"#;
+        let program = parse_and_type_check(contents, false).unwrap();
 
-        assert_eq!(output, expected_output);
+        assert_eq!(
+            program,
+            "( -> ) {( -> F64) 3.14 (F64 -> ) print ( -> String) \"hello world\" (String -> ) println}"
+        );
+    }
+
+    #[test]
+    fn simple_block() {
+        let contents = "{ 42u8 \"test\" print print }";
+        let program = parse_and_type_check(contents, false).unwrap();
+
+        assert_eq!(
+            program,
+            "( -> ) {( -> ) {( -> U8) 42u8 ( -> String) \"test\" (String -> ) print (U8 -> ) print}}"
+        );
+    }
+
+    #[test]
+    fn simple_definition() {
+        let contents = r#"def hello { "Hello, World!" }"#;
+        let program = parse_and_type_check(contents, false).unwrap();
+
+        assert_eq!(
+            program,
+            "( -> ) {( -> ) def hello ( -> String) {( -> String) \"Hello, World!\"}\n}"
+        );
+    }
+
+    #[test]
+    fn if_without_else() {
+        let contents = r#"
+            def main {
+                true if { 42u8 print }
+            }
+        "#;
+        let program = parse_and_type_check(contents, true).unwrap();
+        assert_eq!(
+            program,
+            "( -> ) {( -> ) def main ( -> ) {( -> Boolean) true (Boolean -> ) if ( -> ) {( -> U8) 42u8 (U8 -> ) print}}\n}"
+        );
+    }
+
+    #[test]
+    fn if_with_else_same_types() {
+        let contents = r#"
+            def main {
+                true if { 42u8 } else { 24u8 } print
+            }
+        "#;
+        let program = parse_and_type_check(contents, true).unwrap();
+        assert_eq!(
+            program,
+            "( -> ) {( -> ) def main ( -> ) {( -> Boolean) true (Boolean -> U8) if ( -> U8) {( -> U8) 42u8} else ( -> U8) {( -> U8) 24u8} (U8 -> ) print}\n}"
+        );
+    }
+
+    #[test]
+    fn symbol_not_found_error() {
+        let contents = "unknown_symbol";
+        let error = parse_and_type_check(contents, false)
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            error,
+            "Symbol unknown_symbol not found at 1:1 with type stack <...>. Maybe it is defined after the current position"
+        );
+    }
+
+    #[test]
+    fn invalid_if_body_error() {
+        let contents = r#"true if { 42u8 }"#;
+        let error = parse_and_type_check(contents, false)
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            error,
+            "Invalid if body at 1:6. If cannot change the type stack. It tried to change to ( -> U8)"
+        );
+    }
+
+    #[test]
+    fn invalid_if_else_body_different_types() {
+        let contents = r#"
+            def main {
+                true if { 42u8 } else { "hello" } print
+            }
+        "#;
+        let error = parse_and_type_check(contents, true)
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            error,
+            "Invalid if else body at 3:22.If and else bodies need to pop and push the same types. ( -> U8) != ( -> String)"
+        );
+    }
+
+    #[test]
+    fn valid_main_function() {
+        let contents = r#"def main { }"#;
+        let result = parse_and_type_check(contents, true).unwrap();
+        assert_eq!(result, "( -> ) {( -> ) def main ( -> ) {}\n}");
+    }
+
+    #[test]
+    fn valid_main_function_with_u8_return() {
+        let contents = r#"def main (-> U8) { 0u8 }"#;
+        let result = parse_and_type_check(contents, true).unwrap();
+        assert_eq!(result, "( -> ) {( -> ) def main ( -> U8) {( -> U8) 0u8}\n}");
+    }
+
+    #[test]
+    fn invalid_main_function_wrong_return_type() {
+        let contents = r#"def main (-> String) { "hello" }"#;
+        let error = parse_and_type_check(contents, true)
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(error, "Invalid main definition ( -> String)");
+    }
+
+    #[test]
+    fn builtin_functions_work() {
+        let contents = r#"
+            def main {
+                42u8 print
+                "hello" println
+            }
+        "#;
+        let result = parse_and_type_check(contents, true).unwrap();
+        assert_eq!(
+            result,
+            "( -> ) {( -> ) def main ( -> ) {( -> U8) 42u8 (U8 -> ) print ( -> String) \"hello\" (String -> ) println}\n}"
+        );
+    }
+
+    #[test]
+    fn arithmetic_operations() {
+        let contents = r#"def main {
+    5i32 3i32 +
+    10i32 2i32 -
+    15i32 3i32 + drop drop drop
+}"#;
+        let result = parse_and_type_check(contents, true).unwrap();
+        assert_eq!(
+            result,
+            "( -> ) {( -> ) def main ( -> ) {( -> I32) 5i32 ( -> I32) 3i32 (I32, I32 -> I32) + ( -> I32) 10i32 ( -> I32) 2i32 (I32, I32 -> I32) - ( -> I32) 15i32 ( -> I32) 3i32 (I32, I32 -> I32) + (a -> ) drop (a -> ) drop (a -> ) drop}\n}"
+        );
+    }
+
+    #[test]
+    fn nested_blocks() {
+        let contents = r#"
+            def main {
+                { { 42u8 print } }
+            }
+        "#;
+        let result = parse_and_type_check(contents, true).unwrap();
+        assert_eq!(
+            result,
+            "( -> ) {( -> ) def main ( -> ) {( -> ) {( -> ) {( -> U8) 42u8 (U8 -> ) print}}}\n}"
+        );
+    }
+
+    #[test]
+    fn complex_stack_manipulation() {
+        let contents = r#"
+            def main {
+                1u8 2u8
+                dup print
+                swap print print
+            }
+        "#;
+        let result = parse_and_type_check(contents, true).unwrap();
+        assert_eq!(
+            result,
+            "( -> ) {( -> ) def main ( -> ) {( -> U8) 1u8 ( -> U8) 2u8 (a -> a, a) dup (U8 -> ) print (a, b -> b, a) swap (U8 -> ) print (U8 -> ) print}\n}"
+        );
+    }
+
+    #[test]
+    fn type_conflict_error() {
+        let contents = r#"
+            def test (U8 -> U8) { dup drop }
+            def main {
+                42i32 test  # This should fail - trying to pass I32 where U8 expected
+            }
+        "#;
+        let error = parse_and_type_check(contents, true)
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            error,
+            "Symbol test not found at 4:23 with type stack <...I32>. Maybe it is defined after the current position"
+        );
     }
 }

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fmt::{Display, Formatter},
     iter::Peekable,
     sync::atomic::{AtomicU64, Ordering},
@@ -318,27 +319,61 @@ impl VarType {
     }
 }
 
-impl Display for UnitType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+pub struct VarTypeToCharContainer {
+    map: HashMap<VarType, char>,
+    current_char: char,
+}
+
+impl VarTypeToCharContainer {
+    pub fn new() -> Self {
+        VarTypeToCharContainer {
+            map: HashMap::new(),
+            current_char: 'a',
+        }
+    }
+
+    pub fn get_string(&mut self, var_type: &VarType) -> String {
+        if let Some(c) = self.map.get(var_type) {
+            return c.to_string();
+        }
+        self.map.insert(var_type.clone(), self.current_char);
+        let return_string = self.current_char.to_string();
+        self.current_char = (self.current_char as u8 + 1) as char;
+        return_string
+    }
+}
+
+impl UnitType {
+    pub fn to_consistent_string(&self, var_t: &mut VarTypeToCharContainer) -> String {
         match self {
-            UnitType::Literal(LiteralType::Number(NumberType::U8)) => write!(f, "U8"),
-            UnitType::Literal(LiteralType::Number(NumberType::U16)) => write!(f, "U16"),
-            UnitType::Literal(LiteralType::Number(NumberType::U32)) => write!(f, "U32"),
-            UnitType::Literal(LiteralType::Number(NumberType::U64)) => write!(f, "U64"),
-            UnitType::Literal(LiteralType::Number(NumberType::U128)) => write!(f, "U128"),
-            UnitType::Literal(LiteralType::Number(NumberType::I8)) => write!(f, "I8"),
-            UnitType::Literal(LiteralType::Number(NumberType::I16)) => write!(f, "I16"),
-            UnitType::Literal(LiteralType::Number(NumberType::I32)) => write!(f, "I32"),
-            UnitType::Literal(LiteralType::Number(NumberType::I64)) => write!(f, "I64"),
-            UnitType::Literal(LiteralType::Number(NumberType::I128)) => write!(f, "I128"),
-            UnitType::Literal(LiteralType::Number(NumberType::F64)) => write!(f, "F64"),
-            UnitType::Literal(LiteralType::String) => write!(f, "String"),
-            UnitType::Literal(LiteralType::Boolean) => write!(f, "Boolean"),
-            UnitType::Var(VarType { identifier }) => write!(f, "Var {}", identifier),
+            UnitType::Literal(LiteralType::Number(NumberType::U8)) => "U8".into(),
+            UnitType::Literal(LiteralType::Number(NumberType::U16)) => "U16".into(),
+            UnitType::Literal(LiteralType::Number(NumberType::U32)) => "U32".into(),
+            UnitType::Literal(LiteralType::Number(NumberType::U64)) => "U64".into(),
+            UnitType::Literal(LiteralType::Number(NumberType::U128)) => "U128".into(),
+            UnitType::Literal(LiteralType::Number(NumberType::I8)) => "I8".into(),
+            UnitType::Literal(LiteralType::Number(NumberType::I16)) => "I16".into(),
+            UnitType::Literal(LiteralType::Number(NumberType::I32)) => "I32".into(),
+            UnitType::Literal(LiteralType::Number(NumberType::I64)) => "I64".into(),
+            UnitType::Literal(LiteralType::Number(NumberType::I128)) => "I128".into(),
+            UnitType::Literal(LiteralType::Number(NumberType::F64)) => "F64".into(),
+            UnitType::Literal(LiteralType::String) => "String".into(),
+            UnitType::Literal(LiteralType::Boolean) => "Boolean".into(),
+            UnitType::Var(var_type) => var_t.get_string(var_type),
             UnitType::Type(ty) => {
-                write!(f, "{}", ty)
+                format!("{}", ty)
             }
         }
+    }
+}
+
+impl Display for UnitType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            self.to_consistent_string(&mut VarTypeToCharContainer::new())
+        )
     }
 }
 
@@ -450,17 +485,18 @@ impl Type {
 
 impl Display for Type {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let mut var_t_container = VarTypeToCharContainer::new();
         write!(
             f,
             "({} -> {})",
             self.pop_types
                 .iter()
-                .map(|t| t.to_string())
+                .map(|t| t.to_consistent_string(&mut var_t_container))
                 .collect::<Vec<String>>()
                 .join(", "),
             self.push_types
                 .iter()
-                .map(|t| t.to_string())
+                .map(|t| t.to_consistent_string(&mut var_t_container))
                 .collect::<Vec<String>>()
                 .join(", ")
         )

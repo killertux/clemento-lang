@@ -1,6 +1,10 @@
-def greet (String I64 -> ) { swap print println}
-def greet (String I32 -> ) { print println }
+def fizz_buzz (I64 ->) {
+    dup 3 % 0 = if { "Fizz" print }
+    dup 5 % 0 = if { "Buzz" print }
+    dup 3 % 0 != swap dup 5 % 0 != rot && if { dup print }
+    1 + dup 20 > if { "Done" println } else { "" println fizz_buzz }
+}
 
 def main {
-    true if "True" else "False" println
+    0 fizz_buzz
 }
