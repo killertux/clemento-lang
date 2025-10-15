@@ -1,0 +1,19 @@
+def fibonacci (I64 -> I64) {
+    dup 0 = if { drop 0 }
+    else {
+        dup 1 = if { drop 1 }
+        else { dup 1 - fibonacci swap 2 - fibonacci + }
+    }
+}
+
+def print_fibonacci (I64 I64 -> ) {
+    dup2 = if drop2 else { dup fibonacci println 1 +  print_fibonacci }
+}
+def print_fibonacci (I64 -> ) {
+    0 print_fibonacci
+}
+
+
+def main {
+    10 print_fibonacci
+}

@@ -109,6 +109,31 @@ pub fn builtins_functions() -> Vec<InternalFunction> {
         }],
         vec![InternalFunction {
             arity: 2,
+            name: "dup2".into(),
+            ty: {
+                let var1 = VarType::new();
+                let var2 = VarType::new();
+                Type::new(
+                    vec![UnitType::Var(var1.clone()), UnitType::Var(var2.clone())],
+                    vec![
+                        UnitType::Var(var1.clone()),
+                        UnitType::Var(var2.clone()),
+                        UnitType::Var(var1.clone()),
+                        UnitType::Var(var2.clone()),
+                    ],
+                )
+            },
+            function: Rc::new(Box::new(|args| {
+                Ok(vec![
+                    args[0].clone(),
+                    args[1].clone(),
+                    args[0].clone(),
+                    args[1].clone(),
+                ])
+            })),
+        }],
+        vec![InternalFunction {
+            arity: 2,
             name: "swap".into(),
             ty: {
                 let var1 = VarType::new();
@@ -148,6 +173,15 @@ pub fn builtins_functions() -> Vec<InternalFunction> {
             arity: 1,
             name: "drop".into(),
             ty: Type::new(vec![UnitType::Var(VarType::new())], vec![]),
+            function: Rc::new(Box::new(|_args| Ok(vec![]))),
+        }],
+        vec![InternalFunction {
+            arity: 2,
+            name: "drop2".into(),
+            ty: Type::new(
+                vec![UnitType::Var(VarType::new()), UnitType::Var(VarType::new())],
+                vec![],
+            ),
             function: Rc::new(Box::new(|_args| Ok(vec![]))),
         }],
         vec![InternalFunction {
