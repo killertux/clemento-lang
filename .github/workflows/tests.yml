@@ -13,6 +13,8 @@ jobs:
       release_built: ${{ steps.set-output.outputs.release_built }}
     steps:
       - uses: actions/checkout@v5
+      - name: Install dependencies
+        run: apt install clang-18 llvm-18 llvm-18-dev
       - name: Run tests in "${{ matrix.BUILD_TARGET }}" mode
         run: cargo test --profile ${{ matrix.BUILD_TARGET }}
       - name: Validate examples in "${{ matrix.BUILD_TARGET }}" mode
