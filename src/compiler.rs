@@ -88,15 +88,15 @@ impl<'ctx> CompilerContext<'ctx> {
                 Ok(())
             }
             AstNodeType::Block(nodes) => {
-                let mut scope = Scope::with_parent(&scope);
+                let mut scope = Scope::with_parent(scope);
                 for node in nodes {
                     self.compile_ast(&mut scope, stack, node)?;
                 }
                 Ok(())
             }
-            AstNodeType::Definition(symbol, body) => self.compile_definition(scope, &symbol, body),
+            AstNodeType::Definition(symbol, body) => self.compile_definition(scope, &symbol, *body),
             AstNodeType::If(true_body, false_body) => {
-                self.compile_if(scope, true_body, false_body, stack)
+                self.compile_if(scope, *true_body, false_body, stack)
             }
         }
     }
@@ -128,7 +128,7 @@ impl<'ctx> CompilerContext<'ctx> {
                 UnitType::Literal(LiteralType::Number(NumberType::U64)),
                 self.context
                     .i64_type()
-                    .const_int_arbitrary_precision(&[n as u64])
+                    .const_int_arbitrary_precision(&[n])
                     .into(),
             ),
             Number::Integer(IntegerNumber::U128(n)) => (
@@ -214,7 +214,7 @@ impl<'ctx> CompilerContext<'ctx> {
         &self,
         scope: &mut Scope<'_, 'ctx>,
         symbol: &str,
-        body: Box<AstNodeWithType>,
+        body: AstNodeWithType,
     ) -> Result<(), CompilerError> {
         let function_type = self.get_llvm_function_type(&body.type_definition)?;
         let function_name = if symbol == "main" {
@@ -243,12 +243,12 @@ impl<'ctx> CompilerContext<'ctx> {
             .pop_types
             .clone()
             .into_iter()
-            .zip(function.get_param_iter().into_iter())
+            .zip(function.get_param_iter())
         {
             stack.push(param);
         }
 
-        self.compile_ast(scope, &mut stack, *body)?;
+        self.compile_ast(scope, &mut stack, body)?;
 
         match function_type.get_return_type() {
             Some(_) => {
@@ -306,7 +306,7 @@ impl<'ctx> CompilerContext<'ctx> {
             ));
         }
 
-        if type_def.push_types.len() == 0 {
+        if type_def.push_types.is_empty() {
             return Ok(self.context.void_type().fn_type(&param_types, false));
         }
         Ok(self
@@ -363,7 +363,7 @@ impl<'ctx> CompilerContext<'ctx> {
     fn compile_if(
         &self,
         scope: &mut Scope<'_, 'ctx>,
-        true_body: Box<AstNodeWithType>,
+        true_body: AstNodeWithType,
         false_body: Option<Box<AstNodeWithType>>,
         stack: &mut Stack<'ctx>,
     ) -> Result<(), CompilerError> {
@@ -399,7 +399,7 @@ impl<'ctx> CompilerContext<'ctx> {
                 self.builder.position_at_end(true_block);
                 let mut true_stack = stack.clone();
                 let push_types_len = true_body.type_definition.push_types.len();
-                self.compile_ast(scope, &mut true_stack, *true_body)?;
+                self.compile_ast(scope, &mut true_stack, true_body)?;
                 let true_values = true_stack.pop_n(push_types_len);
                 self.builder.build_unconditional_branch(merge_block)?;
                 let true_end_bb = self
@@ -434,7 +434,7 @@ impl<'ctx> CompilerContext<'ctx> {
                     .build_conditional_branch(condition, true_block, merge_block)?;
 
                 self.builder.position_at_end(true_block);
-                self.compile_ast(scope, stack, *true_body)?;
+                self.compile_ast(scope, stack, true_body)?;
                 self.builder.build_unconditional_branch(merge_block)?;
 
                 self.builder.position_at_end(merge_block);

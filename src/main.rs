@@ -49,7 +49,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 .arg("-o")
                 .arg(execute_file.clone())
                 .output()?;
-            let result: u8 = StdCommand::new(&format!("./{}", execute_file.display()))
+            let result: u8 = StdCommand::new(format!("./{}", execute_file.display()))
                 .status()?
                 .code()
                 .unwrap_or(0)
