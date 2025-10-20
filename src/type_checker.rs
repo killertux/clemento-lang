@@ -589,7 +589,7 @@ mod test {
     }"#;
 
         let program = parse_and_type_check(contents, true).unwrap();
-        let expected_output = "( -> ) {( -> ) def greet (String, I64 -> ) {(String, I64 -> I64, String) swap (String -> ) print (I64 -> ) println}\n ( -> ) def greet (String, I32 -> ) {(I32 -> ) print (String -> ) println}\n ( -> ) def main ( -> ) {( -> String) \" The answer for the meaning of life is \" (String -> String, String) dup ( -> I32) 40i32 ( -> I32) 2i32 (I32, I32 -> I32) + (String, I32 -> ) greet ( -> I64) 40i64 ( -> I64) 2i64 (I64, I64 -> I64) + (String, I64 -> ) greet}\n}";
+        let expected_output = "( -> ) {( -> ) def greet (String I64 -> ) {(String I64 -> I64 String) swap (String -> ) print (I64 -> ) println}\n ( -> ) def greet (String I32 -> ) {(I32 -> ) print (String -> ) println}\n ( -> ) def main ( -> ) {( -> String) \" The answer for the meaning of life is \" (String -> String String) dup ( -> I32) 40i32 ( -> I32) 2i32 (I32 I32 -> I32) + (String I32 -> ) greet ( -> I64) 40i64 ( -> I64) 2i64 (I64 I64 -> I64) + (String I64 -> ) greet}\n}";
 
         assert_eq!(program, expected_output);
     }
@@ -728,10 +728,13 @@ mod test {
     }
 
     #[test]
-    fn valid_main_function_with_u8_return() {
-        let contents = r#"def main (-> U8) { 0u8 }"#;
+    fn valid_main_function_with_i32_return() {
+        let contents = r#"def main (-> I32) { 0i32 }"#;
         let result = parse_and_type_check(contents, true).unwrap();
-        assert_eq!(result, "( -> ) {( -> ) def main ( -> U8) {( -> U8) 0u8}\n}");
+        assert_eq!(
+            result,
+            "( -> ) {( -> ) def main ( -> I32) {( -> I32) 0i32}\n}"
+        );
     }
 
     #[test]
@@ -769,7 +772,7 @@ mod test {
         let result = parse_and_type_check(contents, true).unwrap();
         assert_eq!(
             result,
-            "( -> ) {( -> ) def main ( -> ) {( -> I32) 5i32 ( -> I32) 3i32 (I32, I32 -> I32) + ( -> I32) 10i32 ( -> I32) 2i32 (I32, I32 -> I32) - ( -> I32) 15i32 ( -> I32) 3i32 (I32, I32 -> I32) + (I32 -> ) drop (I32 -> ) drop (I32 -> ) drop}\n}"
+            "( -> ) {( -> ) def main ( -> ) {( -> I32) 5i32 ( -> I32) 3i32 (I32 I32 -> I32) + ( -> I32) 10i32 ( -> I32) 2i32 (I32 I32 -> I32) - ( -> I32) 15i32 ( -> I32) 3i32 (I32 I32 -> I32) + (I32 -> ) drop (I32 -> ) drop (I32 -> ) drop}\n}"
         );
     }
 
@@ -799,7 +802,7 @@ mod test {
         let result = parse_and_type_check(contents, true).unwrap();
         assert_eq!(
             result,
-            "( -> ) {( -> ) def main ( -> ) {( -> U8) 1u8 ( -> U8) 2u8 (U8 -> U8, U8) dup (U8 -> ) print (U8, U8 -> U8, U8) swap (U8 -> ) print (U8 -> ) print}\n}"
+            "( -> ) {( -> ) def main ( -> ) {( -> U8) 1u8 ( -> U8) 2u8 (U8 -> U8 U8) dup (U8 -> ) print (U8 U8 -> U8 U8) swap (U8 -> ) print (U8 -> ) print}\n}"
         );
     }
 
