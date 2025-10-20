@@ -1,0 +1,5 @@
+// def temp (I64 ->) { dup = if "true" else "false" println }
+
+def main {
+    42i32
+}

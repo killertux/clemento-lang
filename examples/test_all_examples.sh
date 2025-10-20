@@ -87,3 +87,4 @@ else
     echo -e "${RED}$FAILED_TESTS test(s) failed.${NC}"
     exit 1
 fi
+PASS${NC}"

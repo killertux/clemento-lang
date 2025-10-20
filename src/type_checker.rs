@@ -103,7 +103,7 @@ fn type_check_block(
             Type::new(vec![], vec![]),
             Type::new(
                 vec![],
-                vec![UnitType::Literal(LiteralType::Number(NumberType::U8))],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::I32))],
             ),
         ];
         if !valid_main_definitions.contains(&main) {

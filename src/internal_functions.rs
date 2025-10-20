@@ -1,22 +1,20 @@
 use std::rc::Rc;
 
+use inkwell::{IntPredicate, values::BasicValueEnum};
+
 use crate::{
-    interpreter::{RuntimeError, Value},
-    lexer::IntegerNumber,
+    compiler::{BoxDefinitionType, CompilerContext, CompilerError, DefinitionType, Stack},
     parser::{LiteralType, NumberType, Type, UnitType, VarType},
 };
 
-type Function = Rc<Box<dyn Fn(Vec<Value>) -> Result<Vec<Value>, RuntimeError>>>;
-
 #[derive(Clone)]
-pub struct InternalFunction {
-    pub arity: usize,
+pub struct InternalFunction<'ctx> {
     pub name: String,
     pub ty: Type,
-    pub function: Function,
+    pub function: DefinitionType<'ctx>,
 }
 
-pub fn builtins_functions() -> Vec<InternalFunction> {
+pub fn builtins_functions<'ctx>() -> Vec<InternalFunction<'ctx>> {
     let all_integer_types = vec![
         UnitType::Literal(LiteralType::Number(NumberType::U8)),
         UnitType::Literal(LiteralType::Number(NumberType::U16)),
@@ -40,63 +38,86 @@ pub fn builtins_functions() -> Vec<InternalFunction> {
         pop1_push0(
             &all_literal_types,
             "print".into(),
-            Rc::new(
-                Box::new(|args: Vec<Value>| -> Result<Vec<Value>, RuntimeError> {
-                    match &args[0] {
-                        Value::IntegerNumber(IntegerNumber::U8(n)) => print!("{}", n),
-                        Value::IntegerNumber(IntegerNumber::U16(n)) => print!("{}", n),
-                        Value::IntegerNumber(IntegerNumber::U32(n)) => print!("{}", n),
-                        Value::IntegerNumber(IntegerNumber::U64(n)) => print!("{}", n),
-                        Value::IntegerNumber(IntegerNumber::U128(n)) => print!("{}", n),
-                        Value::IntegerNumber(IntegerNumber::I8(n)) => print!("{}", n),
-                        Value::IntegerNumber(IntegerNumber::I16(n)) => print!("{}", n),
-                        Value::IntegerNumber(IntegerNumber::I32(n)) => print!("{}", n),
-                        Value::IntegerNumber(IntegerNumber::I64(n)) => print!("{}", n),
-                        Value::IntegerNumber(IntegerNumber::I128(n)) => print!("{}", n),
-                        Value::FloatNumber(n) => print!("{}", n),
-                        Value::String(s) => print!("{}", s),
-                        _ => {
-                            return Err(RuntimeError::Unexpected(format!(
-                                "Unexpected value for print param {:?}",
-                                args[0]
-                            )));
-                        }
-                    }
-                    Ok(vec![])
-                }) as Box<dyn Fn(Vec<Value>) -> Result<Vec<Value>, RuntimeError>>,
-            ),
+            Rc::new(Box::new(
+                |compiler_context: &CompilerContext<'ctx>,
+                 stack: &mut Stack<'ctx>|
+                 -> Result<(), CompilerError> {
+                    let value = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    let format_str = match value.0 {
+                        UnitType::Literal(LiteralType::Number(NumberType::U8)) => "%hhu",
+                        UnitType::Literal(LiteralType::Number(NumberType::I8)) => "%hhi",
+                        UnitType::Literal(LiteralType::Number(NumberType::U16)) => "%hu",
+                        UnitType::Literal(LiteralType::Number(NumberType::I16)) => "%hi",
+                        UnitType::Literal(LiteralType::Number(NumberType::U32)) => "%u",
+                        UnitType::Literal(LiteralType::Number(NumberType::I32)) => "%i",
+                        UnitType::Literal(LiteralType::Number(NumberType::U64)) => "%llu",
+                        UnitType::Literal(LiteralType::Number(NumberType::I64)) => "%lli",
+                        UnitType::Literal(LiteralType::Number(NumberType::U128)) => "%llu", //TODO We will need to implement a custom format specifier for u128
+                        UnitType::Literal(LiteralType::Number(NumberType::I128)) => "%lli",
+                        UnitType::Literal(LiteralType::Number(NumberType::F64)) => "%f",
+                        UnitType::Literal(LiteralType::String) => "%s",
+                        UnitType::Literal(LiteralType::Boolean) => "%d",
+                        _other => return Err(CompilerError::FunctionCallError),
+                    };
+                    let format_str = compiler_context
+                        .builder
+                        .build_global_string_ptr(format_str, "int_fmt")?
+                        .as_pointer_value();
+                    let printf = compiler_context
+                        .module
+                        .get_function("printf")
+                        .ok_or(CompilerError::GetFunctionError("printf".into()))?;
+                    compiler_context.builder.build_call(
+                        printf,
+                        &[format_str.into(), value.1.into()],
+                        "printf_call",
+                    )?;
+                    Ok(())
+                },
+            ) as BoxDefinitionType<'ctx>),
         ),
         pop1_push0(
             &all_literal_types,
             "println".into(),
-            Rc::new(
-                Box::new(|args: Vec<Value>| -> Result<Vec<Value>, RuntimeError> {
-                    match &args[0] {
-                        Value::IntegerNumber(IntegerNumber::U8(n)) => println!("{}", n),
-                        Value::IntegerNumber(IntegerNumber::U16(n)) => println!("{}", n),
-                        Value::IntegerNumber(IntegerNumber::U32(n)) => println!("{}", n),
-                        Value::IntegerNumber(IntegerNumber::U64(n)) => println!("{}", n),
-                        Value::IntegerNumber(IntegerNumber::U128(n)) => println!("{}", n),
-                        Value::IntegerNumber(IntegerNumber::I8(n)) => println!("{}", n),
-                        Value::IntegerNumber(IntegerNumber::I16(n)) => println!("{}", n),
-                        Value::IntegerNumber(IntegerNumber::I32(n)) => println!("{}", n),
-                        Value::IntegerNumber(IntegerNumber::I64(n)) => println!("{}", n),
-                        Value::IntegerNumber(IntegerNumber::I128(n)) => println!("{}", n),
-                        Value::FloatNumber(n) => println!("{}", n),
-                        Value::String(s) => println!("{}", s),
-                        _ => {
-                            return Err(RuntimeError::Unexpected(format!(
-                                "Unexpected value for println param {:?}",
-                                args[0]
-                            )));
-                        }
-                    }
-                    Ok(vec![])
-                }) as Box<dyn Fn(Vec<Value>) -> Result<Vec<Value>, RuntimeError>>,
-            ),
+            Rc::new(Box::new(
+                |compiler_context: &CompilerContext<'ctx>,
+                 stack: &mut Stack<'ctx>|
+                 -> Result<(), CompilerError> {
+                    let value = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    let format_str = match value.0 {
+                        UnitType::Literal(LiteralType::Number(NumberType::U8)) => "%hhu\n",
+                        UnitType::Literal(LiteralType::Number(NumberType::I8)) => "%hhi\n",
+                        UnitType::Literal(LiteralType::Number(NumberType::U16)) => "%hu\n",
+                        UnitType::Literal(LiteralType::Number(NumberType::I16)) => "%hi\n",
+                        UnitType::Literal(LiteralType::Number(NumberType::U32)) => "%u\n",
+                        UnitType::Literal(LiteralType::Number(NumberType::I32)) => "%i\n",
+                        UnitType::Literal(LiteralType::Number(NumberType::U64)) => "%llu\n",
+                        UnitType::Literal(LiteralType::Number(NumberType::I64)) => "%lli\n",
+                        UnitType::Literal(LiteralType::Number(NumberType::U128)) => "%llu\n", //TODO We will need to implement a custom format specifier for u128
+                        UnitType::Literal(LiteralType::Number(NumberType::I128)) => "%lli\n",
+                        UnitType::Literal(LiteralType::Number(NumberType::F64)) => "%f\n",
+                        UnitType::Literal(LiteralType::String) => "%s\n",
+                        UnitType::Literal(LiteralType::Boolean) => "%d\n",
+                        _other => return Err(CompilerError::FunctionCallError),
+                    };
+                    let format_str = compiler_context
+                        .builder
+                        .build_global_string_ptr(format_str, "int_fmt")?
+                        .as_pointer_value();
+                    let printf = compiler_context
+                        .module
+                        .get_function("printf")
+                        .ok_or(CompilerError::GetFunctionError("printf".into()))?;
+                    compiler_context.builder.build_call(
+                        printf,
+                        &[format_str.into(), value.1.into()],
+                        "printf_call",
+                    )?;
+                    Ok(())
+                },
+            ) as BoxDefinitionType<'ctx>),
         ),
         vec![InternalFunction {
-            arity: 1,
             name: "dup".into(),
             ty: {
                 let var = VarType::new();
@@ -105,10 +126,18 @@ pub fn builtins_functions() -> Vec<InternalFunction> {
                     vec![UnitType::Var(var.clone()), UnitType::Var(var.clone())],
                 )
             },
-            function: Rc::new(Box::new(|args| Ok(vec![args[0].clone(), args[0].clone()]))),
+            function: Rc::new(Box::new(
+                |_compiler_context: &CompilerContext<'ctx>,
+                 stack: &mut Stack<'ctx>|
+                 -> Result<(), CompilerError> {
+                    let value = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    stack.push(value.clone());
+                    stack.push(value.clone());
+                    Ok(())
+                },
+            ) as BoxDefinitionType<'ctx>),
         }],
         vec![InternalFunction {
-            arity: 2,
             name: "dup2".into(),
             ty: {
                 let var1 = VarType::new();
@@ -123,17 +152,22 @@ pub fn builtins_functions() -> Vec<InternalFunction> {
                     ],
                 )
             },
-            function: Rc::new(Box::new(|args| {
-                Ok(vec![
-                    args[0].clone(),
-                    args[1].clone(),
-                    args[0].clone(),
-                    args[1].clone(),
-                ])
-            })),
+            function: Rc::new(Box::new(
+                |_compiler_context: &CompilerContext<'ctx>,
+                 stack: &mut Stack<'ctx>|
+                 -> Result<(), CompilerError> {
+                    let value1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    let value2 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+
+                    stack.push(value2.clone());
+                    stack.push(value1.clone());
+                    stack.push(value2.clone());
+                    stack.push(value1.clone());
+                    Ok(())
+                },
+            ) as BoxDefinitionType<'ctx>),
         }],
         vec![InternalFunction {
-            arity: 2,
             name: "swap".into(),
             ty: {
                 let var1 = VarType::new();
@@ -143,10 +177,20 @@ pub fn builtins_functions() -> Vec<InternalFunction> {
                     vec![UnitType::Var(var2.clone()), UnitType::Var(var1.clone())],
                 )
             },
-            function: Rc::new(Box::new(|args| Ok(vec![args[1].clone(), args[0].clone()]))),
+            function: Rc::new(Box::new(
+                |_compiler_context: &CompilerContext<'ctx>,
+                 stack: &mut Stack<'ctx>|
+                 -> Result<(), CompilerError> {
+                    let value1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    let value2 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+
+                    stack.push(value1.clone());
+                    stack.push(value2.clone());
+                    Ok(())
+                },
+            ) as BoxDefinitionType<'ctx>),
         }],
         vec![InternalFunction {
-            arity: 3,
             name: "rot".into(),
             ty: {
                 let var1 = VarType::new();
@@ -165,27 +209,50 @@ pub fn builtins_functions() -> Vec<InternalFunction> {
                     ],
                 )
             },
-            function: Rc::new(Box::new(|args| {
-                Ok(vec![args[1].clone(), args[2].clone(), args[0].clone()])
-            })),
+            function: Rc::new(Box::new(
+                |_compiler_context: &CompilerContext<'ctx>,
+                 stack: &mut Stack<'ctx>|
+                 -> Result<(), CompilerError> {
+                    let value1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    let value2 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    let value3 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+
+                    stack.push(value2.clone());
+                    stack.push(value1.clone());
+                    stack.push(value3.clone());
+                    Ok(())
+                },
+            ) as BoxDefinitionType<'ctx>),
         }],
         vec![InternalFunction {
-            arity: 1,
             name: "drop".into(),
             ty: Type::new(vec![UnitType::Var(VarType::new())], vec![]),
-            function: Rc::new(Box::new(|_args| Ok(vec![]))),
+            function: Rc::new(Box::new(
+                |_compiler_context: &CompilerContext<'ctx>,
+                 stack: &mut Stack<'ctx>|
+                 -> Result<(), CompilerError> {
+                    let _ = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    Ok(())
+                },
+            ) as BoxDefinitionType<'ctx>),
         }],
         vec![InternalFunction {
-            arity: 2,
             name: "drop2".into(),
             ty: Type::new(
                 vec![UnitType::Var(VarType::new()), UnitType::Var(VarType::new())],
                 vec![],
             ),
-            function: Rc::new(Box::new(|_args| Ok(vec![]))),
+            function: Rc::new(Box::new(
+                |_compiler_context: &CompilerContext<'ctx>,
+                 stack: &mut Stack<'ctx>|
+                 -> Result<(), CompilerError> {
+                    let _ = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    let _ = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    Ok(())
+                },
+            ) as BoxDefinitionType<'ctx>),
         }],
         vec![InternalFunction {
-            arity: 2,
             name: "&&".into(),
             ty: {
                 Type::new(
@@ -196,463 +263,2129 @@ pub fn builtins_functions() -> Vec<InternalFunction> {
                     vec![UnitType::Literal(LiteralType::Boolean)],
                 )
             },
-            function: Rc::new(Box::new(|args| match (&args[0], &args[1]) {
-                (Value::Boolean(b1), Value::Boolean(b2)) => Ok(vec![Value::Boolean(*b1 && *b2)]),
-                (other1, other2) => Err(RuntimeError::Unexpected(format!(
-                    "Unexpected types used in && function. {:?} {:?}",
-                    other1, other2
-                ))),
-            })),
+            function: Rc::new(Box::new(
+                |compiler_context: &CompilerContext<'ctx>,
+                 stack: &mut Stack<'ctx>|
+                 -> Result<(), CompilerError> {
+                    let arg1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    let arg2 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    match (arg1, arg2) {
+                        (
+                            (UnitType::Literal(LiteralType::Boolean), BasicValueEnum::IntValue(n1)),
+                            (UnitType::Literal(LiteralType::Boolean), BasicValueEnum::IntValue(n2)),
+                        ) => {
+                            let result =
+                                compiler_context.builder.build_and(n1, n2, "and_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        _ => return Err(CompilerError::FunctionCallError),
+                    }
+                    Ok(())
+                },
+            ) as BoxDefinitionType<'ctx>),
         }],
         pop2_push1(
             &all_number_types,
             None,
             "+".into(),
-            Rc::new(Box::new(|args: Vec<Value>| match (&args[0], &args[1]) {
-                (
-                    Value::IntegerNumber(IntegerNumber::U8(n1)),
-                    Value::IntegerNumber(IntegerNumber::U8(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::U8(n1 + n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U16(n1)),
-                    Value::IntegerNumber(IntegerNumber::U16(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::U16(n1 + n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U32(n1)),
-                    Value::IntegerNumber(IntegerNumber::U32(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::U32(n1 + n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U64(n1)),
-                    Value::IntegerNumber(IntegerNumber::U64(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::U64(n1 + n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U128(n1)),
-                    Value::IntegerNumber(IntegerNumber::U128(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::U128(n1 + n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I8(n1)),
-                    Value::IntegerNumber(IntegerNumber::I8(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::I8(n1 + n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I16(n1)),
-                    Value::IntegerNumber(IntegerNumber::I16(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::I16(n1 + n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I32(n1)),
-                    Value::IntegerNumber(IntegerNumber::I32(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::I32(n1 + n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I64(n1)),
-                    Value::IntegerNumber(IntegerNumber::I64(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::I64(n1 + n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I128(n1)),
-                    Value::IntegerNumber(IntegerNumber::I128(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::I128(n1 + n2))]),
-                (Value::FloatNumber(n1), Value::FloatNumber(n2)) => {
-                    Ok(vec![Value::FloatNumber(n1 + n2)])
-                }
-                (other1, other2) => Err(RuntimeError::Unexpected(format!(
-                    "Unexpected types used in + function. {:?} {:?}",
-                    other1, other2
-                ))),
-            })),
+            Rc::new(Box::new(
+                |compiler_context: &CompilerContext<'ctx>,
+                 stack: &mut Stack<'ctx>|
+                 -> Result<(), CompilerError> {
+                    let arg1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    let arg2 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    match (arg1, arg2) {
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_int_add(n1, n2, "add_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_int_add(n1, n2, "add_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_int_add(n1, n2, "add_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_int_add(n1, n2, "add_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_int_add(n1, n2, "add_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_int_add(n1, n2, "add_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_int_add(n1, n2, "add_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_int_add(n1, n2, "add_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_int_add(n1, n2, "add_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_int_add(n1, n2, "add_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::F64)),
+                                BasicValueEnum::FloatValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::F64)),
+                                BasicValueEnum::FloatValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_float_add(n1, n2, "add_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::F64)),
+                                BasicValueEnum::FloatValue(result),
+                            ));
+                        }
+                        _ => return Err(CompilerError::UnexpectedType),
+                    }
+                    Ok(())
+                },
+            ) as BoxDefinitionType<'ctx>),
         ),
         pop2_push1(
             &all_number_types,
             None,
             "-".into(),
-            Rc::new(Box::new(|args: Vec<Value>| match (&args[0], &args[1]) {
-                (
-                    Value::IntegerNumber(IntegerNumber::U8(n1)),
-                    Value::IntegerNumber(IntegerNumber::U8(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::U8(n1 - n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U16(n1)),
-                    Value::IntegerNumber(IntegerNumber::U16(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::U16(n1 - n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U32(n1)),
-                    Value::IntegerNumber(IntegerNumber::U32(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::U32(n1 - n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U64(n1)),
-                    Value::IntegerNumber(IntegerNumber::U64(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::U64(n1 - n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U128(n1)),
-                    Value::IntegerNumber(IntegerNumber::U128(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::U128(n1 - n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I8(n1)),
-                    Value::IntegerNumber(IntegerNumber::I8(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::I8(n1 - n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I16(n1)),
-                    Value::IntegerNumber(IntegerNumber::I16(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::I16(n1 - n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I32(n1)),
-                    Value::IntegerNumber(IntegerNumber::I32(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::I32(n1 - n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I64(n1)),
-                    Value::IntegerNumber(IntegerNumber::I64(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::I64(n1 - n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I128(n1)),
-                    Value::IntegerNumber(IntegerNumber::I128(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::I128(n1 - n2))]),
-                (Value::FloatNumber(n1), Value::FloatNumber(n2)) => {
-                    Ok(vec![Value::FloatNumber(n1 - n2)])
-                }
-                (other1, other2) => Err(RuntimeError::Unexpected(format!(
-                    "Unexpected types used in - function. {:?} {:?}",
-                    other1, other2
-                ))),
-            })),
+            Rc::new(Box::new(
+                |compiler_context: &CompilerContext<'ctx>,
+                 stack: &mut Stack<'ctx>|
+                 -> Result<(), CompilerError> {
+                    let arg1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    let arg2 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    match (arg2, arg1) {
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_int_sub(n1, n2, "sub_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_int_sub(n1, n2, "sub_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_int_sub(n1, n2, "sub_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_int_sub(n1, n2, "sub_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_int_sub(n1, n2, "sub_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_int_sub(n1, n2, "sub_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_int_sub(n1, n2, "sub_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_int_sub(n1, n2, "sub_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_int_sub(n1, n2, "sub_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_int_sub(n1, n2, "sub_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::F64)),
+                                BasicValueEnum::FloatValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::F64)),
+                                BasicValueEnum::FloatValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_float_sub(n1, n2, "sub_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::F64)),
+                                BasicValueEnum::FloatValue(result),
+                            ));
+                        }
+                        _ => return Err(CompilerError::UnexpectedType),
+                    }
+                    Ok(())
+                },
+            ) as BoxDefinitionType<'ctx>),
         ),
         pop2_push1(
             &all_number_types,
             None,
             "*".into(),
-            Rc::new(Box::new(|args: Vec<Value>| match (&args[0], &args[1]) {
-                (
-                    Value::IntegerNumber(IntegerNumber::U8(n1)),
-                    Value::IntegerNumber(IntegerNumber::U8(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::U8(n1 * n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U16(n1)),
-                    Value::IntegerNumber(IntegerNumber::U16(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::U16(n1 * n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U32(n1)),
-                    Value::IntegerNumber(IntegerNumber::U32(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::U32(n1 * n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U64(n1)),
-                    Value::IntegerNumber(IntegerNumber::U64(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::U64(n1 * n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U128(n1)),
-                    Value::IntegerNumber(IntegerNumber::U128(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::U128(n1 * n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I8(n1)),
-                    Value::IntegerNumber(IntegerNumber::I8(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::I8(n1 * n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I16(n1)),
-                    Value::IntegerNumber(IntegerNumber::I16(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::I16(n1 * n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I32(n1)),
-                    Value::IntegerNumber(IntegerNumber::I32(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::I32(n1 * n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I64(n1)),
-                    Value::IntegerNumber(IntegerNumber::I64(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::I64(n1 * n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I128(n1)),
-                    Value::IntegerNumber(IntegerNumber::I128(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::I128(n1 * n2))]),
-                (Value::FloatNumber(n1), Value::FloatNumber(n2)) => {
-                    Ok(vec![Value::FloatNumber(n1 * n2)])
-                }
-                (other1, other2) => Err(RuntimeError::Unexpected(format!(
-                    "Unexpected types used in + function. {:?} {:?}",
-                    other1, other2
-                ))),
-            })),
+            Rc::new(Box::new(
+                |compiler_context: &CompilerContext<'ctx>,
+                 stack: &mut Stack<'ctx>|
+                 -> Result<(), CompilerError> {
+                    let arg1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    let arg2 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    match (arg1, arg2) {
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_int_mul(n1, n2, "mul_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_int_mul(n1, n2, "mul_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_int_mul(n1, n2, "mul_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_int_mul(n1, n2, "mul_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_int_mul(n1, n2, "mul_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_int_mul(n1, n2, "mul_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_int_mul(n1, n2, "mul_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_int_mul(n1, n2, "mul_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_int_mul(n1, n2, "mul_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_int_mul(n1, n2, "mul_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::F64)),
+                                BasicValueEnum::FloatValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::F64)),
+                                BasicValueEnum::FloatValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_float_mul(n1, n2, "mul_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::F64)),
+                                BasicValueEnum::FloatValue(result),
+                            ));
+                        }
+                        _ => return Err(CompilerError::UnexpectedType),
+                    }
+                    Ok(())
+                },
+            ) as BoxDefinitionType<'ctx>),
         ),
         pop2_push1(
-            &all_number_types,
+            &all_integer_types,
             None,
             "%".into(),
-            Rc::new(Box::new(|args: Vec<Value>| match (&args[0], &args[1]) {
-                (
-                    Value::IntegerNumber(IntegerNumber::U8(n1)),
-                    Value::IntegerNumber(IntegerNumber::U8(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::U8(n1 % n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U16(n1)),
-                    Value::IntegerNumber(IntegerNumber::U16(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::U16(n1 % n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U32(n1)),
-                    Value::IntegerNumber(IntegerNumber::U32(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::U32(n1 % n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U64(n1)),
-                    Value::IntegerNumber(IntegerNumber::U64(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::U64(n1 % n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U128(n1)),
-                    Value::IntegerNumber(IntegerNumber::U128(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::U128(n1 % n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I8(n1)),
-                    Value::IntegerNumber(IntegerNumber::I8(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::I8(n1 % n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I16(n1)),
-                    Value::IntegerNumber(IntegerNumber::I16(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::I16(n1 % n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I32(n1)),
-                    Value::IntegerNumber(IntegerNumber::I32(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::I32(n1 % n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I64(n1)),
-                    Value::IntegerNumber(IntegerNumber::I64(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::I64(n1 % n2))]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I128(n1)),
-                    Value::IntegerNumber(IntegerNumber::I128(n2)),
-                ) => Ok(vec![Value::IntegerNumber(IntegerNumber::I128(n1 % n2))]),
-                (Value::FloatNumber(n1), Value::FloatNumber(n2)) => {
-                    Ok(vec![Value::FloatNumber(n1 % n2)])
-                }
-                (other1, other2) => Err(RuntimeError::Unexpected(format!(
-                    "Unexpected types used in - function. {:?} {:?}",
-                    other1, other2
-                ))),
-            })),
+            Rc::new(Box::new(
+                |compiler_context: &CompilerContext<'ctx>,
+                 stack: &mut Stack<'ctx>|
+                 -> Result<(), CompilerError> {
+                    let arg1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    let arg2 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    match (arg2, arg1) {
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_unsigned_rem(
+                                n1,
+                                n2,
+                                "rem_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_unsigned_rem(
+                                n1,
+                                n2,
+                                "rem_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_unsigned_rem(
+                                n1,
+                                n2,
+                                "rem_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_unsigned_rem(
+                                n1,
+                                n2,
+                                "rem_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_unsigned_rem(
+                                n1,
+                                n2,
+                                "rem_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_signed_rem(
+                                n1,
+                                n2,
+                                "rem_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_signed_rem(
+                                n1,
+                                n2,
+                                "rem_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_signed_rem(
+                                n1,
+                                n2,
+                                "rem_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_signed_rem(
+                                n1,
+                                n2,
+                                "rem_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_signed_rem(
+                                n1,
+                                n2,
+                                "rem_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        _ => return Err(CompilerError::UnexpectedType),
+                    }
+                    Ok(())
+                },
+            ) as BoxDefinitionType<'ctx>),
         ),
         pop2_push1(
             &all_literal_types,
             Some(UnitType::Literal(LiteralType::Boolean)),
             ">".into(),
-            Rc::new(Box::new(|args: Vec<Value>| match (&args[0], &args[1]) {
-                (
-                    Value::IntegerNumber(IntegerNumber::U8(n1)),
-                    Value::IntegerNumber(IntegerNumber::U8(n2)),
-                ) => Ok(vec![Value::Boolean(n1 > n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U16(n1)),
-                    Value::IntegerNumber(IntegerNumber::U16(n2)),
-                ) => Ok(vec![Value::Boolean(n1 > n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U32(n1)),
-                    Value::IntegerNumber(IntegerNumber::U32(n2)),
-                ) => Ok(vec![Value::Boolean(n1 > n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U64(n1)),
-                    Value::IntegerNumber(IntegerNumber::U64(n2)),
-                ) => Ok(vec![Value::Boolean(n1 > n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U128(n1)),
-                    Value::IntegerNumber(IntegerNumber::U128(n2)),
-                ) => Ok(vec![Value::Boolean(n1 > n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I8(n1)),
-                    Value::IntegerNumber(IntegerNumber::I8(n2)),
-                ) => Ok(vec![Value::Boolean(n1 > n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I16(n1)),
-                    Value::IntegerNumber(IntegerNumber::I16(n2)),
-                ) => Ok(vec![Value::Boolean(n1 > n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I32(n1)),
-                    Value::IntegerNumber(IntegerNumber::I32(n2)),
-                ) => Ok(vec![Value::Boolean(n1 > n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I64(n1)),
-                    Value::IntegerNumber(IntegerNumber::I64(n2)),
-                ) => Ok(vec![Value::Boolean(n1 > n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I128(n1)),
-                    Value::IntegerNumber(IntegerNumber::I128(n2)),
-                ) => Ok(vec![Value::Boolean(n1 > n2)]),
-                (Value::FloatNumber(n1), Value::FloatNumber(n2)) => {
-                    Ok(vec![Value::Boolean(n1 > n2)])
-                }
-                (Value::String(n1), Value::String(n2)) => Ok(vec![Value::Boolean(n1 > n2)]),
-                (Value::Boolean(n1), Value::Boolean(n2)) => Ok(vec![Value::Boolean(n1 > n2)]),
-                (other1, other2) => Err(RuntimeError::Unexpected(format!(
-                    "Unexpected types used in > function. {:?} {:?}",
-                    other1, other2
-                ))),
-            })),
+            Rc::new(Box::new(
+                |compiler_context: &CompilerContext<'ctx>,
+                 stack: &mut Stack<'ctx>|
+                 -> Result<(), CompilerError> {
+                    let arg1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    let arg2 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    match (arg2, arg1) {
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::UGT,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::UGT,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::UGT,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::UGT,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::UGT,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::SGT,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::SGT,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::SGT,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::SGT,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::SGT,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::F64)),
+                                BasicValueEnum::FloatValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::F64)),
+                                BasicValueEnum::FloatValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_float_compare(
+                                inkwell::FloatPredicate::OGT,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (UnitType::Literal(LiteralType::Boolean), BasicValueEnum::IntValue(n1)),
+                            (UnitType::Literal(LiteralType::Boolean), BasicValueEnum::IntValue(n2)),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::UGT,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::String),
+                                BasicValueEnum::PointerValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::String),
+                                BasicValueEnum::PointerValue(n2),
+                            ),
+                        ) => {
+                            let strcmp_fn = compiler_context
+                                .module
+                                .get_function("strcmp")
+                                .ok_or(CompilerError::FunctionCallError)?;
+
+                            let strcmp_result = compiler_context
+                                .builder
+                                .build_call(strcmp_fn, &[n1.into(), n2.into()], "strcmp_call")?
+                                .try_as_basic_value()
+                                .left()
+                                .unwrap()
+                                .into_int_value();
+
+                            let zero = compiler_context.context.i32_type().const_zero();
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::SGT,
+                                strcmp_result,
+                                zero,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        _ => return Err(CompilerError::UnexpectedType),
+                    }
+                    Ok(())
+                },
+            ) as BoxDefinitionType<'ctx>),
         ),
         pop2_push1(
             &all_literal_types,
             Some(UnitType::Literal(LiteralType::Boolean)),
             "<".into(),
-            Rc::new(Box::new(|args: Vec<Value>| match (&args[0], &args[1]) {
-                (
-                    Value::IntegerNumber(IntegerNumber::U8(n1)),
-                    Value::IntegerNumber(IntegerNumber::U8(n2)),
-                ) => Ok(vec![Value::Boolean(n1 < n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U16(n1)),
-                    Value::IntegerNumber(IntegerNumber::U16(n2)),
-                ) => Ok(vec![Value::Boolean(n1 < n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U32(n1)),
-                    Value::IntegerNumber(IntegerNumber::U32(n2)),
-                ) => Ok(vec![Value::Boolean(n1 < n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U64(n1)),
-                    Value::IntegerNumber(IntegerNumber::U64(n2)),
-                ) => Ok(vec![Value::Boolean(n1 < n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U128(n1)),
-                    Value::IntegerNumber(IntegerNumber::U128(n2)),
-                ) => Ok(vec![Value::Boolean(n1 < n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I8(n1)),
-                    Value::IntegerNumber(IntegerNumber::I8(n2)),
-                ) => Ok(vec![Value::Boolean(n1 < n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I16(n1)),
-                    Value::IntegerNumber(IntegerNumber::I16(n2)),
-                ) => Ok(vec![Value::Boolean(n1 < n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I32(n1)),
-                    Value::IntegerNumber(IntegerNumber::I32(n2)),
-                ) => Ok(vec![Value::Boolean(n1 < n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I64(n1)),
-                    Value::IntegerNumber(IntegerNumber::I64(n2)),
-                ) => Ok(vec![Value::Boolean(n1 < n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I128(n1)),
-                    Value::IntegerNumber(IntegerNumber::I128(n2)),
-                ) => Ok(vec![Value::Boolean(n1 < n2)]),
-                (Value::FloatNumber(n1), Value::FloatNumber(n2)) => {
-                    Ok(vec![Value::Boolean(n1 < n2)])
-                }
-                (Value::String(n1), Value::String(n2)) => Ok(vec![Value::Boolean(n1 < n2)]),
-                (Value::Boolean(n1), Value::Boolean(n2)) => Ok(vec![Value::Boolean(n1 < n2)]),
-                (other1, other2) => Err(RuntimeError::Unexpected(format!(
-                    "Unexpected types used in < function. {:?} {:?}",
-                    other1, other2
-                ))),
-            })),
+            Rc::new(Box::new(
+                |compiler_context: &CompilerContext<'ctx>,
+                 stack: &mut Stack<'ctx>|
+                 -> Result<(), CompilerError> {
+                    let arg1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    let arg2 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    match (arg2, arg1) {
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::ULT,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::ULT,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::ULT,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::ULT,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::ULT,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::SLT,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::SLT,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::SLT,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::SLT,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::SLT,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::F64)),
+                                BasicValueEnum::FloatValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::F64)),
+                                BasicValueEnum::FloatValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_float_compare(
+                                inkwell::FloatPredicate::OLT,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (UnitType::Literal(LiteralType::Boolean), BasicValueEnum::IntValue(n1)),
+                            (UnitType::Literal(LiteralType::Boolean), BasicValueEnum::IntValue(n2)),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::ULT,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::String),
+                                BasicValueEnum::PointerValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::String),
+                                BasicValueEnum::PointerValue(n2),
+                            ),
+                        ) => {
+                            let strcmp_fn = compiler_context
+                                .module
+                                .get_function("strcmp")
+                                .ok_or(CompilerError::FunctionCallError)?;
+
+                            let strcmp_result = compiler_context
+                                .builder
+                                .build_call(strcmp_fn, &[n1.into(), n2.into()], "strcmp_call")?
+                                .try_as_basic_value()
+                                .left()
+                                .unwrap()
+                                .into_int_value();
+
+                            let zero = compiler_context.context.i32_type().const_zero();
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::SLT,
+                                strcmp_result,
+                                zero,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        _ => return Err(CompilerError::UnexpectedType),
+                    }
+                    Ok(())
+                },
+            ) as BoxDefinitionType<'ctx>),
         ),
         pop2_push1(
             &all_literal_types,
             Some(UnitType::Literal(LiteralType::Boolean)),
             "=".into(),
-            Rc::new(Box::new(|args: Vec<Value>| match (&args[0], &args[1]) {
-                (
-                    Value::IntegerNumber(IntegerNumber::U8(n1)),
-                    Value::IntegerNumber(IntegerNumber::U8(n2)),
-                ) => Ok(vec![Value::Boolean(n1 == n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U16(n1)),
-                    Value::IntegerNumber(IntegerNumber::U16(n2)),
-                ) => Ok(vec![Value::Boolean(n1 == n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U32(n1)),
-                    Value::IntegerNumber(IntegerNumber::U32(n2)),
-                ) => Ok(vec![Value::Boolean(n1 == n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U64(n1)),
-                    Value::IntegerNumber(IntegerNumber::U64(n2)),
-                ) => Ok(vec![Value::Boolean(n1 == n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U128(n1)),
-                    Value::IntegerNumber(IntegerNumber::U128(n2)),
-                ) => Ok(vec![Value::Boolean(n1 == n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I8(n1)),
-                    Value::IntegerNumber(IntegerNumber::I8(n2)),
-                ) => Ok(vec![Value::Boolean(n1 == n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I16(n1)),
-                    Value::IntegerNumber(IntegerNumber::I16(n2)),
-                ) => Ok(vec![Value::Boolean(n1 == n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I32(n1)),
-                    Value::IntegerNumber(IntegerNumber::I32(n2)),
-                ) => Ok(vec![Value::Boolean(n1 == n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I64(n1)),
-                    Value::IntegerNumber(IntegerNumber::I64(n2)),
-                ) => Ok(vec![Value::Boolean(n1 == n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I128(n1)),
-                    Value::IntegerNumber(IntegerNumber::I128(n2)),
-                ) => Ok(vec![Value::Boolean(n1 == n2)]),
-                (Value::FloatNumber(n1), Value::FloatNumber(n2)) => {
-                    Ok(vec![Value::Boolean(n1 == n2)])
-                }
-                (Value::String(n1), Value::String(n2)) => Ok(vec![Value::Boolean(n1 == n2)]),
-                (Value::Boolean(n1), Value::Boolean(n2)) => Ok(vec![Value::Boolean(n1 == n2)]),
-                (other1, other2) => Err(RuntimeError::Unexpected(format!(
-                    "Unexpected types used in == function. {:?} {:?}",
-                    other1, other2
-                ))),
-            })),
+            Rc::new(Box::new(
+                |compiler_context: &CompilerContext<'ctx>,
+                 stack: &mut Stack<'ctx>|
+                 -> Result<(), CompilerError> {
+                    let arg1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    let arg2 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    match (arg2, arg1) {
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::EQ,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::EQ,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::EQ,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::EQ,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::EQ,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::EQ,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::EQ,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::EQ,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::EQ,
+                                n1,
+                                n2,
+                                "eq_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::EQ,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::F64)),
+                                BasicValueEnum::FloatValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::F64)),
+                                BasicValueEnum::FloatValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_float_compare(
+                                inkwell::FloatPredicate::OEQ,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (UnitType::Literal(LiteralType::Boolean), BasicValueEnum::IntValue(n1)),
+                            (UnitType::Literal(LiteralType::Boolean), BasicValueEnum::IntValue(n2)),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::EQ,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::String),
+                                BasicValueEnum::PointerValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::String),
+                                BasicValueEnum::PointerValue(n2),
+                            ),
+                        ) => {
+                            let strcmp_fn = compiler_context
+                                .module
+                                .get_function("strcmp")
+                                .ok_or(CompilerError::FunctionCallError)?;
+
+                            let strcmp_result = compiler_context
+                                .builder
+                                .build_call(strcmp_fn, &[n1.into(), n2.into()], "strcmp_call")?
+                                .try_as_basic_value()
+                                .left()
+                                .unwrap()
+                                .into_int_value();
+
+                            let zero = compiler_context.context.i32_type().const_zero();
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::EQ,
+                                strcmp_result,
+                                zero,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        _ => return Err(CompilerError::UnexpectedType),
+                    }
+                    Ok(())
+                },
+            ) as BoxDefinitionType<'ctx>),
         ),
         pop2_push1(
             &all_integer_types,
             Some(UnitType::Literal(LiteralType::Boolean)),
             "!=".into(),
-            Rc::new(Box::new(|args: Vec<Value>| match (&args[0], &args[1]) {
-                (
-                    Value::IntegerNumber(IntegerNumber::U8(n1)),
-                    Value::IntegerNumber(IntegerNumber::U8(n2)),
-                ) => Ok(vec![Value::Boolean(n1 != n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U16(n1)),
-                    Value::IntegerNumber(IntegerNumber::U16(n2)),
-                ) => Ok(vec![Value::Boolean(n1 != n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U32(n1)),
-                    Value::IntegerNumber(IntegerNumber::U32(n2)),
-                ) => Ok(vec![Value::Boolean(n1 != n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U64(n1)),
-                    Value::IntegerNumber(IntegerNumber::U64(n2)),
-                ) => Ok(vec![Value::Boolean(n1 != n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::U128(n1)),
-                    Value::IntegerNumber(IntegerNumber::U128(n2)),
-                ) => Ok(vec![Value::Boolean(n1 != n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I8(n1)),
-                    Value::IntegerNumber(IntegerNumber::I8(n2)),
-                ) => Ok(vec![Value::Boolean(n1 != n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I16(n1)),
-                    Value::IntegerNumber(IntegerNumber::I16(n2)),
-                ) => Ok(vec![Value::Boolean(n1 != n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I32(n1)),
-                    Value::IntegerNumber(IntegerNumber::I32(n2)),
-                ) => Ok(vec![Value::Boolean(n1 != n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I64(n1)),
-                    Value::IntegerNumber(IntegerNumber::I64(n2)),
-                ) => Ok(vec![Value::Boolean(n1 != n2)]),
-                (
-                    Value::IntegerNumber(IntegerNumber::I128(n1)),
-                    Value::IntegerNumber(IntegerNumber::I128(n2)),
-                ) => Ok(vec![Value::Boolean(n1 != n2)]),
-                (Value::FloatNumber(n1), Value::FloatNumber(n2)) => {
-                    Ok(vec![Value::Boolean(n1 != n2)])
-                }
-                (Value::String(n1), Value::String(n2)) => Ok(vec![Value::Boolean(n1 != n2)]),
-                (Value::Boolean(n1), Value::Boolean(n2)) => Ok(vec![Value::Boolean(n1 != n2)]),
-                (other1, other2) => Err(RuntimeError::Unexpected(format!(
-                    "Unexpected types used in < function. {:?} {:?}",
-                    other1, other2
-                ))),
-            })),
+            Rc::new(Box::new(
+                |compiler_context: &CompilerContext<'ctx>,
+                 stack: &mut Stack<'ctx>|
+                 -> Result<(), CompilerError> {
+                    let arg1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    let arg2 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    match (arg2, arg1) {
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::NE,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::NE,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::NE,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::NE,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::NE,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::NE,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::NE,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::NE,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::NE,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                                BasicValueEnum::IntValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                                BasicValueEnum::IntValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::NE,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::F64)),
+                                BasicValueEnum::FloatValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::F64)),
+                                BasicValueEnum::FloatValue(n2),
+                            ),
+                        ) => {
+                            let result = compiler_context.builder.build_float_compare(
+                                inkwell::FloatPredicate::ONE,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (UnitType::Literal(LiteralType::Boolean), BasicValueEnum::IntValue(n1)),
+                            (UnitType::Literal(LiteralType::Boolean), BasicValueEnum::IntValue(n2)),
+                        ) => {
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::NE,
+                                n1,
+                                n2,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::String),
+                                BasicValueEnum::PointerValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::String),
+                                BasicValueEnum::PointerValue(n2),
+                            ),
+                        ) => {
+                            let strcmp_fn = compiler_context
+                                .module
+                                .get_function("strcmp")
+                                .ok_or(CompilerError::FunctionCallError)?;
+
+                            let strcmp_result = compiler_context
+                                .builder
+                                .build_call(strcmp_fn, &[n1.into(), n2.into()], "strcmp_call")?
+                                .try_as_basic_value()
+                                .left()
+                                .unwrap()
+                                .into_int_value();
+
+                            let zero = compiler_context.context.i32_type().const_zero();
+                            let result = compiler_context.builder.build_int_compare(
+                                IntPredicate::NE,
+                                strcmp_result,
+                                zero,
+                                "gt_result",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Boolean),
+                                BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        _ => return Err(CompilerError::UnexpectedType),
+                    }
+                    Ok(())
+                },
+            ) as BoxDefinitionType<'ctx>),
         ),
     ]
     .concat()
 }
 
-fn pop1_push0(types: &[UnitType], name: String, function: Function) -> Vec<InternalFunction> {
+fn pop1_push0<'ctx>(
+    types: &[UnitType],
+    name: String,
+    function: DefinitionType<'ctx>,
+) -> Vec<InternalFunction<'ctx>> {
     let mut result = Vec::new();
     for ty in types {
         result.push(InternalFunction {
-            arity: 1,
             name: name.clone(),
             ty: Type::new(vec![ty.clone()], vec![]),
             function: function.clone(),
@@ -661,16 +2394,15 @@ fn pop1_push0(types: &[UnitType], name: String, function: Function) -> Vec<Inter
     result
 }
 
-fn pop2_push1(
+fn pop2_push1<'ctx>(
     pop_types: &[UnitType],
     push_type: Option<UnitType>,
     name: String,
-    function: Function,
-) -> Vec<InternalFunction> {
+    function: DefinitionType<'ctx>,
+) -> Vec<InternalFunction<'ctx>> {
     let mut result = Vec::new();
     for ty in pop_types {
         result.push(InternalFunction {
-            arity: 2,
             name: name.clone(),
             ty: Type::new(
                 vec![ty.clone(), ty.clone()],

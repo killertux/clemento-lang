@@ -493,12 +493,12 @@ impl Display for Type {
                 .iter()
                 .map(|t| t.to_consistent_string(&mut var_t_container))
                 .collect::<Vec<String>>()
-                .join(", "),
+                .join(" "),
             self.push_types
                 .iter()
                 .map(|t| t.to_consistent_string(&mut var_t_container))
                 .collect::<Vec<String>>()
-                .join(", ")
+                .join(" ")
         )
     }
 }
