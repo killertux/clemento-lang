@@ -1,3 +1,5 @@
+import std::*
+
 def fizz_buzz (I64 ->) {
     dup 3 % 0 = if { "Fizz" print }
     dup 5 % 0 = if { "Buzz" print }

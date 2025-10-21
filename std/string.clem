@@ -1,0 +1,24 @@
+import std::stack
+import std::cmp
+import std::math
+
+defx concat (String String -> String)
+defx String (String -> String)
+defx String (U8 -> String)
+defx String (U16 -> String)
+defx String (U32 -> String)
+defx String (U64 -> String)
+def to_string (String U128 -> String) {
+    dup 10u128 / swap 10u8 % String rot concat swap dup 0u128 = if { drop touch } else { to_string }
+}
+def String (U128 -> String) { "" swap  to_string }
+defx String (I8 -> String)
+defx String (I16 -> String)
+defx String (I32 -> String)
+defx String (I64 -> String)
+def inner_to_string (String I128 -> String) {
+    dup 10i128 / abs swap 10i8 % abs String rot concat swap dup 0i128 = if { drop touch } else { inner_to_string }
+}
+def String (I128 -> String) { dup 0i128 < if { "" swap inner_to_string "-" swap concat } else { "" swap inner_to_string } }
+defx String (F64 -> String)
+defx String (Boolean -> String)

@@ -1,6 +1,8 @@
 use std::rc::Rc;
 
-use inkwell::{IntPredicate, values::BasicValueEnum};
+use inkwell::{
+    AddressSpace, IntPredicate, context::Context, module::Module, values::BasicValueEnum,
+};
 
 use crate::{
     compiler::{BoxDefinitionType, CompilerContext, CompilerError, DefinitionType, Stack},
@@ -14,7 +16,24 @@ pub struct InternalFunction<'ctx> {
     pub function: DefinitionType<'ctx>,
 }
 
-pub fn builtins_functions<'ctx>() -> Vec<InternalFunction<'ctx>> {
+pub fn builtins_functions<'ctx>(
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+) -> Vec<InternalFunction<'ctx>> {
+    let ptr_type = context.ptr_type(AddressSpace::default());
+    let printf_type = context.i32_type().fn_type(&[ptr_type.into()], true);
+    module.add_function("printf", printf_type, None);
+    let strcmp_type = context
+        .i32_type()
+        .fn_type(&[ptr_type.into(), ptr_type.into()], false);
+    module.add_function("strcmp", strcmp_type, None);
+    let sprintf_type = context
+        .i32_type()
+        .fn_type(&[ptr_type.into(), ptr_type.into()], true);
+    module.add_function("sprintf", sprintf_type, None);
+    let strlen_type = context.i64_type().fn_type(&[ptr_type.into()], false);
+    module.add_function("strlen", strlen_type, None);
+
     let all_integer_types = vec![
         UnitType::Literal(LiteralType::Number(NumberType::U8)),
         UnitType::Literal(LiteralType::Number(NumberType::U16)),
@@ -33,8 +52,100 @@ pub fn builtins_functions<'ctx>() -> Vec<InternalFunction<'ctx>> {
 
     let mut all_literal_types = all_number_types.clone();
     all_literal_types.push(UnitType::Literal(LiteralType::String));
+    all_literal_types.push(UnitType::Literal(LiteralType::Boolean));
 
     [
+        vec![InternalFunction {
+            name: "concat".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::String),
+                    UnitType::Literal(LiteralType::String),
+                ],
+                vec![UnitType::Literal(LiteralType::String)],
+            ),
+            function: Rc::new(Box::new(
+                |compiler_context: &CompilerContext<'ctx>,
+                 stack: &mut Stack<'ctx>|
+                 -> Result<(), CompilerError> {
+                    let value1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    let value2 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    match (value2, value1) {
+                        (
+                            (
+                                UnitType::Literal(LiteralType::String),
+                                BasicValueEnum::PointerValue(p1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::String),
+                                BasicValueEnum::PointerValue(p2),
+                            ),
+                        ) => {
+                            let output_buffer = compiler_context.builder.build_alloca(
+                                compiler_context.context.i8_type().array_type(1024),
+                                "output_buffer",
+                            )?;
+                            let format_str = compiler_context
+                                .builder
+                                .build_global_string_ptr("%s%s", "concat_fmt")?
+                                .as_pointer_value();
+                            let sprintf = compiler_context
+                                .module
+                                .get_function("sprintf")
+                                .ok_or(CompilerError::GetFunctionError("sprintf".into()))?;
+                            compiler_context.builder.build_call(
+                                sprintf,
+                                &[
+                                    output_buffer.into(),
+                                    format_str.into(),
+                                    p1.into(),
+                                    p2.into(),
+                                ],
+                                "call_sprintf",
+                            )?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::String),
+                                output_buffer.into(),
+                            ));
+                        }
+                        _other => return Err(CompilerError::FunctionCallError),
+                    }
+                    Ok(())
+                },
+            ) as BoxDefinitionType<'ctx>),
+        }],
+        pop1_push1(
+            &all_literal_types,
+            Some(UnitType::Literal(LiteralType::String)),
+            "String".into(),
+            Rc::new(Box::new(
+                |compiler_context: &CompilerContext<'ctx>,
+                 stack: &mut Stack<'ctx>|
+                 -> Result<(), CompilerError> {
+                    let value = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    let format_str = get_format_str(value.0)?;
+                    let output_buffer = compiler_context.builder.build_alloca(
+                        compiler_context.context.i8_type().array_type(40),
+                        "output_buffer",
+                    )?;
+                    let format_str = compiler_context
+                        .builder
+                        .build_global_string_ptr(format_str, "int_fmt")?
+                        .as_pointer_value();
+                    let sprintf = compiler_context
+                        .module
+                        .get_function("sprintf")
+                        .ok_or(CompilerError::GetFunctionError("sprintf".into()))?;
+                    compiler_context.builder.build_call(
+                        sprintf,
+                        &[output_buffer.into(), format_str.into(), value.1.into()],
+                        "call_sprintf",
+                    )?;
+                    stack.push((UnitType::Literal(LiteralType::String), output_buffer.into()));
+                    Ok(())
+                },
+            ) as BoxDefinitionType<'ctx>),
+        ),
         pop1_push0(
             &all_literal_types,
             "print".into(),
@@ -43,22 +154,7 @@ pub fn builtins_functions<'ctx>() -> Vec<InternalFunction<'ctx>> {
                  stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> {
                     let value = stack.pop().ok_or(CompilerError::StackUnderflow)?;
-                    let format_str = match value.0 {
-                        UnitType::Literal(LiteralType::Number(NumberType::U8)) => "%hhu",
-                        UnitType::Literal(LiteralType::Number(NumberType::I8)) => "%hhi",
-                        UnitType::Literal(LiteralType::Number(NumberType::U16)) => "%hu",
-                        UnitType::Literal(LiteralType::Number(NumberType::I16)) => "%hi",
-                        UnitType::Literal(LiteralType::Number(NumberType::U32)) => "%u",
-                        UnitType::Literal(LiteralType::Number(NumberType::I32)) => "%i",
-                        UnitType::Literal(LiteralType::Number(NumberType::U64)) => "%llu",
-                        UnitType::Literal(LiteralType::Number(NumberType::I64)) => "%lli",
-                        UnitType::Literal(LiteralType::Number(NumberType::U128)) => "%llu", //TODO We will need to implement a custom format specifier for u128
-                        UnitType::Literal(LiteralType::Number(NumberType::I128)) => "%lli",
-                        UnitType::Literal(LiteralType::Number(NumberType::F64)) => "%f",
-                        UnitType::Literal(LiteralType::String) => "%s",
-                        UnitType::Literal(LiteralType::Boolean) => "%d",
-                        _other => return Err(CompilerError::FunctionCallError),
-                    };
+                    let format_str = get_format_str(value.0)?;
                     let format_str = compiler_context
                         .builder
                         .build_global_string_ptr(format_str, "int_fmt")?
@@ -84,25 +180,10 @@ pub fn builtins_functions<'ctx>() -> Vec<InternalFunction<'ctx>> {
                  stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> {
                     let value = stack.pop().ok_or(CompilerError::StackUnderflow)?;
-                    let format_str = match value.0 {
-                        UnitType::Literal(LiteralType::Number(NumberType::U8)) => "%hhu\n",
-                        UnitType::Literal(LiteralType::Number(NumberType::I8)) => "%hhi\n",
-                        UnitType::Literal(LiteralType::Number(NumberType::U16)) => "%hu\n",
-                        UnitType::Literal(LiteralType::Number(NumberType::I16)) => "%hi\n",
-                        UnitType::Literal(LiteralType::Number(NumberType::U32)) => "%u\n",
-                        UnitType::Literal(LiteralType::Number(NumberType::I32)) => "%i\n",
-                        UnitType::Literal(LiteralType::Number(NumberType::U64)) => "%llu\n",
-                        UnitType::Literal(LiteralType::Number(NumberType::I64)) => "%lli\n",
-                        UnitType::Literal(LiteralType::Number(NumberType::U128)) => "%llu\n", //TODO We will need to implement a custom format specifier for u128
-                        UnitType::Literal(LiteralType::Number(NumberType::I128)) => "%lli\n",
-                        UnitType::Literal(LiteralType::Number(NumberType::F64)) => "%f\n",
-                        UnitType::Literal(LiteralType::String) => "%s\n",
-                        UnitType::Literal(LiteralType::Boolean) => "%d\n",
-                        _other => return Err(CompilerError::FunctionCallError),
-                    };
+                    let format_str = format!("{}\n", get_format_str(value.0)?);
                     let format_str = compiler_context
                         .builder
-                        .build_global_string_ptr(format_str, "int_fmt")?
+                        .build_global_string_ptr(&format_str, "int_fmt")?
                         .as_pointer_value();
                     let printf = compiler_context
                         .module
@@ -135,6 +216,21 @@ pub fn builtins_functions<'ctx>() -> Vec<InternalFunction<'ctx>> {
                     stack.push(value.clone());
                     Ok(())
                 },
+            ) as BoxDefinitionType<'ctx>),
+        }],
+        vec![InternalFunction {
+            name: "touch".into(),
+            ty: {
+                let var = VarType::new();
+                Type::new(
+                    vec![UnitType::Var(var.clone())],
+                    vec![UnitType::Var(var.clone())],
+                )
+            },
+            function: Rc::new(Box::new(
+                |_compiler_context: &CompilerContext<'ctx>,
+                 _stack: &mut Stack<'ctx>|
+                 -> Result<(), CompilerError> { Ok(()) },
             ) as BoxDefinitionType<'ctx>),
         }],
         vec![InternalFunction {
@@ -966,9 +1062,9 @@ pub fn builtins_functions<'ctx>() -> Vec<InternalFunction<'ctx>> {
             ) as BoxDefinitionType<'ctx>),
         ),
         pop2_push1(
-            &all_integer_types,
+            &all_number_types,
             None,
-            "%".into(),
+            "/".into(),
             Rc::new(Box::new(
                 |compiler_context: &CompilerContext<'ctx>,
                  stack: &mut Stack<'ctx>|
@@ -986,10 +1082,10 @@ pub fn builtins_functions<'ctx>() -> Vec<InternalFunction<'ctx>> {
                                 BasicValueEnum::IntValue(n2),
                             ),
                         ) => {
-                            let result = compiler_context.builder.build_int_unsigned_rem(
+                            let result = compiler_context.builder.build_int_unsigned_div(
                                 n1,
                                 n2,
-                                "rem_result",
+                                "mul_result",
                             )?;
                             stack.push((
                                 UnitType::Literal(LiteralType::Number(NumberType::U8)),
@@ -1006,10 +1102,10 @@ pub fn builtins_functions<'ctx>() -> Vec<InternalFunction<'ctx>> {
                                 BasicValueEnum::IntValue(n2),
                             ),
                         ) => {
-                            let result = compiler_context.builder.build_int_unsigned_rem(
+                            let result = compiler_context.builder.build_int_unsigned_div(
                                 n1,
                                 n2,
-                                "rem_result",
+                                "mul_result",
                             )?;
                             stack.push((
                                 UnitType::Literal(LiteralType::Number(NumberType::U16)),
@@ -1026,10 +1122,10 @@ pub fn builtins_functions<'ctx>() -> Vec<InternalFunction<'ctx>> {
                                 BasicValueEnum::IntValue(n2),
                             ),
                         ) => {
-                            let result = compiler_context.builder.build_int_unsigned_rem(
+                            let result = compiler_context.builder.build_int_unsigned_div(
                                 n1,
                                 n2,
-                                "rem_result",
+                                "mul_result",
                             )?;
                             stack.push((
                                 UnitType::Literal(LiteralType::Number(NumberType::U32)),
@@ -1046,10 +1142,10 @@ pub fn builtins_functions<'ctx>() -> Vec<InternalFunction<'ctx>> {
                                 BasicValueEnum::IntValue(n2),
                             ),
                         ) => {
-                            let result = compiler_context.builder.build_int_unsigned_rem(
+                            let result = compiler_context.builder.build_int_unsigned_div(
                                 n1,
                                 n2,
-                                "rem_result",
+                                "mul_result",
                             )?;
                             stack.push((
                                 UnitType::Literal(LiteralType::Number(NumberType::U64)),
@@ -1066,10 +1162,10 @@ pub fn builtins_functions<'ctx>() -> Vec<InternalFunction<'ctx>> {
                                 BasicValueEnum::IntValue(n2),
                             ),
                         ) => {
-                            let result = compiler_context.builder.build_int_unsigned_rem(
+                            let result = compiler_context.builder.build_int_unsigned_div(
                                 n1,
                                 n2,
-                                "rem_result",
+                                "mul_result",
                             )?;
                             stack.push((
                                 UnitType::Literal(LiteralType::Number(NumberType::U128)),
@@ -1086,10 +1182,10 @@ pub fn builtins_functions<'ctx>() -> Vec<InternalFunction<'ctx>> {
                                 BasicValueEnum::IntValue(n2),
                             ),
                         ) => {
-                            let result = compiler_context.builder.build_int_signed_rem(
+                            let result = compiler_context.builder.build_int_signed_div(
                                 n1,
                                 n2,
-                                "rem_result",
+                                "mul_result",
                             )?;
                             stack.push((
                                 UnitType::Literal(LiteralType::Number(NumberType::I8)),
@@ -1106,10 +1202,10 @@ pub fn builtins_functions<'ctx>() -> Vec<InternalFunction<'ctx>> {
                                 BasicValueEnum::IntValue(n2),
                             ),
                         ) => {
-                            let result = compiler_context.builder.build_int_signed_rem(
+                            let result = compiler_context.builder.build_int_signed_div(
                                 n1,
                                 n2,
-                                "rem_result",
+                                "mul_result",
                             )?;
                             stack.push((
                                 UnitType::Literal(LiteralType::Number(NumberType::I16)),
@@ -1126,10 +1222,10 @@ pub fn builtins_functions<'ctx>() -> Vec<InternalFunction<'ctx>> {
                                 BasicValueEnum::IntValue(n2),
                             ),
                         ) => {
-                            let result = compiler_context.builder.build_int_signed_rem(
+                            let result = compiler_context.builder.build_int_signed_div(
                                 n1,
                                 n2,
-                                "rem_result",
+                                "mul_result",
                             )?;
                             stack.push((
                                 UnitType::Literal(LiteralType::Number(NumberType::I32)),
@@ -1146,10 +1242,10 @@ pub fn builtins_functions<'ctx>() -> Vec<InternalFunction<'ctx>> {
                                 BasicValueEnum::IntValue(n2),
                             ),
                         ) => {
-                            let result = compiler_context.builder.build_int_signed_rem(
+                            let result = compiler_context.builder.build_int_signed_div(
                                 n1,
                                 n2,
-                                "rem_result",
+                                "mul_result",
                             )?;
                             stack.push((
                                 UnitType::Literal(LiteralType::Number(NumberType::I64)),
@@ -1166,14 +1262,33 @@ pub fn builtins_functions<'ctx>() -> Vec<InternalFunction<'ctx>> {
                                 BasicValueEnum::IntValue(n2),
                             ),
                         ) => {
-                            let result = compiler_context.builder.build_int_signed_rem(
+                            let result = compiler_context.builder.build_int_signed_div(
                                 n1,
                                 n2,
-                                "rem_result",
+                                "mul_result",
                             )?;
                             stack.push((
                                 UnitType::Literal(LiteralType::Number(NumberType::I128)),
                                 BasicValueEnum::IntValue(result),
+                            ));
+                        }
+                        (
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::F64)),
+                                BasicValueEnum::FloatValue(n1),
+                            ),
+                            (
+                                UnitType::Literal(LiteralType::Number(NumberType::F64)),
+                                BasicValueEnum::FloatValue(n2),
+                            ),
+                        ) => {
+                            let result =
+                                compiler_context
+                                    .builder
+                                    .build_float_div(n1, n2, "mul_result")?;
+                            stack.push((
+                                UnitType::Literal(LiteralType::Number(NumberType::F64)),
+                                BasicValueEnum::FloatValue(result),
                             ));
                         }
                         _ => return Err(CompilerError::UnexpectedType),
@@ -1182,6 +1297,7 @@ pub fn builtins_functions<'ctx>() -> Vec<InternalFunction<'ctx>> {
                 },
             ) as BoxDefinitionType<'ctx>),
         ),
+        rem(),
         pop2_push1(
             &all_literal_types,
             Some(UnitType::Literal(LiteralType::Boolean)),
@@ -2077,7 +2193,7 @@ pub fn builtins_functions<'ctx>() -> Vec<InternalFunction<'ctx>> {
             ) as BoxDefinitionType<'ctx>),
         ),
         pop2_push1(
-            &all_integer_types,
+            &all_literal_types,
             Some(UnitType::Literal(LiteralType::Boolean)),
             "!=".into(),
             Rc::new(Box::new(
@@ -2378,6 +2494,943 @@ pub fn builtins_functions<'ctx>() -> Vec<InternalFunction<'ctx>> {
     .concat()
 }
 
+fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
+    let function = Rc::new(Box::new(
+        |compiler_context: &CompilerContext<'ctx>,
+         stack: &mut Stack<'ctx>|
+         -> Result<(), CompilerError> {
+            let arg1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+            let arg2 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+            match (arg2, arg1) {
+                (
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                        BasicValueEnum::IntValue(n1),
+                    ),
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                        BasicValueEnum::IntValue(n2),
+                    ),
+                ) => {
+                    let result =
+                        compiler_context
+                            .builder
+                            .build_int_unsigned_rem(n1, n2, "rem_result")?;
+                    stack.push((
+                        UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                        BasicValueEnum::IntValue(result),
+                    ));
+                }
+                (
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                        BasicValueEnum::IntValue(n1),
+                    ),
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                        BasicValueEnum::IntValue(n2),
+                    ),
+                ) => {
+                    let result = compiler_context
+                        .builder
+                        .build_int_unsigned_rem(n1, n2, "rem_result")?
+                        .const_truncate(compiler_context.context.i8_type());
+                    stack.push((
+                        UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                        BasicValueEnum::IntValue(result),
+                    ));
+                }
+                (
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                        BasicValueEnum::IntValue(n1),
+                    ),
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                        BasicValueEnum::IntValue(n2),
+                    ),
+                ) => {
+                    let result =
+                        compiler_context
+                            .builder
+                            .build_int_unsigned_rem(n1, n2, "rem_result")?;
+                    stack.push((
+                        UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                        BasicValueEnum::IntValue(result),
+                    ));
+                }
+                (
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                        BasicValueEnum::IntValue(n1),
+                    ),
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                        BasicValueEnum::IntValue(n2),
+                    ),
+                ) => {
+                    let result = compiler_context
+                        .builder
+                        .build_int_unsigned_rem(n1, n2, "rem_result")?
+                        .const_truncate(compiler_context.context.i8_type());
+                    stack.push((
+                        UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                        BasicValueEnum::IntValue(result),
+                    ));
+                }
+                (
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                        BasicValueEnum::IntValue(n1),
+                    ),
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                        BasicValueEnum::IntValue(n2),
+                    ),
+                ) => {
+                    let result = compiler_context
+                        .builder
+                        .build_int_unsigned_rem(n1, n2, "rem_result")?
+                        .const_truncate(compiler_context.context.i16_type());
+                    stack.push((
+                        UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                        BasicValueEnum::IntValue(result),
+                    ));
+                }
+                (
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                        BasicValueEnum::IntValue(n1),
+                    ),
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                        BasicValueEnum::IntValue(n2),
+                    ),
+                ) => {
+                    let result =
+                        compiler_context
+                            .builder
+                            .build_int_unsigned_rem(n1, n2, "rem_result")?;
+                    stack.push((
+                        UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                        BasicValueEnum::IntValue(result),
+                    ));
+                }
+                (
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                        BasicValueEnum::IntValue(n1),
+                    ),
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                        BasicValueEnum::IntValue(n2),
+                    ),
+                ) => {
+                    let result = compiler_context
+                        .builder
+                        .build_int_unsigned_rem(n1, n2, "rem_result")?
+                        .const_truncate(compiler_context.context.i8_type());
+                    stack.push((
+                        UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                        BasicValueEnum::IntValue(result),
+                    ));
+                }
+                (
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                        BasicValueEnum::IntValue(n1),
+                    ),
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                        BasicValueEnum::IntValue(n2),
+                    ),
+                ) => {
+                    let result = compiler_context
+                        .builder
+                        .build_int_unsigned_rem(n1, n2, "rem_result")?
+                        .const_truncate(compiler_context.context.i16_type());
+                    stack.push((
+                        UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                        BasicValueEnum::IntValue(result),
+                    ));
+                }
+                (
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                        BasicValueEnum::IntValue(n1),
+                    ),
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                        BasicValueEnum::IntValue(n2),
+                    ),
+                ) => {
+                    let result = compiler_context
+                        .builder
+                        .build_int_unsigned_rem(n1, n2, "rem_result")?
+                        .const_truncate(compiler_context.context.i32_type());
+                    stack.push((
+                        UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                        BasicValueEnum::IntValue(result),
+                    ));
+                }
+                (
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                        BasicValueEnum::IntValue(n1),
+                    ),
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                        BasicValueEnum::IntValue(n2),
+                    ),
+                ) => {
+                    let result =
+                        compiler_context
+                            .builder
+                            .build_int_unsigned_rem(n1, n2, "rem_result")?;
+                    stack.push((
+                        UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                        BasicValueEnum::IntValue(result),
+                    ));
+                }
+                (
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                        BasicValueEnum::IntValue(n1),
+                    ),
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                        BasicValueEnum::IntValue(n2),
+                    ),
+                ) => {
+                    let result = compiler_context
+                        .builder
+                        .build_int_unsigned_rem(n1, n2, "rem_result")?
+                        .const_truncate(compiler_context.context.i8_type());
+                    stack.push((
+                        UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                        BasicValueEnum::IntValue(result),
+                    ));
+                }
+                (
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                        BasicValueEnum::IntValue(n1),
+                    ),
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                        BasicValueEnum::IntValue(n2),
+                    ),
+                ) => {
+                    let result = compiler_context
+                        .builder
+                        .build_int_unsigned_rem(n1, n2, "rem_result")?
+                        .const_truncate(compiler_context.context.i16_type());
+                    stack.push((
+                        UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                        BasicValueEnum::IntValue(result),
+                    ));
+                }
+                (
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                        BasicValueEnum::IntValue(n1),
+                    ),
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                        BasicValueEnum::IntValue(n2),
+                    ),
+                ) => {
+                    let result = compiler_context
+                        .builder
+                        .build_int_unsigned_rem(n1, n2, "rem_result")?
+                        .const_truncate(compiler_context.context.i32_type());
+                    stack.push((
+                        UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                        BasicValueEnum::IntValue(result),
+                    ));
+                }
+                (
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                        BasicValueEnum::IntValue(n1),
+                    ),
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                        BasicValueEnum::IntValue(n2),
+                    ),
+                ) => {
+                    let result = compiler_context
+                        .builder
+                        .build_int_unsigned_rem(n1, n2, "rem_result")?
+                        .const_truncate(compiler_context.context.i64_type());
+                    stack.push((
+                        UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                        BasicValueEnum::IntValue(result),
+                    ));
+                }
+                (
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                        BasicValueEnum::IntValue(n1),
+                    ),
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                        BasicValueEnum::IntValue(n2),
+                    ),
+                ) => {
+                    let result =
+                        compiler_context
+                            .builder
+                            .build_int_unsigned_rem(n1, n2, "rem_result")?;
+                    stack.push((
+                        UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                        BasicValueEnum::IntValue(result),
+                    ));
+                }
+                (
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                        BasicValueEnum::IntValue(n1),
+                    ),
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                        BasicValueEnum::IntValue(n2),
+                    ),
+                ) => {
+                    let result =
+                        compiler_context
+                            .builder
+                            .build_int_signed_rem(n1, n2, "rem_result")?;
+                    stack.push((
+                        UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                        BasicValueEnum::IntValue(result),
+                    ));
+                }
+                (
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                        BasicValueEnum::IntValue(n1),
+                    ),
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                        BasicValueEnum::IntValue(n2),
+                    ),
+                ) => {
+                    let result = compiler_context
+                        .builder
+                        .build_int_signed_rem(n1, n2, "rem_result")?
+                        .const_truncate(compiler_context.context.i8_type());
+                    stack.push((
+                        UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                        BasicValueEnum::IntValue(result),
+                    ));
+                }
+                (
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                        BasicValueEnum::IntValue(n1),
+                    ),
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                        BasicValueEnum::IntValue(n2),
+                    ),
+                ) => {
+                    let result =
+                        compiler_context
+                            .builder
+                            .build_int_signed_rem(n1, n2, "rem_result")?;
+                    stack.push((
+                        UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                        BasicValueEnum::IntValue(result),
+                    ));
+                }
+                (
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                        BasicValueEnum::IntValue(n1),
+                    ),
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                        BasicValueEnum::IntValue(n2),
+                    ),
+                ) => {
+                    let result = compiler_context
+                        .builder
+                        .build_int_signed_rem(n1, n2, "rem_result")?
+                        .const_truncate(compiler_context.context.i8_type());
+                    stack.push((
+                        UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                        BasicValueEnum::IntValue(result),
+                    ));
+                }
+                (
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                        BasicValueEnum::IntValue(n1),
+                    ),
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                        BasicValueEnum::IntValue(n2),
+                    ),
+                ) => {
+                    let result = compiler_context
+                        .builder
+                        .build_int_signed_rem(n1, n2, "rem_result")?
+                        .const_truncate(compiler_context.context.i16_type());
+                    stack.push((
+                        UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                        BasicValueEnum::IntValue(result),
+                    ));
+                }
+                (
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                        BasicValueEnum::IntValue(n1),
+                    ),
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                        BasicValueEnum::IntValue(n2),
+                    ),
+                ) => {
+                    let result =
+                        compiler_context
+                            .builder
+                            .build_int_signed_rem(n1, n2, "rem_result")?;
+                    stack.push((
+                        UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                        BasicValueEnum::IntValue(result),
+                    ));
+                }
+                (
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                        BasicValueEnum::IntValue(n1),
+                    ),
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                        BasicValueEnum::IntValue(n2),
+                    ),
+                ) => {
+                    let result = compiler_context
+                        .builder
+                        .build_int_signed_rem(n1, n2, "rem_result")?
+                        .const_truncate(compiler_context.context.i8_type());
+                    stack.push((
+                        UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                        BasicValueEnum::IntValue(result),
+                    ));
+                }
+                (
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                        BasicValueEnum::IntValue(n1),
+                    ),
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                        BasicValueEnum::IntValue(n2),
+                    ),
+                ) => {
+                    let result = compiler_context
+                        .builder
+                        .build_int_signed_rem(n1, n2, "rem_result")?
+                        .const_truncate(compiler_context.context.i16_type());
+                    stack.push((
+                        UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                        BasicValueEnum::IntValue(result),
+                    ));
+                }
+                (
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                        BasicValueEnum::IntValue(n1),
+                    ),
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                        BasicValueEnum::IntValue(n2),
+                    ),
+                ) => {
+                    let result = compiler_context
+                        .builder
+                        .build_int_signed_rem(n1, n2, "rem_result")?
+                        .const_truncate(compiler_context.context.i32_type());
+                    stack.push((
+                        UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                        BasicValueEnum::IntValue(result),
+                    ));
+                }
+                (
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                        BasicValueEnum::IntValue(n1),
+                    ),
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                        BasicValueEnum::IntValue(n2),
+                    ),
+                ) => {
+                    let result =
+                        compiler_context
+                            .builder
+                            .build_int_signed_rem(n1, n2, "rem_result")?;
+                    stack.push((
+                        UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                        BasicValueEnum::IntValue(result),
+                    ));
+                }
+                (
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                        BasicValueEnum::IntValue(n1),
+                    ),
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                        BasicValueEnum::IntValue(n2),
+                    ),
+                ) => {
+                    let result = compiler_context
+                        .builder
+                        .build_int_signed_rem(n1, n2, "rem_result")?
+                        .const_truncate(compiler_context.context.i8_type());
+                    stack.push((
+                        UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                        BasicValueEnum::IntValue(result),
+                    ));
+                }
+                (
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                        BasicValueEnum::IntValue(n1),
+                    ),
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                        BasicValueEnum::IntValue(n2),
+                    ),
+                ) => {
+                    let result = compiler_context
+                        .builder
+                        .build_int_signed_rem(n1, n2, "rem_result")?
+                        .const_truncate(compiler_context.context.i16_type());
+                    stack.push((
+                        UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                        BasicValueEnum::IntValue(result),
+                    ));
+                }
+                (
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                        BasicValueEnum::IntValue(n1),
+                    ),
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                        BasicValueEnum::IntValue(n2),
+                    ),
+                ) => {
+                    let result = compiler_context
+                        .builder
+                        .build_int_signed_rem(n1, n2, "rem_result")?
+                        .const_truncate(compiler_context.context.i32_type());
+                    stack.push((
+                        UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                        BasicValueEnum::IntValue(result),
+                    ));
+                }
+                (
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                        BasicValueEnum::IntValue(n1),
+                    ),
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                        BasicValueEnum::IntValue(n2),
+                    ),
+                ) => {
+                    let result = compiler_context
+                        .builder
+                        .build_int_signed_rem(n1, n2, "rem_result")?
+                        .const_truncate(compiler_context.context.i64_type());
+                    stack.push((
+                        UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                        BasicValueEnum::IntValue(result),
+                    ));
+                }
+                (
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                        BasicValueEnum::IntValue(n1),
+                    ),
+                    (
+                        UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                        BasicValueEnum::IntValue(n2),
+                    ),
+                ) => {
+                    let result =
+                        compiler_context
+                            .builder
+                            .build_int_signed_rem(n1, n2, "rem_result")?;
+                    stack.push((
+                        UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                        BasicValueEnum::IntValue(result),
+                    ));
+                }
+                _ => return Err(CompilerError::UnexpectedType),
+            }
+            Ok(())
+        },
+    ) as BoxDefinitionType<'ctx>);
+    vec![
+        InternalFunction {
+            name: "%".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                    UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                ],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::U8))],
+            ),
+            function: function.clone(),
+        },
+        InternalFunction {
+            name: "%".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                    UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                ],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::U8))],
+            ),
+            function: function.clone(),
+        },
+        InternalFunction {
+            name: "%".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                    UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                ],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::U16))],
+            ),
+            function: function.clone(),
+        },
+        InternalFunction {
+            name: "%".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                    UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                ],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::U8))],
+            ),
+            function: function.clone(),
+        },
+        InternalFunction {
+            name: "%".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                    UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                ],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::U16))],
+            ),
+            function: function.clone(),
+        },
+        InternalFunction {
+            name: "%".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                    UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                ],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::U32))],
+            ),
+            function: function.clone(),
+        },
+        InternalFunction {
+            name: "%".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                    UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                ],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::U8))],
+            ),
+            function: function.clone(),
+        },
+        InternalFunction {
+            name: "%".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                    UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                ],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::U16))],
+            ),
+            function: function.clone(),
+        },
+        InternalFunction {
+            name: "%".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                    UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                ],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::U32))],
+            ),
+            function: function.clone(),
+        },
+        InternalFunction {
+            name: "%".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                    UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                ],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::U64))],
+            ),
+            function: function.clone(),
+        },
+        InternalFunction {
+            name: "%".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                    UnitType::Literal(LiteralType::Number(NumberType::U8)),
+                ],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::U8))],
+            ),
+            function: function.clone(),
+        },
+        InternalFunction {
+            name: "%".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                    UnitType::Literal(LiteralType::Number(NumberType::U16)),
+                ],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::U16))],
+            ),
+            function: function.clone(),
+        },
+        InternalFunction {
+            name: "%".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                    UnitType::Literal(LiteralType::Number(NumberType::U32)),
+                ],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::U32))],
+            ),
+            function: function.clone(),
+        },
+        InternalFunction {
+            name: "%".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                    UnitType::Literal(LiteralType::Number(NumberType::U64)),
+                ],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::U64))],
+            ),
+            function: function.clone(),
+        },
+        InternalFunction {
+            name: "%".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                    UnitType::Literal(LiteralType::Number(NumberType::U128)),
+                ],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::U128))],
+            ),
+            function: function.clone(),
+        },
+        InternalFunction {
+            name: "%".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                    UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                ],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::I8))],
+            ),
+            function: function.clone(),
+        },
+        InternalFunction {
+            name: "%".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                    UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                ],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::I8))],
+            ),
+            function: function.clone(),
+        },
+        InternalFunction {
+            name: "%".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                    UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                ],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::I16))],
+            ),
+            function: function.clone(),
+        },
+        InternalFunction {
+            name: "%".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                    UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                ],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::I8))],
+            ),
+            function: function.clone(),
+        },
+        InternalFunction {
+            name: "%".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                    UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                ],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::I16))],
+            ),
+            function: function.clone(),
+        },
+        InternalFunction {
+            name: "%".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                    UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                ],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::I32))],
+            ),
+            function: function.clone(),
+        },
+        InternalFunction {
+            name: "%".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                    UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                ],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::I8))],
+            ),
+            function: function.clone(),
+        },
+        InternalFunction {
+            name: "%".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                    UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                ],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::I16))],
+            ),
+            function: function.clone(),
+        },
+        InternalFunction {
+            name: "%".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                    UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                ],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::I32))],
+            ),
+            function: function.clone(),
+        },
+        InternalFunction {
+            name: "%".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                    UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                ],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::I64))],
+            ),
+            function: function.clone(),
+        },
+        InternalFunction {
+            name: "%".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                    UnitType::Literal(LiteralType::Number(NumberType::I8)),
+                ],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::I8))],
+            ),
+            function: function.clone(),
+        },
+        InternalFunction {
+            name: "%".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                    UnitType::Literal(LiteralType::Number(NumberType::I16)),
+                ],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::I16))],
+            ),
+            function: function.clone(),
+        },
+        InternalFunction {
+            name: "%".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                    UnitType::Literal(LiteralType::Number(NumberType::I32)),
+                ],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::I32))],
+            ),
+            function: function.clone(),
+        },
+        InternalFunction {
+            name: "%".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                    UnitType::Literal(LiteralType::Number(NumberType::I64)),
+                ],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::I64))],
+            ),
+            function: function.clone(),
+        },
+        InternalFunction {
+            name: "%".into(),
+            ty: Type::new(
+                vec![
+                    UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                    UnitType::Literal(LiteralType::Number(NumberType::I128)),
+                ],
+                vec![UnitType::Literal(LiteralType::Number(NumberType::I128))],
+            ),
+            function: function.clone(),
+        },
+    ]
+}
+
+fn get_format_str(value: UnitType) -> Result<&'static str, CompilerError> {
+    let format_str = match value {
+        UnitType::Literal(LiteralType::Number(NumberType::U8)) => "%hhu",
+        UnitType::Literal(LiteralType::Number(NumberType::I8)) => "%hhi",
+        UnitType::Literal(LiteralType::Number(NumberType::U16)) => "%hu",
+        UnitType::Literal(LiteralType::Number(NumberType::I16)) => "%hi",
+        UnitType::Literal(LiteralType::Number(NumberType::U32)) => "%u",
+        UnitType::Literal(LiteralType::Number(NumberType::I32)) => "%i",
+        UnitType::Literal(LiteralType::Number(NumberType::U64)) => "%llu",
+        UnitType::Literal(LiteralType::Number(NumberType::I64)) => "%lli",
+        UnitType::Literal(LiteralType::Number(NumberType::U128)) => "%llu", //TODO We will need to implement a custom format specifier for u128
+        UnitType::Literal(LiteralType::Number(NumberType::I128)) => "%lli",
+        UnitType::Literal(LiteralType::Number(NumberType::F64)) => "%f",
+        UnitType::Literal(LiteralType::String) => "%s",
+        UnitType::Literal(LiteralType::Boolean) => "%d",
+        _other => return Err(CompilerError::FunctionCallError),
+    };
+    Ok(format_str)
+}
+
 fn pop1_push0<'ctx>(
     types: &[UnitType],
     name: String,
@@ -2388,6 +3441,26 @@ fn pop1_push0<'ctx>(
         result.push(InternalFunction {
             name: name.clone(),
             ty: Type::new(vec![ty.clone()], vec![]),
+            function: function.clone(),
+        });
+    }
+    result
+}
+
+fn pop1_push1<'ctx>(
+    types: &[UnitType],
+    push_type: Option<UnitType>,
+    name: String,
+    function: DefinitionType<'ctx>,
+) -> Vec<InternalFunction<'ctx>> {
+    let mut result = Vec::new();
+    for ty in types {
+        result.push(InternalFunction {
+            name: name.clone(),
+            ty: Type::new(
+                vec![ty.clone()],
+                vec![push_type.clone().unwrap_or(ty.clone())],
+            ),
             function: function.clone(),
         });
     }

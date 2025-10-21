@@ -3,7 +3,6 @@ use std::{collections::HashMap, fmt::Display};
 use thiserror::Error;
 
 use crate::{
-    internal_functions::builtins_functions,
     lexer::{IntegerNumber, Number, Position},
     parser::{
         AstNode, AstNodeType, LiteralType, NumberType, Type, UnitType, VarType,
@@ -41,8 +40,8 @@ impl AstNodeWithType {
 pub fn type_check(
     program: AstNode,
     check_for_main: bool,
-) -> Result<AstNodeWithType, TypeCheckerError> {
-    let scope = TypeScope::root();
+) -> Result<(AstNodeWithType, TypeScope<'static>), TypeCheckerError> {
+    let mut scope = TypeScope::empty();
     let AstNodeType::Block(nodes) = program.node_type else {
         return Err(TypeCheckerError::InvalidModuleDefinition(Box::new(
             Type::empty(),
@@ -50,31 +49,33 @@ pub fn type_check(
     };
 
     let (block_type_check_result, nodes_with_types) =
-        type_check_block(&scope, Vec::new(), nodes, check_for_main)?;
+        type_check_block(&mut scope, Vec::new(), nodes, check_for_main)?;
     if block_type_check_result != Type::empty() {
         return Err(TypeCheckerError::InvalidModuleDefinition(Box::new(
             block_type_check_result,
         )));
     }
-    Ok(AstNodeWithType::new(
-        AstNodeType::Block(nodes_with_types),
-        program.position,
-        block_type_check_result,
+    Ok((
+        AstNodeWithType::new(
+            AstNodeType::Block(nodes_with_types),
+            program.position,
+            block_type_check_result,
+        ),
+        scope,
     ))
 }
 
 fn type_check_block(
-    scope: &TypeScope,
+    scope: &mut TypeScope,
     mut type_stack: Vec<UnitType>,
     program: Vec<AstNode>,
     check_for_main: bool,
 ) -> Result<(Type, Vec<AstNodeWithType>), TypeCheckerError> {
     let mut node_results = Vec::new();
-    let mut scope = TypeScope::with_parent(scope);
     let mut pop_type_stack: Vec<UnitType> = Vec::new();
     let mut local_stack: Vec<UnitType> = Vec::new();
     for node in program {
-        let node = infer_type_definition(&mut scope, type_stack.clone(), node)?;
+        let node = infer_type_definition(scope, type_stack.clone(), node)?;
         let type_definition = &node.type_definition;
         let pop_size = type_definition.pop_types.len();
         if pop_size > type_stack.len() {
@@ -316,6 +317,7 @@ fn infer_type_definition(
             node.position.clone(),
             Type::boolean(),
         )),
+        AstNodeType::SymbolWithPath(_symbol) => todo!(),
         AstNodeType::Symbol(symbol) => {
             let type_definition = scope.get_definition(&symbol, &type_stack).ok_or(
                 TypeCheckerError::SymbolNotFound(symbol.clone(), node.position.clone(), {
@@ -337,7 +339,8 @@ fn infer_type_definition(
             ))
         }
         AstNodeType::Block(nodes) => {
-            let (ty, nodes) = type_check_block(scope, type_stack.clone(), nodes, false)?;
+            let mut scope = TypeScope::with_parent(scope);
+            let (ty, nodes) = type_check_block(&mut scope, type_stack.clone(), nodes, false)?;
             Ok(AstNodeWithType::new(
                 AstNodeType::Block(nodes),
                 node.position.clone(),
@@ -363,6 +366,27 @@ fn infer_type_definition(
             };
             Ok(AstNodeWithType::new(
                 AstNodeType::Definition(symbol, Box::new(body)),
+                node.position.clone(),
+                Type::empty(),
+            ))
+        }
+        AstNodeType::ExternalDefinition(symbol, ty) => {
+            scope.insert_definition(symbol.clone(), ty.clone());
+            Ok(AstNodeWithType::new(
+                AstNodeType::ExternalDefinition(symbol, ty),
+                node.position.clone(),
+                Type::empty(),
+            ))
+        }
+        AstNodeType::Import(_path, import_nodes) => {
+            let mut result_nodes = Vec::new();
+            for import_node in import_nodes {
+                let result = type_check(import_node, false)?;
+                scope.imported.push(result.1);
+                result_nodes.push(result.0);
+            }
+            Ok(AstNodeWithType::new(
+                AstNodeType::Import(_path, result_nodes),
                 node.position.clone(),
                 Type::empty(),
             ))
@@ -464,10 +488,7 @@ fn infer_type_definition(
                 return Err(TypeCheckerError::TypeConflict(
                     node.position.clone(),
                     Box::new(UnitType::Type(ty.clone())),
-                    Box::new(UnitType::Type(Type::new(
-                        ty.pop_types,
-                        inferred_type.type_definition.push_types,
-                    ))),
+                    Box::new(UnitType::Type(inferred_type.type_definition.clone())),
                 ));
             }
             AstNodeWithType::new(inferred_type.node_type, node.position, ty)
@@ -496,8 +517,10 @@ pub enum TypeCheckerError {
     InvalidIfElseBody(Position, Box<Type>, Box<Type>),
 }
 
-struct TypeScope<'a> {
+#[derive(Debug)]
+pub struct TypeScope<'a> {
     parent: Option<&'a TypeScope<'a>>,
+    imported: Vec<TypeScope<'static>>,
     definitions: HashMap<String, Vec<Type>>,
 }
 
@@ -505,22 +528,9 @@ impl<'a> TypeScope<'a> {
     fn with_parent(parent: &'a TypeScope<'a>) -> TypeScope<'a> {
         TypeScope {
             parent: Some(parent),
+            imported: Vec::new(),
             definitions: HashMap::new(),
         }
-    }
-
-    fn root() -> Self {
-        let builtin_functions = builtins_functions();
-        let mut scope = TypeScope {
-            parent: None,
-            definitions: HashMap::new(),
-        };
-
-        for builtin_function in builtin_functions {
-            scope.insert_definition(builtin_function.name, builtin_function.ty);
-        }
-
-        scope
     }
 
     fn insert_definition(&mut self, symbol: String, definition: Type) {
@@ -528,27 +538,44 @@ impl<'a> TypeScope<'a> {
     }
 
     fn get_definition(&self, symbol: &str, stack: &[UnitType]) -> Option<Type> {
-        let Some(definition) = self.definitions.get(symbol).cloned() else {
-            if let Some(parent) = &self.parent {
-                return parent.get_definition(symbol, stack);
-            }
-            return None;
-        };
-        for def in definition {
-            let mut stack = stack.to_vec();
-            if stack.len() < def.pop_types.len() {
-                for _ in 0..def.pop_types.len() - stack.len() {
-                    stack.insert(0, UnitType::Var(VarType::new()));
+        self.definitions
+            .get(symbol)
+            .cloned()
+            .and_then(|definitions| {
+                for def in definitions {
+                    let mut stack = stack.to_vec();
+                    if stack.len() < def.pop_types.len() {
+                        for _ in 0..def.pop_types.len() - stack.len() {
+                            stack.insert(0, UnitType::Var(VarType::new()));
+                        }
+                    }
+                    if validate_type_against_type_stack(&stack, &def, Position::default()).is_ok() {
+                        return Some(def);
+                    }
                 }
-            }
-            if validate_type_against_type_stack(&stack, &def, Position::default()).is_ok() {
-                return Some(def);
-            }
+                None
+            })
+            .or_else(|| {
+                for imported in &self.imported {
+                    let value = imported.get_definition(symbol, stack);
+                    if value.is_some() {
+                        return value;
+                    }
+                }
+                None
+            })
+            .or_else(|| {
+                self.parent
+                    .and_then(|parent| parent.get_definition(symbol, stack))
+            })
+    }
+
+    fn empty() -> TypeScope<'a> {
+        TypeScope {
+            parent: None,
+            imported: Vec::new(),
+            definitions: HashMap::new(),
         }
-        if let Some(parent) = &self.parent {
-            return parent.get_definition(symbol, stack);
-        }
-        None
     }
 }
 
@@ -576,7 +603,7 @@ mod test {
             },
             check_for_main,
         )
-        .map(|ast_node| ast_node.to_string())
+        .map(|ast_node| ast_node.0.to_string())
     }
 
     #[test]

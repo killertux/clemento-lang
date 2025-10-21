@@ -55,6 +55,7 @@ pub enum TokenType {
     String(String),
     Boolean(bool),
     Symbol(String),
+    SymbolWithPath(Vec<String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,6 +243,15 @@ impl<'a> Lexer<'a> {
                 position,
             }));
         }
+        if symbol.contains("::") {
+            let parts: Vec<&str> = symbol.split("::").collect();
+            let parts = parts.iter().map(|s| s.to_string()).collect();
+            return Ok(Some(Token {
+                token_type: TokenType::SymbolWithPath(parts),
+                position,
+            }));
+        }
+
         Ok(Some(Token {
             token_type: TokenType::Symbol(symbol),
             position,
@@ -461,19 +471,6 @@ mod tests {
             Some(Ok(Token {
                 token_type: TokenType::Symbol("hello".to_string()),
                 position: Position::new(1, 1, None),
-            }))
-        );
-    }
-
-    #[test]
-    fn lex_symbol_with_path() {
-        let input = "hello";
-        let mut lexer = Lexer::new(input, Some("test".into()));
-        assert_eq!(
-            lexer.next(),
-            Some(Ok(Token {
-                token_type: TokenType::Symbol("hello".into()),
-                position: Position::new(1, 1, Some(Rc::new("test".into()))),
             }))
         );
     }
@@ -1139,6 +1136,19 @@ mod tests {
             lexer.next(),
             Some(Ok(Token {
                 token_type: TokenType::Boolean(false),
+                position: Position::new(1, 1, None),
+            }))
+        );
+    }
+
+    #[test]
+    fn lex_symbol_with_path() {
+        let input = "std::std::*";
+        let mut lexer = Lexer::new(input, None);
+        assert_eq!(
+            lexer.next(),
+            Some(Ok(Token {
+                token_type: TokenType::SymbolWithPath(vec!["std".into(), "std".into(), "*".into()]),
                 position: Position::new(1, 1, None),
             }))
         );

@@ -21,7 +21,7 @@ pub fn print_type(file: impl AsRef<Path>) -> Result<(), TypePrinterError> {
         },
         true,
     )?;
-    println!("{}", program);
+    println!("{}", program.0);
     Ok(())
 }
 

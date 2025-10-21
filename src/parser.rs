@@ -1,13 +1,15 @@
 use std::{
     collections::HashMap,
     fmt::{Display, Formatter},
+    fs::read_to_string,
     iter::Peekable,
+    path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
 };
 
 use thiserror::Error;
 
-use crate::lexer::{IntegerNumber, Lexer, LexerError, Number, Position, TokenType};
+use crate::lexer::{IntegerNumber, Lexer, LexerError, Number, Position, Token, TokenType};
 
 pub struct Parser<'a> {
     tokens: Peekable<Lexer<'a>>,
@@ -60,7 +62,9 @@ impl<'a> Parser<'a> {
                 TokenType::LeftBrace => self.parse_block(token.position),
                 TokenType::Symbol(symbol) => match symbol.as_str() {
                     "def" => self.parse_definition(token.position),
+                    "defx" => self.parse_external_definition(token.position),
                     "if" => self.parse_if(token.position),
+                    "import" => self.parse_import(token.position),
                     _ => Ok(Some(AstNode {
                         node_type: AstNodeType::Symbol(symbol),
                         position: token.position,
@@ -68,7 +72,19 @@ impl<'a> Parser<'a> {
                     })),
                 },
                 TokenType::LeftParen => self.parse_type_definition(token.position),
-                todo => todo!("{:?}", todo),
+                TokenType::SymbolWithPath(path) => Ok(Some(AstNode {
+                    node_type: AstNodeType::SymbolWithPath(path),
+                    position: token.position,
+                    type_definition: None,
+                })),
+                TokenType::RightParen
+                | TokenType::RightBrace
+                | TokenType::RightBracket
+                | TokenType::RightArrow
+                | TokenType::LeftBracket => Err(ParserError::UnexpectedToken(
+                    token.token_type,
+                    token.position,
+                )),
             },
             None => Ok(None),
         }
@@ -129,8 +145,22 @@ impl<'a> Parser<'a> {
         &mut self,
         position: Position,
     ) -> Result<Option<AstNode>, ParserError> {
+        let ty = self.parse_type(&position)?;
+        let node = self
+            .parse()?
+            .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
+
+        Ok(Some(AstNode {
+            node_type: node.node_type,
+            position: node.position,
+            type_definition: Some(ty),
+        }))
+    }
+
+    fn parse_type(&mut self, position: &Position) -> Result<Type, ParserError> {
         let mut pop_types = Vec::new();
         let mut push_types = Vec::new();
+        let mut var_type_map: HashMap<String, VarType> = HashMap::new();
         while self
             .tokens
             .peek()
@@ -142,8 +172,13 @@ impl<'a> Parser<'a> {
             })
             .unwrap_or(false)
         {
-            let node = self.parse()?.and_then(parse_unit_type);
-            pop_types.push(node.ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?);
+            let ty = self
+                .tokens
+                .next()
+                .map(|token| parse_unit_type(token?, &mut var_type_map))
+                .transpose()?
+                .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
+            pop_types.push(ty);
         }
         let Some(_) = self.tokens.next() else {
             return Err(ParserError::UnexpectedEndOfInput(position.clone()));
@@ -159,21 +194,19 @@ impl<'a> Parser<'a> {
             })
             .unwrap_or(false)
         {
-            let node = self.parse()?.and_then(parse_unit_type);
-            push_types.push(node.ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?);
+            let ty = self
+                .tokens
+                .next()
+                .map(|token| parse_unit_type(token?, &mut var_type_map))
+                .transpose()?
+                .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
+            push_types.push(ty);
         }
         let Some(_) = self.tokens.next() else {
             return Err(ParserError::UnexpectedEndOfInput(position.clone()));
         };
-        let node = self
-            .parse()?
-            .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
-
-        Ok(Some(AstNode {
-            node_type: node.node_type,
-            position: node.position,
-            type_definition: Some(Type::new(pop_types, push_types)),
-        }))
+        let ty = Type::new(pop_types, push_types);
+        Ok(ty)
     }
 
     fn parse_if(&mut self, position: Position) -> Result<Option<AstNode>, ParserError> {
@@ -198,27 +231,140 @@ impl<'a> Parser<'a> {
             type_definition: None,
         }))
     }
+
+    fn parse_external_definition(
+        &mut self,
+        position: Position,
+    ) -> Result<Option<AstNode>, ParserError> {
+        let name_token = self
+            .tokens
+            .next()
+            .transpose()?
+            .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
+        let TokenType::Symbol(name) = name_token.token_type else {
+            return Err(ParserError::UnexpectedToken(
+                name_token.token_type,
+                position,
+            ));
+        };
+        let left_paren = self
+            .tokens
+            .next()
+            .transpose()?
+            .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
+        let TokenType::LeftParen = left_paren.token_type else {
+            return Err(ParserError::UnexpectedToken(
+                left_paren.token_type,
+                position,
+            ));
+        };
+        let ty = self.parse_type(&position)?;
+        Ok(Some(AstNode {
+            node_type: AstNodeType::ExternalDefinition(name, ty),
+            position,
+            type_definition: None,
+        }))
+    }
+
+    fn parse_import(&mut self, position: Position) -> Result<Option<AstNode>, ParserError> {
+        let symbol = self
+            .tokens
+            .next()
+            .transpose()?
+            .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
+        let symbol = match symbol.token_type {
+            TokenType::Symbol(symbol) => vec![symbol],
+            TokenType::SymbolWithPath(symbol) => symbol,
+            _ => return Err(ParserError::UnexpectedToken(symbol.token_type, position)),
+        };
+
+        let paths = if symbol.last().is_some_and(|last| last == "*") {
+            let dir = PathBuf::from_iter(symbol.iter().take(symbol.len() - 1));
+            let mut paths = Vec::new();
+            for entry in std::fs::read_dir(&dir).map_err(|err| {
+                ParserError::ImportError(dir.display().to_string(), err.to_string())
+            })? {
+                let entry = entry.map_err(|err| {
+                    ParserError::ImportError(dir.display().to_string(), err.to_string())
+                })?;
+                if entry
+                    .file_type()
+                    .map_err(|err| {
+                        ParserError::ImportError(dir.display().to_string(), err.to_string())
+                    })?
+                    .is_file()
+                {
+                    paths.push(entry.path().with_extension("clem"));
+                }
+            }
+            paths
+        } else {
+            vec![PathBuf::from_iter(symbol.iter()).with_extension("clem")]
+        };
+
+        let mut nodes = Vec::new();
+        for path in paths {
+            let path_as_string = path.display().to_string();
+            let file_content = read_to_string(&path)
+                .map_err(|err| ParserError::ImportError(path_as_string.clone(), err.to_string()))?;
+
+            let program = Parser::new_from_file(&file_content, path_as_string)
+                .collect::<Result<Vec<AstNode>, ParserError>>()?;
+            nodes.push(AstNode {
+                node_type: AstNodeType::Block(program),
+                position: Position::default(),
+                type_definition: None,
+            });
+        }
+
+        Ok(Some(AstNode {
+            node_type: AstNodeType::Import(symbol, nodes),
+            position,
+            type_definition: None,
+        }))
+    }
 }
 
-fn parse_unit_type(node: AstNode) -> Option<UnitType> {
-    match node.node_type {
-        AstNodeType::Symbol(symbol) => match symbol.as_str() {
-            "String" => Some(UnitType::Literal(LiteralType::String)),
-            "U8" => Some(UnitType::Literal(LiteralType::Number(NumberType::U8))),
-            "U16" => Some(UnitType::Literal(LiteralType::Number(NumberType::U16))),
-            "U32" => Some(UnitType::Literal(LiteralType::Number(NumberType::U32))),
-            "U64" => Some(UnitType::Literal(LiteralType::Number(NumberType::U64))),
-            "U128" => Some(UnitType::Literal(LiteralType::Number(NumberType::U128))),
-            "I8" => Some(UnitType::Literal(LiteralType::Number(NumberType::I8))),
-            "I16" => Some(UnitType::Literal(LiteralType::Number(NumberType::I16))),
-            "I32" => Some(UnitType::Literal(LiteralType::Number(NumberType::I32))),
-            "I64" => Some(UnitType::Literal(LiteralType::Number(NumberType::I64))),
-            "I128" => Some(UnitType::Literal(LiteralType::Number(NumberType::I128))),
-            "F64" => Some(UnitType::Literal(LiteralType::Number(NumberType::F64))),
-            "Boolean" => Some(UnitType::Literal(LiteralType::Boolean)),
-            _ => None,
+fn parse_unit_type(
+    token: Token,
+    var_type_map: &mut HashMap<String, VarType>,
+) -> Result<UnitType, ParserError> {
+    match &token.token_type {
+        TokenType::Symbol(symbol) => match symbol.as_str() {
+            "String" => Ok(UnitType::Literal(LiteralType::String)),
+            "U8" => Ok(UnitType::Literal(LiteralType::Number(NumberType::U8))),
+            "U16" => Ok(UnitType::Literal(LiteralType::Number(NumberType::U16))),
+            "U32" => Ok(UnitType::Literal(LiteralType::Number(NumberType::U32))),
+            "U64" => Ok(UnitType::Literal(LiteralType::Number(NumberType::U64))),
+            "U128" => Ok(UnitType::Literal(LiteralType::Number(NumberType::U128))),
+            "I8" => Ok(UnitType::Literal(LiteralType::Number(NumberType::I8))),
+            "I16" => Ok(UnitType::Literal(LiteralType::Number(NumberType::I16))),
+            "I32" => Ok(UnitType::Literal(LiteralType::Number(NumberType::I32))),
+            "I64" => Ok(UnitType::Literal(LiteralType::Number(NumberType::I64))),
+            "I128" => Ok(UnitType::Literal(LiteralType::Number(NumberType::I128))),
+            "F64" => Ok(UnitType::Literal(LiteralType::Number(NumberType::F64))),
+            "Boolean" => Ok(UnitType::Literal(LiteralType::Boolean)),
+            string => {
+                if string == string.to_lowercase() {
+                    if let Some(var) = var_type_map.get(string) {
+                        Ok(UnitType::Var(var.clone()))
+                    } else {
+                        let var = VarType::new();
+                        var_type_map.insert(string.to_string(), var.clone());
+                        Ok(UnitType::Var(var))
+                    }
+                } else {
+                    Err(ParserError::UnexpectedToken(
+                        token.token_type,
+                        token.position,
+                    ))
+                }
+            }
         },
-        _ => None,
+        _ => Err(ParserError::UnexpectedToken(
+            token.token_type,
+            token.position,
+        )),
     }
 }
 
@@ -228,7 +374,10 @@ pub enum AstNodeType<T> {
     String(String),
     Boolean(bool),
     Symbol(String),
+    SymbolWithPath(Vec<String>),
+    Import(Vec<String>, Vec<T>),
     Definition(String, Box<T>),
+    ExternalDefinition(String, Type),
     Block(Vec<T>),
     If(Box<T>, Option<Box<T>>),
 }
@@ -243,7 +392,10 @@ where
             AstNodeType::String(string) => write!(f, "\"{}\"", string),
             AstNodeType::Boolean(boolean) => write!(f, "{}", boolean),
             AstNodeType::Symbol(symbol) => write!(f, "{}", symbol),
+            AstNodeType::SymbolWithPath(symbol) => write!(f, "{}", symbol.join("::")),
             AstNodeType::Definition(symbol, body) => writeln!(f, "def {} {}", symbol, body),
+            AstNodeType::ExternalDefinition(symbol, ty) => writeln!(f, "defx {} {}", symbol, ty),
+            AstNodeType::Import(symbol, _) => write!(f, "import {}", symbol.join("::")),
             AstNodeType::If(true_body, Some(false_body)) => {
                 write!(f, "if {} else {}", true_body, false_body)
             }
@@ -505,6 +657,8 @@ impl Display for Type {
 
 #[derive(Debug, PartialEq, Eq, Error)]
 pub enum ParserError {
+    #[error("Error importing file {0}: {1}")]
+    ImportError(String, String),
     #[error(transparent)]
     LexerError(#[from] LexerError),
     #[error("Unexpected token {0:?} at {1}")]
@@ -873,6 +1027,23 @@ mod tests {
                         type_definition: Some(Type::string()),
                     }),
                     None
+                ),
+                position: Position::new(1, 1, None),
+                type_definition: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn test_parse_external_definition() {
+        let input = "defx println (String ->)";
+        let mut parser = Parser::new_from_str(input);
+        assert_eq!(
+            parser.next(),
+            Some(Ok(AstNode {
+                node_type: AstNodeType::ExternalDefinition(
+                    "println".into(),
+                    Type::new(vec![UnitType::Literal(LiteralType::String)], vec![])
                 ),
                 position: Position::new(1, 1, None),
                 type_definition: None,

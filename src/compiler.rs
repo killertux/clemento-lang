@@ -17,7 +17,7 @@ use inkwell::{
 use thiserror::Error;
 
 use crate::{
-    internal_functions::builtins_functions,
+    internal_functions::{InternalFunction, builtins_functions},
     lexer::{IntegerNumber, Number, Position},
     parser::{
         AstNode, AstNodeType, LiteralType, NumberType, Parser, ParserError, Type, UnitType, VarType,
@@ -29,6 +29,7 @@ pub struct CompilerContext<'ctx> {
     pub context: &'ctx Context,
     pub module: Module<'ctx>,
     pub builder: Builder<'ctx>,
+    pub internal_functions: Vec<InternalFunction<'ctx>>,
 }
 
 pub fn compile(file: impl AsRef<Path>) -> Result<PathBuf, CompilerError> {
@@ -49,8 +50,8 @@ pub fn compile(file: impl AsRef<Path>) -> Result<PathBuf, CompilerError> {
     let mut stack = Stack::new();
 
     let compiler_context = CompilerContext::new(&context);
-    let mut scope = Scope::root(&compiler_context);
-    compiler_context.compile_ast(&mut scope, &mut stack, program)?;
+    let mut scope = Scope::empty();
+    compiler_context.compile_ast(&mut scope, &mut stack, program.0)?;
 
     let mut output_path = file.as_ref().to_path_buf();
     output_path.set_extension("ll");
@@ -65,11 +66,13 @@ impl<'ctx> CompilerContext<'ctx> {
     pub fn new(context: &'ctx Context) -> Self {
         let module = context.create_module("std");
         let builder = context.create_builder();
+        let internal_functions = builtins_functions(context, &module);
 
         Self {
             context,
             module,
             builder,
+            internal_functions,
         }
     }
 
@@ -87,6 +90,9 @@ impl<'ctx> CompilerContext<'ctx> {
                 scope.call_symbol(&symbol, self, program.type_definition, stack)?;
                 Ok(())
             }
+            AstNodeType::SymbolWithPath(_symbol) => {
+                todo!()
+            }
             AstNodeType::Block(nodes) => {
                 let mut scope = Scope::with_parent(scope);
                 for node in nodes {
@@ -95,8 +101,35 @@ impl<'ctx> CompilerContext<'ctx> {
                 Ok(())
             }
             AstNodeType::Definition(symbol, body) => self.compile_definition(scope, &symbol, *body),
+            AstNodeType::ExternalDefinition(symbol, ty) => {
+                for function in &self.internal_functions {
+                    if function.name == symbol && match_types(&ty.pop_types, &function.ty.pop_types)
+                    {
+                        scope
+                            .definitions
+                            .entry(function.name.clone())
+                            .or_default()
+                            .push((function.ty.clone(), function.function.clone()));
+                        return Ok(());
+                    }
+                }
+                Err(CompilerError::UndefinedSymbol(symbol))
+            }
             AstNodeType::If(true_body, false_body) => {
                 self.compile_if(scope, *true_body, false_body, stack)
+            }
+            AstNodeType::Import(_path, import_nodes) => {
+                for import_node in import_nodes {
+                    let AstNodeType::Block(nodes) = import_node.node_type else {
+                        return Err(CompilerError::InvalidImportType(program.position));
+                    };
+                    let mut import_scope = Scope::empty();
+                    for node in nodes {
+                        self.compile_ast(&mut import_scope, stack, node)?;
+                    }
+                    scope.imported.push(import_scope);
+                }
+                Ok(())
             }
         }
     }
@@ -137,12 +170,12 @@ impl<'ctx> CompilerContext<'ctx> {
                     .i128_type()
                     .const_int_arbitrary_precision(&[
                         u64::from_le_bytes(
-                            n.to_le_bytes()[..4]
+                            n.to_le_bytes()[..8]
                                 .try_into()
                                 .expect("We know that we have the correct number of bytes"),
                         ),
                         u64::from_le_bytes(
-                            n.to_le_bytes()[4..]
+                            n.to_le_bytes()[8..]
                                 .try_into()
                                 .expect("We know that we have the correct number of bytes"),
                         ),
@@ -183,12 +216,12 @@ impl<'ctx> CompilerContext<'ctx> {
                     .i128_type()
                     .const_int_arbitrary_precision(&[
                         u64::from_le_bytes(
-                            n.to_le_bytes()[..4]
+                            n.to_le_bytes()[..8]
                                 .try_into()
                                 .expect("We know that we have the correct number of bytes"),
                         ),
                         u64::from_le_bytes(
-                            n.to_le_bytes()[4..]
+                            n.to_le_bytes()[8..]
                                 .try_into()
                                 .expect("We know that we have the correct number of bytes"),
                         ),
@@ -481,6 +514,7 @@ pub type DefinitionType<'ctx> = Rc<BoxDefinitionType<'ctx>>;
 
 pub struct Scope<'a, 'ctx> {
     definitions: HashMap<String, Vec<(Type, DefinitionType<'ctx>)>>,
+    imported: Vec<Scope<'a, 'ctx>>,
     parent: Option<&'a Scope<'a, 'ctx>>,
     id: u64,
 }
@@ -491,37 +525,10 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
     fn with_parent(parent: &'a Scope<'a, 'ctx>) -> Self {
         Self {
             definitions: HashMap::new(),
+            imported: Vec::new(),
             parent: Some(parent),
             id: SCOPE_ID.fetch_add(1, Ordering::Relaxed),
         }
-    }
-
-    fn root(context: &CompilerContext) -> Self {
-        let i8_ptr_type = context.context.ptr_type(AddressSpace::default());
-        let printf_type = context
-            .context
-            .i32_type()
-            .fn_type(&[i8_ptr_type.into()], true);
-        context.module.add_function("printf", printf_type, None);
-        let i8_ptr_type = context.context.ptr_type(inkwell::AddressSpace::default());
-        let strcmp_type = context
-            .context
-            .i32_type()
-            .fn_type(&[i8_ptr_type.into(), i8_ptr_type.into()], false);
-        context.module.add_function("strcmp", strcmp_type, None);
-        let mut scope = Self {
-            definitions: HashMap::new(),
-            parent: None,
-            id: SCOPE_ID.fetch_add(1, Ordering::Relaxed),
-        };
-        for internal in builtins_functions() {
-            scope
-                .definitions
-                .entry(internal.name)
-                .or_default()
-                .push((internal.ty, internal.function));
-        }
-        scope
     }
 
     fn call_symbol(
@@ -531,23 +538,31 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
         ty: Type,
         stack: &mut Stack<'ctx>,
     ) -> Result<(), CompilerError> {
-        match self.definitions.get(symbol) {
-            Some(closures) => {
+        self.definitions
+            .get(symbol)
+            .and_then(|closures| {
                 for (ty_closure, closure) in closures {
                     if match_types(&ty.pop_types, &ty_closure.pop_types) {
-                        return closure(context, stack);
+                        return Some(closure(context, stack));
                     }
                 }
-                Err(CompilerError::UndefinedSymbol(symbol.into()))
-            }
-            None => {
-                if let Some(parent) = self.parent {
-                    parent.call_symbol(symbol, context, ty, stack)
-                } else {
-                    Err(CompilerError::UndefinedSymbol(symbol.into()))
+                None
+            })
+            .or_else(|| {
+                for imported in &self.imported {
+                    let value = imported.call_symbol(symbol, context, ty.clone(), stack);
+                    if let Err(CompilerError::UndefinedSymbol(_)) = value {
+                        continue;
+                    }
+                    return Some(value);
                 }
-            }
-        }
+                None
+            })
+            .or_else(|| {
+                self.parent
+                    .map(|parent| parent.call_symbol(symbol, context, ty, stack))
+            })
+            .ok_or(CompilerError::UndefinedSymbol(symbol.into()))?
     }
 
     fn add_definition(&mut self, symbol: &str, function: FunctionValue<'ctx>, ty: Type) {
@@ -610,6 +625,15 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
                 )),
             ));
     }
+
+    fn empty() -> Scope<'a, 'ctx> {
+        Scope {
+            parent: None,
+            imported: Vec::new(),
+            definitions: HashMap::new(),
+            id: SCOPE_ID.fetch_add(1, Ordering::Relaxed),
+        }
+    }
 }
 
 fn match_types(left: &[UnitType], right: &[UnitType]) -> bool {
@@ -662,4 +686,6 @@ pub enum CompilerError {
     UnexpectedType,
     #[error("If statement without function")]
     IfWithoutFunction,
+    #[error("Invalid import type at {0}")]
+    InvalidImportType(Position),
 }

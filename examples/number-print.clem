@@ -1,0 +1,25 @@
+import std::*
+
+def main {
+    0u8 println
+    255u8 println
+    0u16 println
+    65535u16 println
+    0u32 println
+    4294967295u32 println
+    0u64 println
+    18446744073709551615u64 println
+    0u128 println
+    340282366920938463463374607431768211455u128 println
+    -128i8 println
+    127i8 println
+    -32768i16 println
+    32767i16 println
+    -2147483648i32 println
+    2147483647i32 println
+    -9223372036854775808i64 println
+    9223372036854775807i64 println
+    -170141183460469231731687303715884105728i128 println
+    170141183460469231731687303715884105727i128 println
+    3.1415926 println
+}

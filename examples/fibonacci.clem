@@ -1,3 +1,5 @@
+import std::*
+
 def fibonacci (I64 -> I64) {
     dup 2 < if {
         drop 1

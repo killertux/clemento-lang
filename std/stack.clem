@@ -1,0 +1,7 @@
+defx dup (a -> a a)
+defx dup2 (a b -> a b a b)
+defx swap (a b -> b a)
+defx drop (a ->)
+defx drop2 (a b ->)
+defx rot (a b c -> b c a)
+defx touch (a -> a)

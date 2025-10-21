@@ -1,5 +1,6 @@
-// def temp (I64 ->) { dup = if "true" else "false" println }
+import std::io
+import std::stack
 
 def main {
-    42i32
+    42i32 println
 }
