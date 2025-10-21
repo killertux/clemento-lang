@@ -608,60 +608,63 @@ mod test {
 
     #[test]
     fn program_with_multiple_definitions_with_different_types() {
-        let contents = r#"def greet (String I64 -> ) { swap print println}
-    def greet (String I32 -> ) { print println}
+        let contents = r#"
+        import std::*
 
-    def main {
-        " The answer for the meaning of life is " dup 40i32 2i32 + greet  40i64 2i64 + greet
-    }"#;
+        def greet (String I64 -> ) { swap print println}
+        def greet (String I32 -> ) { print println}
+
+        def main {
+            " The answer for the meaning of life is " dup 40i32 2i32 + greet  40i64 2i64 + greet
+        }"#;
 
         let program = parse_and_type_check(contents, true).unwrap();
-        let expected_output = "( -> ) {( -> ) def greet (String I64 -> ) {(String I64 -> I64 String) swap (String -> ) print (I64 -> ) println}\n ( -> ) def greet (String I32 -> ) {(I32 -> ) print (String -> ) println}\n ( -> ) def main ( -> ) {( -> String) \" The answer for the meaning of life is \" (String -> String String) dup ( -> I32) 40i32 ( -> I32) 2i32 (I32 I32 -> I32) + (String I32 -> ) greet ( -> I64) 40i64 ( -> I64) 2i64 (I64 I64 -> I64) + (String I64 -> ) greet}\n}";
+        let expected_output = "( -> ) {( -> ) import std::* ( -> ) def greet (String I64 -> ) {(String I64 -> I64 String) swap (String -> ) print (I64 -> ) println}\n ( -> ) def greet (String I32 -> ) {(I32 -> ) print (String -> ) println}\n ( -> ) def main ( -> ) {( -> String) \" The answer for the meaning of life is \" (String -> String String) dup ( -> I32) 40i32 ( -> I32) 2i32 (I32 I32 -> I32) + (String I32 -> ) greet ( -> I64) 40i64 ( -> I64) 2i64 (I64 I64 -> I64) + (String I64 -> ) greet}\n}";
 
         assert_eq!(program, expected_output);
     }
 
     #[test]
     fn basic_number_literals() {
-        let contents = "42u8 print 100u16 print 1000u32 print";
+        let contents = "import std::io 42u8 print 100u16 print 1000u32 print";
         let program = parse_and_type_check(contents, false).unwrap();
 
         assert_eq!(
             program,
-            "( -> ) {( -> U8) 42u8 (U8 -> ) print ( -> U16) 100u16 (U16 -> ) print ( -> U32) 1000u32 (U32 -> ) print}"
+            "( -> ) {( -> ) import std::io ( -> U8) 42u8 (U8 -> ) print ( -> U16) 100u16 (U16 -> ) print ( -> U32) 1000u32 (U32 -> ) print}"
         );
     }
 
     #[test]
     fn signed_number_literals() {
-        let contents = "-42i8 print -100i16 print -1000i32 print";
+        let contents = "import std::io -42i8 print -100i16 print -1000i32 print";
         let program = parse_and_type_check(contents, false).unwrap();
 
         assert_eq!(
             program,
-            "( -> ) {( -> I8) -42i8 (I8 -> ) print ( -> I16) -100i16 (I16 -> ) print ( -> I32) -1000i32 (I32 -> ) print}"
+            "( -> ) {( -> ) import std::io ( -> I8) -42i8 (I8 -> ) print ( -> I16) -100i16 (I16 -> ) print ( -> I32) -1000i32 (I32 -> ) print}"
         )
     }
 
     #[test]
     fn float_and_string_literals() {
-        let contents = r#"3.14 print "hello world" println"#;
+        let contents = r#"import std::io 3.14 print "hello world" println"#;
         let program = parse_and_type_check(contents, false).unwrap();
 
         assert_eq!(
             program,
-            "( -> ) {( -> F64) 3.14 (F64 -> ) print ( -> String) \"hello world\" (String -> ) println}"
+            "( -> ) {( -> ) import std::io ( -> F64) 3.14 (F64 -> ) print ( -> String) \"hello world\" (String -> ) println}"
         );
     }
 
     #[test]
     fn simple_block() {
-        let contents = "{ 42u8 \"test\" print print }";
+        let contents = "import std::io { 42u8 \"test\" print print }";
         let program = parse_and_type_check(contents, false).unwrap();
 
         assert_eq!(
             program,
-            "( -> ) {( -> ) {( -> U8) 42u8 ( -> String) \"test\" (String -> ) print (U8 -> ) print}}"
+            "( -> ) {( -> ) import std::io ( -> ) {( -> U8) 42u8 ( -> String) \"test\" (String -> ) print (U8 -> ) print}}"
         );
     }
 
@@ -679,6 +682,8 @@ mod test {
     #[test]
     fn if_without_else() {
         let contents = r#"
+            import std::io
+
             def main {
                 true if { 42u8 print }
             }
@@ -686,13 +691,15 @@ mod test {
         let program = parse_and_type_check(contents, true).unwrap();
         assert_eq!(
             program,
-            "( -> ) {( -> ) def main ( -> ) {( -> Boolean) true (Boolean -> ) if ( -> ) {( -> U8) 42u8 (U8 -> ) print}}\n}"
+            "( -> ) {( -> ) import std::io ( -> ) def main ( -> ) {( -> Boolean) true (Boolean -> ) if ( -> ) {( -> U8) 42u8 (U8 -> ) print}}\n}"
         );
     }
 
     #[test]
     fn if_with_else_same_types() {
         let contents = r#"
+            import std::io
+
             def main {
                 true if { 42u8 } else { 24u8 } print
             }
@@ -700,7 +707,7 @@ mod test {
         let program = parse_and_type_check(contents, true).unwrap();
         assert_eq!(
             program,
-            "( -> ) {( -> ) def main ( -> ) {( -> Boolean) true (Boolean -> U8) if ( -> U8) {( -> U8) 42u8} else ( -> U8) {( -> U8) 24u8} (U8 -> ) print}\n}"
+            "( -> ) {( -> ) import std::io ( -> ) def main ( -> ) {( -> Boolean) true (Boolean -> U8) if ( -> U8) {( -> U8) 42u8} else ( -> U8) {( -> U8) 24u8} (U8 -> ) print}\n}"
         );
     }
 
@@ -777,6 +784,8 @@ mod test {
     #[test]
     fn builtin_functions_work() {
         let contents = r#"
+            import std::io
+
             def main {
                 42u8 print
                 "hello" println
@@ -785,13 +794,16 @@ mod test {
         let result = parse_and_type_check(contents, true).unwrap();
         assert_eq!(
             result,
-            "( -> ) {( -> ) def main ( -> ) {( -> U8) 42u8 (U8 -> ) print ( -> String) \"hello\" (String -> ) println}\n}"
+            "( -> ) {( -> ) import std::io ( -> ) def main ( -> ) {( -> U8) 42u8 (U8 -> ) print ( -> String) \"hello\" (String -> ) println}\n}"
         );
     }
 
     #[test]
     fn arithmetic_operations() {
-        let contents = r#"def main {
+        let contents = r#"
+import std::*
+
+def main {
     5i32 3i32 +
     10i32 2i32 -
     15i32 3i32 + drop drop drop
@@ -799,13 +811,15 @@ mod test {
         let result = parse_and_type_check(contents, true).unwrap();
         assert_eq!(
             result,
-            "( -> ) {( -> ) def main ( -> ) {( -> I32) 5i32 ( -> I32) 3i32 (I32 I32 -> I32) + ( -> I32) 10i32 ( -> I32) 2i32 (I32 I32 -> I32) - ( -> I32) 15i32 ( -> I32) 3i32 (I32 I32 -> I32) + (I32 -> ) drop (I32 -> ) drop (I32 -> ) drop}\n}"
+            "( -> ) {( -> ) import std::* ( -> ) def main ( -> ) {( -> I32) 5i32 ( -> I32) 3i32 (I32 I32 -> I32) + ( -> I32) 10i32 ( -> I32) 2i32 (I32 I32 -> I32) - ( -> I32) 15i32 ( -> I32) 3i32 (I32 I32 -> I32) + (I32 -> ) drop (I32 -> ) drop (I32 -> ) drop}\n}"
         );
     }
 
     #[test]
     fn nested_blocks() {
         let contents = r#"
+            import std::io
+
             def main {
                 { { 42u8 print } }
             }
@@ -813,13 +827,14 @@ mod test {
         let result = parse_and_type_check(contents, true).unwrap();
         assert_eq!(
             result,
-            "( -> ) {( -> ) def main ( -> ) {( -> ) {( -> ) {( -> U8) 42u8 (U8 -> ) print}}}\n}"
+            "( -> ) {( -> ) import std::io ( -> ) def main ( -> ) {( -> ) {( -> ) {( -> U8) 42u8 (U8 -> ) print}}}\n}"
         );
     }
 
     #[test]
     fn complex_stack_manipulation() {
         let contents = r#"
+            import std::*
             def main {
                 1u8 2u8
                 dup print
@@ -829,13 +844,14 @@ mod test {
         let result = parse_and_type_check(contents, true).unwrap();
         assert_eq!(
             result,
-            "( -> ) {( -> ) def main ( -> ) {( -> U8) 1u8 ( -> U8) 2u8 (U8 -> U8 U8) dup (U8 -> ) print (U8 U8 -> U8 U8) swap (U8 -> ) print (U8 -> ) print}\n}"
+            "( -> ) {( -> ) import std::* ( -> ) def main ( -> ) {( -> U8) 1u8 ( -> U8) 2u8 (U8 -> U8 U8) dup (U8 -> ) print (U8 U8 -> U8 U8) swap (U8 -> ) print (U8 -> ) print}\n}"
         );
     }
 
     #[test]
     fn type_conflict_error() {
         let contents = r#"
+            import std::stack
             def test (U8 -> U8) { dup drop }
             def main {
                 42i32 test  # This should fail - trying to pass I32 where U8 expected
@@ -847,7 +863,7 @@ mod test {
 
         assert_eq!(
             error,
-            "Symbol test not found at 4:23 with type stack <...I32>. Maybe it is defined after the current position"
+            "Symbol test not found at 5:23 with type stack <...I32>. Maybe it is defined after the current position"
         );
     }
 }
