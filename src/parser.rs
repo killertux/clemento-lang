@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::{Display, Formatter},
     fs::read_to_string,
     iter::Peekable,
@@ -13,6 +13,7 @@ use crate::lexer::{IntegerNumber, Lexer, LexerError, Number, Position, Token, To
 
 pub struct Parser<'a> {
     tokens: Peekable<Lexer<'a>>,
+    imports: HashSet<String>,
 }
 
 impl<'a> Parser<'a> {
@@ -20,13 +21,19 @@ impl<'a> Parser<'a> {
     pub fn new_from_str(input: &'a str) -> Self {
         let lexer = Lexer::new(input, None);
         let tokens = lexer.peekable();
-        Self { tokens }
+        Self {
+            tokens,
+            imports: HashSet::new(),
+        }
     }
 
     pub fn new_from_file(input: &'a str, path: String) -> Self {
         let lexer = Lexer::new(input, Some(path));
         let tokens = lexer.peekable();
-        Self { tokens }
+        Self {
+            tokens,
+            imports: HashSet::new(),
+        }
     }
 
     pub fn parse(&mut self) -> Result<Option<AstNode>, ParserError> {
@@ -305,15 +312,28 @@ impl<'a> Parser<'a> {
         let mut nodes = Vec::new();
         for path in paths {
             let path_as_string = path.display().to_string();
+            if self.imports.contains(&path_as_string) {
+                nodes.push(Import {
+                    name: path_as_string,
+                    node: None,
+                });
+                continue;
+            }
+
             let file_content = read_to_string(&path)
                 .map_err(|err| ParserError::ImportError(path_as_string.clone(), err.to_string()))?;
 
-            let program = Parser::new_from_file(&file_content, path_as_string)
+            let program = Parser::new_from_file(&file_content, path_as_string.clone())
                 .collect::<Result<Vec<AstNode>, ParserError>>()?;
-            nodes.push(AstNode {
-                node_type: AstNodeType::Block(program),
-                position: Position::default(),
-                type_definition: None,
+
+            self.imports.insert(path_as_string.clone());
+            nodes.push(Import {
+                name: path_as_string,
+                node: Some(AstNode {
+                    node_type: AstNodeType::Block(program),
+                    position: Position::default(),
+                    type_definition: None,
+                }),
             });
         }
 
@@ -375,11 +395,17 @@ pub enum AstNodeType<T> {
     Boolean(bool),
     Symbol(String),
     SymbolWithPath(Vec<String>),
-    Import(Vec<String>, Vec<T>),
+    Import(Vec<String>, Vec<Import<T>>),
     Definition(String, Box<T>),
     ExternalDefinition(String, Type),
     Block(Vec<T>),
     If(Box<T>, Option<Box<T>>),
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct Import<T> {
+    pub name: String,
+    pub node: Option<T>,
 }
 
 impl<T> Display for AstNodeType<T>

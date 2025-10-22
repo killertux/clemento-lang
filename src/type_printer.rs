@@ -3,7 +3,7 @@ use thiserror::Error;
 use crate::{
     lexer::Position,
     parser::{AstNode, AstNodeType, Parser, ParserError},
-    type_checker::{TypeCheckerError, type_check},
+    type_checker::{TypeChecker, TypeCheckerError},
 };
 use std::{fs::read_to_string, path::Path};
 
@@ -13,7 +13,7 @@ pub fn print_type(file: impl AsRef<Path>) -> Result<(), TypePrinterError> {
 
     let program = Parser::new_from_file(&file_content, path_as_string)
         .collect::<Result<Vec<AstNode>, ParserError>>()?;
-    let program = type_check(
+    let program = TypeChecker::new().type_check(
         AstNode {
             node_type: AstNodeType::Block(program),
             position: Position::default(),

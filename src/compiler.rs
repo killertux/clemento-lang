@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::HashMap,
     fs::read_to_string,
     path::{Path, PathBuf},
@@ -22,7 +23,7 @@ use crate::{
     parser::{
         AstNode, AstNodeType, LiteralType, NumberType, Parser, ParserError, Type, UnitType, VarType,
     },
-    type_checker::{AstNodeWithType, TypeCheckerError, type_check},
+    type_checker::{AstNodeWithType, TypeChecker, TypeCheckerError},
 };
 
 pub struct CompilerContext<'ctx> {
@@ -30,6 +31,7 @@ pub struct CompilerContext<'ctx> {
     pub module: Module<'ctx>,
     pub builder: Builder<'ctx>,
     pub internal_functions: Vec<InternalFunction<'ctx>>,
+    pub imports: HashMap<String, Scope<'ctx>>,
 }
 
 pub fn compile(file: impl AsRef<Path>) -> Result<PathBuf, CompilerError> {
@@ -38,7 +40,7 @@ pub fn compile(file: impl AsRef<Path>) -> Result<PathBuf, CompilerError> {
 
     let program = Parser::new_from_file(&file_content, path_as_string)
         .collect::<Result<Vec<AstNode>, ParserError>>()?;
-    let program = type_check(
+    let program = TypeChecker::new().type_check(
         AstNode {
             node_type: AstNodeType::Block(program),
             position: Position::default(),
@@ -49,9 +51,9 @@ pub fn compile(file: impl AsRef<Path>) -> Result<PathBuf, CompilerError> {
     let context = Context::create();
     let mut stack = Stack::new();
 
-    let compiler_context = CompilerContext::new(&context);
-    let mut scope = Scope::empty();
-    compiler_context.compile_ast(&mut scope, &mut stack, program.0)?;
+    let scope = Scope::empty();
+    let mut compiler_context = CompilerContext::new(&context);
+    compiler_context.compile_ast(scope, &mut stack, program.0)?;
 
     let mut output_path = file.as_ref().to_path_buf();
     output_path.set_extension("ll");
@@ -73,12 +75,13 @@ impl<'ctx> CompilerContext<'ctx> {
             module,
             builder,
             internal_functions,
+            imports: HashMap::new(),
         }
     }
 
     fn compile_ast(
-        &self,
-        scope: &mut Scope<'_, 'ctx>,
+        &mut self,
+        scope: Scope<'ctx>,
         stack: &mut Stack<'ctx>,
         program: AstNodeWithType,
     ) -> Result<(), CompilerError> {
@@ -94,10 +97,11 @@ impl<'ctx> CompilerContext<'ctx> {
                 todo!()
             }
             AstNodeType::Block(nodes) => {
-                let mut scope = Scope::with_parent(scope);
+                let scope = Scope::with_parent(scope);
                 for node in nodes {
-                    self.compile_ast(&mut scope, stack, node)?;
+                    self.compile_ast(scope.clone(), stack, node)?;
                 }
+
                 Ok(())
             }
             AstNodeType::Definition(symbol, body) => self.compile_definition(scope, &symbol, *body),
@@ -105,11 +109,11 @@ impl<'ctx> CompilerContext<'ctx> {
                 for function in &self.internal_functions {
                     if function.name == symbol && match_types(&ty.pop_types, &function.ty.pop_types)
                     {
-                        scope
-                            .definitions
-                            .entry(function.name.clone())
-                            .or_default()
-                            .push((function.ty.clone(), function.function.clone()));
+                        scope.add_definition(
+                            function.name.clone(),
+                            function.ty.clone(),
+                            function.function.clone(),
+                        );
                         return Ok(());
                     }
                 }
@@ -120,14 +124,25 @@ impl<'ctx> CompilerContext<'ctx> {
             }
             AstNodeType::Import(_path, import_nodes) => {
                 for import_node in import_nodes {
-                    let AstNodeType::Block(nodes) = import_node.node_type else {
-                        return Err(CompilerError::InvalidImportType(program.position));
+                    let import_scope = if let Some(nodes) = import_node.node {
+                        let AstNodeType::Block(nodes) = nodes.node_type else {
+                            return Err(CompilerError::InvalidImportType(program.position));
+                        };
+                        let import_scope = Scope::empty();
+                        for node in nodes {
+                            self.compile_ast(import_scope.clone(), stack, node)?;
+                        }
+
+                        self.imports.insert(import_node.name, import_scope.clone());
+                        import_scope
+                    } else {
+                        self.imports
+                            .get(&import_node.name)
+                            .ok_or(CompilerError::ImportNotFound)?
+                            .clone()
                     };
-                    let mut import_scope = Scope::empty();
-                    for node in nodes {
-                        self.compile_ast(&mut import_scope, stack, node)?;
-                    }
-                    scope.imported.push(import_scope);
+
+                    scope.add_import(import_scope);
                 }
                 Ok(())
             }
@@ -244,8 +259,8 @@ impl<'ctx> CompilerContext<'ctx> {
     }
 
     fn compile_definition(
-        &self,
-        scope: &mut Scope<'_, 'ctx>,
+        &mut self,
+        scope: Scope<'ctx>,
         symbol: &str,
         body: AstNodeWithType,
     ) -> Result<(), CompilerError> {
@@ -253,7 +268,7 @@ impl<'ctx> CompilerContext<'ctx> {
         let function_name = if symbol == "main" {
             "main".into()
         } else {
-            format!("{}_{}_{}", body.type_definition, symbol, scope.id)
+            format!("{}_{}_{}", body.type_definition, symbol, scope.id())
         };
         let function_type = if symbol == "main" {
             self.context.i32_type().fn_type(&[], false)
@@ -264,7 +279,7 @@ impl<'ctx> CompilerContext<'ctx> {
             .module
             .add_function(&function_name, function_type, None); // TODO: Handle name clashes. Probably name the function based on the scope
         let ty = body.type_definition.clone();
-        scope.add_definition(symbol, function, ty.clone());
+        scope.add_function_definition(symbol, function, ty.clone());
 
         let entry = self.context.append_basic_block(function, "entry");
         self.builder.position_at_end(entry);
@@ -394,8 +409,8 @@ impl<'ctx> CompilerContext<'ctx> {
     }
 
     fn compile_if(
-        &self,
-        scope: &mut Scope<'_, 'ctx>,
+        &mut self,
+        scope: Scope<'ctx>,
         true_body: AstNodeWithType,
         false_body: Option<Box<AstNodeWithType>>,
         stack: &mut Stack<'ctx>,
@@ -432,7 +447,7 @@ impl<'ctx> CompilerContext<'ctx> {
                 self.builder.position_at_end(true_block);
                 let mut true_stack = stack.clone();
                 let push_types_len = true_body.type_definition.push_types.len();
-                self.compile_ast(scope, &mut true_stack, true_body)?;
+                self.compile_ast(scope.clone(), &mut true_stack, true_body)?;
                 let true_values = true_stack.pop_n(push_types_len);
                 self.builder.build_unconditional_branch(merge_block)?;
                 let true_end_bb = self
@@ -512,23 +527,34 @@ pub type BoxDefinitionType<'ctx> =
     Box<dyn Fn(&CompilerContext<'ctx>, &mut Stack<'ctx>) -> Result<(), CompilerError> + 'ctx>;
 pub type DefinitionType<'ctx> = Rc<BoxDefinitionType<'ctx>>;
 
-pub struct Scope<'a, 'ctx> {
+#[derive(Clone)]
+pub struct Scope<'ctx> {
+    scope: Rc<RefCell<InternalScope<'ctx>>>,
+}
+
+struct InternalScope<'ctx> {
     definitions: HashMap<String, Vec<(Type, DefinitionType<'ctx>)>>,
-    imported: Vec<Scope<'a, 'ctx>>,
-    parent: Option<&'a Scope<'a, 'ctx>>,
+    imported: Vec<Scope<'ctx>>,
+    parent: Option<Scope<'ctx>>,
     id: u64,
 }
 
 static SCOPE_ID: AtomicU64 = AtomicU64::new(0);
 
-impl<'a, 'ctx> Scope<'a, 'ctx> {
-    fn with_parent(parent: &'a Scope<'a, 'ctx>) -> Self {
+impl<'ctx> Scope<'ctx> {
+    fn with_parent(parent: Scope<'ctx>) -> Self {
         Self {
-            definitions: HashMap::new(),
-            imported: Vec::new(),
-            parent: Some(parent),
-            id: SCOPE_ID.fetch_add(1, Ordering::Relaxed),
+            scope: Rc::new(RefCell::new(InternalScope {
+                definitions: HashMap::new(),
+                imported: Vec::new(),
+                parent: Some(parent),
+                id: SCOPE_ID.fetch_add(1, Ordering::Relaxed),
+            })),
         }
+    }
+
+    fn id(&self) -> u64 {
+        self.scope.borrow().id
     }
 
     fn call_symbol(
@@ -538,7 +564,10 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
         ty: Type,
         stack: &mut Stack<'ctx>,
     ) -> Result<(), CompilerError> {
-        self.definitions
+        let inner = self.scope.borrow();
+
+        inner
+            .definitions
             .get(symbol)
             .and_then(|closures| {
                 for (ty_closure, closure) in closures {
@@ -549,7 +578,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
                 None
             })
             .or_else(|| {
-                for imported in &self.imported {
+                for imported in &inner.imported {
                     let value = imported.call_symbol(symbol, context, ty.clone(), stack);
                     if let Err(CompilerError::UndefinedSymbol(_)) = value {
                         continue;
@@ -559,18 +588,36 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
                 None
             })
             .or_else(|| {
-                self.parent
+                inner
+                    .parent
+                    .as_ref()
                     .map(|parent| parent.call_symbol(symbol, context, ty, stack))
             })
             .ok_or(CompilerError::UndefinedSymbol(symbol.into()))?
     }
 
-    fn add_definition(&mut self, symbol: &str, function: FunctionValue<'ctx>, ty: Type) {
+    fn add_definition(&self, name: String, ty: Type, definition: DefinitionType<'ctx>) {
+        let mut inner = self.scope.borrow_mut();
+        inner
+            .definitions
+            .entry(name.clone())
+            .or_default()
+            .push((ty.clone(), definition));
+    }
+
+    fn add_import(&self, scope: Scope<'ctx>) {
+        let mut inner = self.scope.borrow_mut();
+        inner.imported.push(scope);
+    }
+
+    fn add_function_definition(&self, symbol: &str, function: FunctionValue<'ctx>, ty: Type) {
         let symbol_name = symbol.to_string();
         let function_name = function.get_name().to_string_lossy().to_string();
         let param_count = function.get_params().len();
+        let mut inner = self.scope.borrow_mut();
 
-        self.definitions
+        inner
+            .definitions
             .entry(symbol_name.clone())
             .or_default()
             .push((
@@ -626,12 +673,14 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
             ));
     }
 
-    fn empty() -> Scope<'a, 'ctx> {
-        Scope {
-            parent: None,
-            imported: Vec::new(),
-            definitions: HashMap::new(),
-            id: SCOPE_ID.fetch_add(1, Ordering::Relaxed),
+    fn empty() -> Scope<'ctx> {
+        Self {
+            scope: Rc::new(RefCell::new(InternalScope {
+                definitions: HashMap::new(),
+                imported: Vec::new(),
+                parent: None,
+                id: SCOPE_ID.fetch_add(1, Ordering::Relaxed),
+            })),
         }
     }
 }
@@ -688,4 +737,6 @@ pub enum CompilerError {
     IfWithoutFunction,
     #[error("Invalid import type at {0}")]
     InvalidImportType(Position),
+    #[error("Import not found")]
+    ImportNotFound,
 }
