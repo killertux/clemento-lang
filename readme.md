@@ -6,7 +6,7 @@ ClementoLang is my hobby programming language. It is a concatenative language in
 
 **NOOOOO!!!!** . I am doing this for fun and learning purposes. Do not use it in production. The syntax is still in flux and the implementation is not optimized for performance.
 
-## Road
+## Roadmap
 
 - [x] Static typing
 - [ ] ADT (Algebraic data type)

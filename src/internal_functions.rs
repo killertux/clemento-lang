@@ -2499,6 +2499,11 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
         |compiler_context: &CompilerContext<'ctx>,
          stack: &mut Stack<'ctx>|
          -> Result<(), CompilerError> {
+            let i8_type = compiler_context.context.i8_type();
+            let i16_type = compiler_context.context.i16_type();
+            let i32_type = compiler_context.context.i32_type();
+            let i64_type = compiler_context.context.i64_type();
+            let i128_type = compiler_context.context.i128_type();
             let arg1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
             let arg2 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
             match (arg2, arg1) {
@@ -2531,10 +2536,19 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
                         BasicValueEnum::IntValue(n2),
                     ),
                 ) => {
-                    let result = compiler_context
-                        .builder
-                        .build_int_unsigned_rem(n1, n2, "rem_result")?
-                        .const_truncate(compiler_context.context.i8_type());
+                    let n2 =
+                        compiler_context
+                            .builder
+                            .build_int_z_extend(n2, i16_type, "upcast_type")?;
+                    let result =
+                        compiler_context
+                            .builder
+                            .build_int_unsigned_rem(n1, n2, "rem_result")?;
+                    compiler_context.builder.build_int_truncate(
+                        result,
+                        i8_type,
+                        "truncate_result",
+                    )?;
                     stack.push((
                         UnitType::Literal(LiteralType::Number(NumberType::U8)),
                         BasicValueEnum::IntValue(result),
@@ -2569,10 +2583,19 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
                         BasicValueEnum::IntValue(n2),
                     ),
                 ) => {
-                    let result = compiler_context
-                        .builder
-                        .build_int_unsigned_rem(n1, n2, "rem_result")?
-                        .const_truncate(compiler_context.context.i8_type());
+                    let n2 =
+                        compiler_context
+                            .builder
+                            .build_int_z_extend(n2, i32_type, "upcast_type")?;
+                    let result =
+                        compiler_context
+                            .builder
+                            .build_int_unsigned_rem(n1, n2, "rem_result")?;
+                    compiler_context.builder.build_int_truncate(
+                        result,
+                        i8_type,
+                        "truncate_result",
+                    )?;
                     stack.push((
                         UnitType::Literal(LiteralType::Number(NumberType::U8)),
                         BasicValueEnum::IntValue(result),
@@ -2588,10 +2611,19 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
                         BasicValueEnum::IntValue(n2),
                     ),
                 ) => {
-                    let result = compiler_context
-                        .builder
-                        .build_int_unsigned_rem(n1, n2, "rem_result")?
-                        .const_truncate(compiler_context.context.i16_type());
+                    let n2 =
+                        compiler_context
+                            .builder
+                            .build_int_z_extend(n2, i32_type, "upcast_type")?;
+                    let result =
+                        compiler_context
+                            .builder
+                            .build_int_unsigned_rem(n1, n2, "rem_result")?;
+                    compiler_context.builder.build_int_truncate(
+                        result,
+                        i16_type,
+                        "truncate_result",
+                    )?;
                     stack.push((
                         UnitType::Literal(LiteralType::Number(NumberType::U16)),
                         BasicValueEnum::IntValue(result),
@@ -2626,10 +2658,19 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
                         BasicValueEnum::IntValue(n2),
                     ),
                 ) => {
-                    let result = compiler_context
-                        .builder
-                        .build_int_unsigned_rem(n1, n2, "rem_result")?
-                        .const_truncate(compiler_context.context.i8_type());
+                    let n2 =
+                        compiler_context
+                            .builder
+                            .build_int_z_extend(n2, i64_type, "upcast_type")?;
+                    let result =
+                        compiler_context
+                            .builder
+                            .build_int_unsigned_rem(n1, n2, "rem_result")?;
+                    compiler_context.builder.build_int_truncate(
+                        result,
+                        i8_type,
+                        "truncate_result",
+                    )?;
                     stack.push((
                         UnitType::Literal(LiteralType::Number(NumberType::U8)),
                         BasicValueEnum::IntValue(result),
@@ -2645,10 +2686,19 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
                         BasicValueEnum::IntValue(n2),
                     ),
                 ) => {
-                    let result = compiler_context
-                        .builder
-                        .build_int_unsigned_rem(n1, n2, "rem_result")?
-                        .const_truncate(compiler_context.context.i16_type());
+                    let n2 =
+                        compiler_context
+                            .builder
+                            .build_int_z_extend(n2, i64_type, "upcast_type")?;
+                    let result =
+                        compiler_context
+                            .builder
+                            .build_int_unsigned_rem(n1, n2, "rem_result")?;
+                    compiler_context.builder.build_int_truncate(
+                        result,
+                        i16_type,
+                        "truncate_result",
+                    )?;
                     stack.push((
                         UnitType::Literal(LiteralType::Number(NumberType::U16)),
                         BasicValueEnum::IntValue(result),
@@ -2664,10 +2714,19 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
                         BasicValueEnum::IntValue(n2),
                     ),
                 ) => {
-                    let result = compiler_context
-                        .builder
-                        .build_int_unsigned_rem(n1, n2, "rem_result")?
-                        .const_truncate(compiler_context.context.i32_type());
+                    let n2 =
+                        compiler_context
+                            .builder
+                            .build_int_z_extend(n2, i64_type, "upcast_type")?;
+                    let result =
+                        compiler_context
+                            .builder
+                            .build_int_unsigned_rem(n1, n2, "rem_result")?;
+                    compiler_context.builder.build_int_truncate(
+                        result,
+                        i32_type,
+                        "truncate_result",
+                    )?;
                     stack.push((
                         UnitType::Literal(LiteralType::Number(NumberType::U32)),
                         BasicValueEnum::IntValue(result),
@@ -2702,10 +2761,20 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
                         BasicValueEnum::IntValue(n2),
                     ),
                 ) => {
-                    let result = compiler_context
-                        .builder
-                        .build_int_unsigned_rem(n1, n2, "rem_result")?
-                        .const_truncate(compiler_context.context.i8_type());
+                    let n2 = compiler_context.builder.build_int_z_extend(
+                        n2,
+                        i128_type,
+                        "upcast_type",
+                    )?;
+                    let result =
+                        compiler_context
+                            .builder
+                            .build_int_unsigned_rem(n1, n2, "rem_result")?;
+                    compiler_context.builder.build_int_truncate(
+                        result,
+                        i8_type,
+                        "truncate_result",
+                    )?;
                     stack.push((
                         UnitType::Literal(LiteralType::Number(NumberType::U8)),
                         BasicValueEnum::IntValue(result),
@@ -2721,10 +2790,20 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
                         BasicValueEnum::IntValue(n2),
                     ),
                 ) => {
-                    let result = compiler_context
-                        .builder
-                        .build_int_unsigned_rem(n1, n2, "rem_result")?
-                        .const_truncate(compiler_context.context.i16_type());
+                    let n2 = compiler_context.builder.build_int_z_extend(
+                        n2,
+                        i128_type,
+                        "upcast_type",
+                    )?;
+                    let result =
+                        compiler_context
+                            .builder
+                            .build_int_unsigned_rem(n1, n2, "rem_result")?;
+                    compiler_context.builder.build_int_truncate(
+                        result,
+                        i16_type,
+                        "truncate_result",
+                    )?;
                     stack.push((
                         UnitType::Literal(LiteralType::Number(NumberType::U16)),
                         BasicValueEnum::IntValue(result),
@@ -2740,10 +2819,20 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
                         BasicValueEnum::IntValue(n2),
                     ),
                 ) => {
-                    let result = compiler_context
-                        .builder
-                        .build_int_unsigned_rem(n1, n2, "rem_result")?
-                        .const_truncate(compiler_context.context.i32_type());
+                    let n2 = compiler_context.builder.build_int_z_extend(
+                        n2,
+                        i128_type,
+                        "upcast_type",
+                    )?;
+                    let result =
+                        compiler_context
+                            .builder
+                            .build_int_unsigned_rem(n1, n2, "rem_result")?;
+                    compiler_context.builder.build_int_truncate(
+                        result,
+                        i32_type,
+                        "truncate_result",
+                    )?;
                     stack.push((
                         UnitType::Literal(LiteralType::Number(NumberType::U32)),
                         BasicValueEnum::IntValue(result),
@@ -2759,10 +2848,20 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
                         BasicValueEnum::IntValue(n2),
                     ),
                 ) => {
-                    let result = compiler_context
-                        .builder
-                        .build_int_unsigned_rem(n1, n2, "rem_result")?
-                        .const_truncate(compiler_context.context.i64_type());
+                    let n2 = compiler_context.builder.build_int_z_extend(
+                        n2,
+                        i128_type,
+                        "upcast_type",
+                    )?;
+                    let result =
+                        compiler_context
+                            .builder
+                            .build_int_unsigned_rem(n1, n2, "rem_result")?;
+                    compiler_context.builder.build_int_truncate(
+                        result,
+                        i64_type,
+                        "truncate_result",
+                    )?;
                     stack.push((
                         UnitType::Literal(LiteralType::Number(NumberType::U64)),
                         BasicValueEnum::IntValue(result),
@@ -2816,10 +2915,19 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
                         BasicValueEnum::IntValue(n2),
                     ),
                 ) => {
-                    let result = compiler_context
-                        .builder
-                        .build_int_signed_rem(n1, n2, "rem_result")?
-                        .const_truncate(compiler_context.context.i8_type());
+                    let n2 =
+                        compiler_context
+                            .builder
+                            .build_int_s_extend(n2, i16_type, "upcast_type")?;
+                    let result =
+                        compiler_context
+                            .builder
+                            .build_int_signed_rem(n1, n2, "rem_result")?;
+                    compiler_context.builder.build_int_truncate(
+                        result,
+                        i8_type,
+                        "truncate_result",
+                    )?;
                     stack.push((
                         UnitType::Literal(LiteralType::Number(NumberType::I8)),
                         BasicValueEnum::IntValue(result),
@@ -2854,10 +2962,19 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
                         BasicValueEnum::IntValue(n2),
                     ),
                 ) => {
-                    let result = compiler_context
-                        .builder
-                        .build_int_signed_rem(n1, n2, "rem_result")?
-                        .const_truncate(compiler_context.context.i8_type());
+                    let n2 =
+                        compiler_context
+                            .builder
+                            .build_int_s_extend(n2, i32_type, "upcast_type")?;
+                    let result =
+                        compiler_context
+                            .builder
+                            .build_int_signed_rem(n1, n2, "rem_result")?;
+                    compiler_context.builder.build_int_truncate(
+                        result,
+                        i8_type,
+                        "truncate_result",
+                    )?;
                     stack.push((
                         UnitType::Literal(LiteralType::Number(NumberType::I8)),
                         BasicValueEnum::IntValue(result),
@@ -2873,10 +2990,19 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
                         BasicValueEnum::IntValue(n2),
                     ),
                 ) => {
-                    let result = compiler_context
-                        .builder
-                        .build_int_signed_rem(n1, n2, "rem_result")?
-                        .const_truncate(compiler_context.context.i16_type());
+                    let n2 =
+                        compiler_context
+                            .builder
+                            .build_int_s_extend(n2, i32_type, "upcast_type")?;
+                    let result =
+                        compiler_context
+                            .builder
+                            .build_int_signed_rem(n1, n2, "rem_result")?;
+                    compiler_context.builder.build_int_truncate(
+                        result,
+                        i16_type,
+                        "truncate_result",
+                    )?;
                     stack.push((
                         UnitType::Literal(LiteralType::Number(NumberType::I16)),
                         BasicValueEnum::IntValue(result),
@@ -2911,10 +3037,19 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
                         BasicValueEnum::IntValue(n2),
                     ),
                 ) => {
-                    let result = compiler_context
-                        .builder
-                        .build_int_signed_rem(n1, n2, "rem_result")?
-                        .const_truncate(compiler_context.context.i8_type());
+                    let n2 =
+                        compiler_context
+                            .builder
+                            .build_int_s_extend(n2, i64_type, "upcast_type")?;
+                    let result =
+                        compiler_context
+                            .builder
+                            .build_int_signed_rem(n1, n2, "rem_result")?;
+                    compiler_context.builder.build_int_truncate(
+                        result,
+                        i8_type,
+                        "truncate_result",
+                    )?;
                     stack.push((
                         UnitType::Literal(LiteralType::Number(NumberType::I8)),
                         BasicValueEnum::IntValue(result),
@@ -2930,10 +3065,19 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
                         BasicValueEnum::IntValue(n2),
                     ),
                 ) => {
-                    let result = compiler_context
-                        .builder
-                        .build_int_signed_rem(n1, n2, "rem_result")?
-                        .const_truncate(compiler_context.context.i16_type());
+                    let n2 =
+                        compiler_context
+                            .builder
+                            .build_int_s_extend(n2, i64_type, "upcast_type")?;
+                    let result =
+                        compiler_context
+                            .builder
+                            .build_int_signed_rem(n1, n2, "rem_result")?;
+                    compiler_context.builder.build_int_truncate(
+                        result,
+                        i16_type,
+                        "truncate_result",
+                    )?;
                     stack.push((
                         UnitType::Literal(LiteralType::Number(NumberType::I16)),
                         BasicValueEnum::IntValue(result),
@@ -2949,10 +3093,19 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
                         BasicValueEnum::IntValue(n2),
                     ),
                 ) => {
-                    let result = compiler_context
-                        .builder
-                        .build_int_signed_rem(n1, n2, "rem_result")?
-                        .const_truncate(compiler_context.context.i32_type());
+                    let n2 =
+                        compiler_context
+                            .builder
+                            .build_int_s_extend(n2, i64_type, "upcast_type")?;
+                    let result =
+                        compiler_context
+                            .builder
+                            .build_int_signed_rem(n1, n2, "rem_result")?;
+                    compiler_context.builder.build_int_truncate(
+                        result,
+                        i32_type,
+                        "truncate_result",
+                    )?;
                     stack.push((
                         UnitType::Literal(LiteralType::Number(NumberType::I32)),
                         BasicValueEnum::IntValue(result),
@@ -2987,10 +3140,20 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
                         BasicValueEnum::IntValue(n2),
                     ),
                 ) => {
-                    let result = compiler_context
-                        .builder
-                        .build_int_signed_rem(n1, n2, "rem_result")?
-                        .const_truncate(compiler_context.context.i8_type());
+                    let n2 = compiler_context.builder.build_int_s_extend(
+                        n2,
+                        i128_type,
+                        "upcast_type",
+                    )?;
+                    let result =
+                        compiler_context
+                            .builder
+                            .build_int_signed_rem(n1, n2, "rem_result")?;
+                    compiler_context.builder.build_int_truncate(
+                        result,
+                        i8_type,
+                        "truncate_result",
+                    )?;
                     stack.push((
                         UnitType::Literal(LiteralType::Number(NumberType::I8)),
                         BasicValueEnum::IntValue(result),
@@ -3006,10 +3169,20 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
                         BasicValueEnum::IntValue(n2),
                     ),
                 ) => {
-                    let result = compiler_context
-                        .builder
-                        .build_int_signed_rem(n1, n2, "rem_result")?
-                        .const_truncate(compiler_context.context.i16_type());
+                    let n2 = compiler_context.builder.build_int_s_extend(
+                        n2,
+                        i128_type,
+                        "upcast_type",
+                    )?;
+                    let result =
+                        compiler_context
+                            .builder
+                            .build_int_signed_rem(n1, n2, "rem_result")?;
+                    compiler_context.builder.build_int_truncate(
+                        result,
+                        i16_type,
+                        "truncate_result",
+                    )?;
                     stack.push((
                         UnitType::Literal(LiteralType::Number(NumberType::I16)),
                         BasicValueEnum::IntValue(result),
@@ -3025,10 +3198,20 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
                         BasicValueEnum::IntValue(n2),
                     ),
                 ) => {
-                    let result = compiler_context
-                        .builder
-                        .build_int_signed_rem(n1, n2, "rem_result")?
-                        .const_truncate(compiler_context.context.i32_type());
+                    let n2 = compiler_context.builder.build_int_s_extend(
+                        n2,
+                        i128_type,
+                        "upcast_type",
+                    )?;
+                    let result =
+                        compiler_context
+                            .builder
+                            .build_int_signed_rem(n1, n2, "rem_result")?;
+                    compiler_context.builder.build_int_truncate(
+                        result,
+                        i32_type,
+                        "truncate_result",
+                    )?;
                     stack.push((
                         UnitType::Literal(LiteralType::Number(NumberType::I32)),
                         BasicValueEnum::IntValue(result),
@@ -3044,10 +3227,20 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
                         BasicValueEnum::IntValue(n2),
                     ),
                 ) => {
-                    let result = compiler_context
-                        .builder
-                        .build_int_signed_rem(n1, n2, "rem_result")?
-                        .const_truncate(compiler_context.context.i64_type());
+                    let n2 = compiler_context.builder.build_int_s_extend(
+                        n2,
+                        i128_type,
+                        "upcast_type",
+                    )?;
+                    let result =
+                        compiler_context
+                            .builder
+                            .build_int_signed_rem(n1, n2, "rem_result")?;
+                    compiler_context.builder.build_int_truncate(
+                        result,
+                        i64_type,
+                        "truncate_result",
+                    )?;
                     stack.push((
                         UnitType::Literal(LiteralType::Number(NumberType::I64)),
                         BasicValueEnum::IntValue(result),

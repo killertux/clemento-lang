@@ -44,11 +44,18 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
             let output_path = compile(path).map_err(|err| err.to_string())?;
             let mut execute_file = output_path.clone();
             execute_file.set_extension("");
-            StdCommand::new("clang")
+            let output = StdCommand::new("clang")
                 .arg(output_path)
                 .arg("-o")
                 .arg(execute_file.clone())
                 .output()?;
+            if !output.status.success() {
+                return Err(format!(
+                    "Compilation failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )
+                .into());
+            }
             let result: u8 = StdCommand::new(format!("./{}", execute_file.display()))
                 .status()?
                 .code()
@@ -61,7 +68,21 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
             Ok(0.into())
         }
         Commands::Compile { path } => {
-            compile(path).map_err(|err| err.to_string())?;
+            let output_path = compile(path).map_err(|err| err.to_string())?;
+            let mut execute_file = output_path.clone();
+            execute_file.set_extension("");
+            let output = StdCommand::new("clang")
+                .arg(output_path)
+                .arg("-o")
+                .arg(execute_file.clone())
+                .output()?;
+            if !output.status.success() {
+                return Err(format!(
+                    "Compilation failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )
+                .into());
+            }
             Ok(0.into())
         }
     }
