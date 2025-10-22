@@ -11,7 +11,7 @@ ClementoLang is my hobby programming language. It is a concatenative language in
 - [x] Static typing
 - [ ] ADT (Algebraic data type)
 - [ ] Type Classes
-- [ ] Compile
+- [X] Compile
 - [ ] Permissions system or use monads
 - [ ] Create a proper documentation
 - [ ] Better tooling
