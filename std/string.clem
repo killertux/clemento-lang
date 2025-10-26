@@ -11,7 +11,7 @@ defx String (U64 -> String)
 def to_string (String U128 -> String) {
     dup 10u128 / swap 10u8 % String rot concat swap dup 0u128 = if { drop touch } else { to_string }
 }
-def String (U128 -> String) { "" swap  to_string }
+def String (U128 -> String) { "" swap to_string }
 defx String (I8 -> String)
 defx String (I16 -> String)
 defx String (I32 -> String)

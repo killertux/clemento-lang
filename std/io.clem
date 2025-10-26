@@ -28,3 +28,17 @@ def println (I128 ->) { print "\n" print }
 defx println (F64 ->)
 defx println (Boolean ->)
 defx println (String ->)
+
+def dbg (U8 -> U8) { dup print }
+def dbg (U16 -> U16) { dup print }
+def dbg (U32 -> U32) { dup print }
+def dbg (U64 -> U64) { dup print }
+def dbg (U128 -> U128) { dup print }
+def dbg (I8 -> I8) { dup print }
+def dbg (I16 -> I16) { dup print }
+def dbg (I32 -> I32) { dup print }
+def dbg (I64 -> I64) { dup print }
+def dbg (I128 -> I128) { dup print }
+def dbg (F64 -> F64) { dup print }
+def dbg (Boolean -> Boolean) { dup print }
+def dbg (String -> String) { dup print }

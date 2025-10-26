@@ -291,12 +291,14 @@ impl<'a> Lexer<'a> {
 
         let is_float = number_as_string.contains('.');
         if is_float {
-            let _number = f64::from_str(&number_as_string).map_err(|_| {
-                LexerError::InvalidNumber(number_as_string.clone(), position.clone())
-            })?;
+            let number = number_as_string
+                .strip_suffix("f64")
+                .unwrap_or(&number_as_string);
+            let _number = f64::from_str(number)
+                .map_err(|_| LexerError::InvalidNumber(number.to_string(), position.clone()))?;
 
             return Ok(Some(Token {
-                token_type: TokenType::Number(Number::Float(number_as_string)),
+                token_type: TokenType::Number(Number::Float(number.to_string())),
                 position,
             }));
         }

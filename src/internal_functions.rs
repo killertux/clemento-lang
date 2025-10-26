@@ -54,6 +54,18 @@ pub fn builtins_functions<'ctx>(
     all_literal_types.push(UnitType::Literal(LiteralType::String));
     all_literal_types.push(UnitType::Literal(LiteralType::Boolean));
 
+    let all_literal_types_minus_128_bits = all_literal_types
+        .iter()
+        .filter(|&ty| {
+            !matches!(
+                ty,
+                UnitType::Literal(LiteralType::Number(NumberType::I128))
+                    | UnitType::Literal(LiteralType::Number(NumberType::U128))
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
     [
         vec![InternalFunction {
             name: "concat".into(),
@@ -115,7 +127,7 @@ pub fn builtins_functions<'ctx>(
             ) as BoxDefinitionType<'ctx>),
         }],
         pop1_push1(
-            &all_literal_types,
+            &all_literal_types_minus_128_bits,
             Some(UnitType::Literal(LiteralType::String)),
             "String".into(),
             Rc::new(Box::new(
@@ -147,7 +159,7 @@ pub fn builtins_functions<'ctx>(
             ) as BoxDefinitionType<'ctx>),
         ),
         pop1_push0(
-            &all_literal_types,
+            &all_literal_types_minus_128_bits,
             "print".into(),
             Rc::new(Box::new(
                 |compiler_context: &CompilerContext<'ctx>,
@@ -173,7 +185,7 @@ pub fn builtins_functions<'ctx>(
             ) as BoxDefinitionType<'ctx>),
         ),
         pop1_push0(
-            &all_literal_types,
+            &all_literal_types_minus_128_bits,
             "println".into(),
             Rc::new(Box::new(
                 |compiler_context: &CompilerContext<'ctx>,
@@ -3614,8 +3626,6 @@ fn get_format_str(value: UnitType) -> Result<&'static str, CompilerError> {
         UnitType::Literal(LiteralType::Number(NumberType::I32)) => "%i",
         UnitType::Literal(LiteralType::Number(NumberType::U64)) => "%llu",
         UnitType::Literal(LiteralType::Number(NumberType::I64)) => "%lli",
-        UnitType::Literal(LiteralType::Number(NumberType::U128)) => "%llu", //TODO We will need to implement a custom format specifier for u128
-        UnitType::Literal(LiteralType::Number(NumberType::I128)) => "%lli",
         UnitType::Literal(LiteralType::Number(NumberType::F64)) => "%f",
         UnitType::Literal(LiteralType::String) => "%s",
         UnitType::Literal(LiteralType::Boolean) => "%d",
