@@ -19,7 +19,7 @@ defx println (U8 ->)
 defx println (U16 ->)
 defx println (U32 ->)
 defx println (U64 ->)
-def println (U128 ->) { print "\n" print}
+def println (U128 ->) { print "\n" print }
 defx println (I8 ->)
 defx println (I16 ->)
 defx println (I32 ->)

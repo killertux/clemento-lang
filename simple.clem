@@ -1,6 +1,5 @@
 import std::io
-import std::stack
 
 def main {
-    42i32 println
+    12u128 println
 }
