@@ -1,0 +1,111 @@
+import std::*
+
+def main {
+    // ===== u8 tests =====
+    "u8 tests:" println
+    0u8 0u8 + println
+    0u8 255u8 + println
+    2u8 40u8 + println
+    255u8 1u8 - println
+    100u8 50u8 - println
+    10u8 5u8 * println
+    100u8 4u8 / println
+
+    // ===== u16 tests =====
+    "u16 tests:" println
+    0u16 0u16 + println
+    1000u16 2000u16 + println
+    65535u16 1u16 - println
+    200u16 100u16 - println
+    100u16 200u16 * println
+    1000u16 10u16 / println
+
+    // ===== u32 tests =====
+    "u32 tests:" println
+    0u32 1u32 + println
+    1000000u32 2000000u32 + println
+    4294967295u32 1u32 - println
+    500u32 200u32 - println
+    1000u32 1000u32 * println
+    10000u32 100u32 / println
+
+    // ===== u64 tests =====
+    "u64 tests:" println
+    0u64 1u64 + println
+    9223372036854775807u64 1u64 + println
+    1000u64 500u64 - println
+    1000u64 2000u64 * println
+    10000u64 100u64 / println
+
+    // ===== u128 tests =====
+    "u128 tests:" println
+    0u128 1u128 + println
+    1000000000000000000000000000000u128 1u128 + println
+    2000u128 1000u128 - println
+    100u128 100u128 * println
+    10000u128 100u128 / println
+
+    // ===== i8 tests =====
+    "i8 tests:" println
+    0i8 0i8 + println
+    -10i8 20i8 + println
+    127i8 -1i8 + println
+    10i8 5i8 - println
+    -10i8 -5i8 - println
+    10i8 -5i8 * println
+    -20i8 4i8 / println
+
+    // ===== i16 tests =====
+    "i16 tests:" println
+    0i16 1i16 + println
+    -1000i16 2000i16 + println
+    32767i16 -1i16 + println
+    100i16 50i16 - println
+    -10i16 -5i16 * println
+    100i16 -4i16 / println
+
+    // ===== i32 tests =====
+    "i32 tests:" println
+    0i32 1i32 + println
+    -1000000i32 2000000i32 + println
+    2147483647i32 -1i32 + println
+    200i32 100i32 - println
+    -100i32 200i32 * println
+    -1000i32 10i32 / println
+
+    // ===== i64 tests =====
+    "i64 tests:" println
+    0i64 1i64 + println
+    -9223372036854775807i64 1i64 + println
+    1000i64 -500i64 - println
+    -100i64 -200i64 * println
+    10000i64 -100i64 / println
+
+    // ===== i128 tests =====
+    "i128 tests:" println
+    0i128 1i128 + println
+    -1000000000000000000000000000000i128 1i128 + println
+    2000i128 -1000i128 - println
+    -100i128 100i128 * println
+    -10000i128 100i128 / println
+
+    // ===== f64 tests =====
+    "f64 tests:" println
+    0.0f64 1.0f64 + println
+    3.14159f64 2.71828f64 + println
+    10.5f64 3.2f64 - println
+    -5.5f64 2.0f64 - println
+    3.14f64 2.0f64 * println
+    -10.0f64 -2.5f64 * println
+    15.0f64 3.0f64 / println
+    -20.0f64 4.0f64 / println
+
+    // ===== Mixed operations edge cases =====
+    "Edge cases:" println
+    1u8 1u8 - println         // Should be 0
+    0u8 1u8 * println         // Should be 0
+    0i8 -5i8 + println        // Should be -5
+    -1i8 -1i8 * println       // Should be 1
+    1.0f64 3.0f64 / println   // Should be ~0.333...
+    0.0f64 5.0f64 * println   // Should be 0.0
+}
