@@ -68,7 +68,8 @@ impl<'a> Parser<'a> {
                 })),
                 TokenType::LeftBrace => self.parse_block(token.position),
                 TokenType::Symbol(symbol) => match symbol.as_str() {
-                    "def" => self.parse_definition(token.position),
+                    "def" => self.parse_definition(token.position, false),
+                    "defp" => self.parse_definition(token.position, true),
                     "defx" => self.parse_external_definition(token.position),
                     "if" => self.parse_if(token.position),
                     "import" => self.parse_import(token.position),
@@ -97,7 +98,11 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_definition(&mut self, position: Position) -> Result<Option<AstNode>, ParserError> {
+    fn parse_definition(
+        &mut self,
+        position: Position,
+        is_private: bool,
+    ) -> Result<Option<AstNode>, ParserError> {
         let name_token = self
             .tokens
             .next()
@@ -113,7 +118,11 @@ impl<'a> Parser<'a> {
             .parse()?
             .ok_or(ParserError::UnexpectedEndOfInput(name_token.position))?;
         Ok(Some(AstNode {
-            node_type: AstNodeType::Definition(name, Box::new(body)),
+            node_type: AstNodeType::Definition {
+                name,
+                is_private,
+                body: Box::new(body),
+            },
             position,
             type_definition: None,
         }))
@@ -396,7 +405,11 @@ pub enum AstNodeType<T> {
     Symbol(String),
     SymbolWithPath(Vec<String>),
     Import(Vec<String>, Vec<Import<T>>),
-    Definition(String, Box<T>),
+    Definition {
+        name: String,
+        is_private: bool,
+        body: Box<T>,
+    },
     ExternalDefinition(String, Type),
     Block(Vec<T>),
     If(Box<T>, Option<Box<T>>),
@@ -419,7 +432,17 @@ where
             AstNodeType::Boolean(boolean) => write!(f, "{}", boolean),
             AstNodeType::Symbol(symbol) => write!(f, "{}", symbol),
             AstNodeType::SymbolWithPath(symbol) => write!(f, "{}", symbol.join("::")),
-            AstNodeType::Definition(symbol, body) => writeln!(f, "def {} {}", symbol, body),
+            AstNodeType::Definition {
+                name: symbol,
+                is_private,
+                body,
+            } => {
+                if *is_private {
+                    writeln!(f, "defp {} {}", symbol, body)
+                } else {
+                    writeln!(f, "def {} {}", symbol, body)
+                }
+            }
             AstNodeType::ExternalDefinition(symbol, ty) => writeln!(f, "defx {} {}", symbol, ty),
             AstNodeType::Import(symbol, _) => write!(f, "import {}", symbol.join("::")),
             AstNodeType::If(true_body, Some(false_body)) => {
@@ -756,14 +779,37 @@ mod tests {
         assert_eq!(
             parser.next(),
             Some(Ok(AstNode {
-                node_type: AstNodeType::Definition(
-                    "pi".into(),
-                    Box::new(AstNode {
+                node_type: AstNodeType::Definition {
+                    name: String::from("pi"),
+                    is_private: false,
+                    body: Box::new(AstNode {
                         node_type: AstNodeType::Number(Number::Float("3.14".into())),
                         position: Position::new(1, 8, None),
                         type_definition: Some(Type::f64()),
                     })
-                ),
+                },
+                position: Position::new(1, 1, None),
+                type_definition: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn test_parse_private_definition() {
+        let input = "defp pi 3.14";
+        let mut parser = Parser::new_from_str(input);
+        assert_eq!(
+            parser.next(),
+            Some(Ok(AstNode {
+                node_type: AstNodeType::Definition {
+                    name: String::from("pi"),
+                    is_private: true,
+                    body: Box::new(AstNode {
+                        node_type: AstNodeType::Number(Number::Float("3.14".into())),
+                        position: Position::new(1, 9, None),
+                        type_definition: Some(Type::f64()),
+                    })
+                },
                 position: Position::new(1, 1, None),
                 type_definition: None,
             }))

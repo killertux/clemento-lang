@@ -100,6 +100,74 @@ def main {
     15.0f64 3.0f64 / println
     -20.0f64 4.0f64 / println
 
+    // ===== Modulus (%) operations =====
+    "Modulus tests:" println
+
+    // u8 modulus
+    10u8 3u8 % println
+    100u8 7u8 % println
+    255u8 10u8 % println
+    5u8 10u8 % println
+
+    // u16 modulus
+    1000u16 7u16 % println
+    65535u16 100u16 % println
+    50u16 13u16 % println
+
+    // u32 modulus
+    1000000u32 999u32 % println
+    12345u32 100u32 % println
+    7u32 10u32 % println
+
+    // u64 modulus
+    123456789u64 1000u64 % println
+    9999u64 7u64 % println
+
+    // u128 modulus
+    1000000000000000000000000000000u128 999999999999999999999999999999u128 % println
+    12345u128 67u128 % println
+
+    // i8 modulus
+    10i8 3i8 % println
+    -10i8 3i8 % println
+    10i8 -3i8 % println
+    -10i8 -3i8 % println
+
+    // i16 modulus
+    1000i16 7i16 % println
+    -1000i16 7i16 % println
+    1000i16 -7i16 % println
+    -1000i16 -7i16 % println
+
+    // i32 modulus
+    12345i32 100i32 % println
+    -12345i32 100i32 % println
+    12345i32 -100i32 % println
+    -12345i32 -100i32 % println
+
+    // i64 modulus
+    123456789i64 1000i64 % println
+    -123456789i64 1000i64 % println
+
+    // i128 modulus
+    12345678901234567890i128 999999999i128 % println
+    -12345678901234567890i128 999999999i128 % println
+
+    // Mixed type modulus (testing various combinations from math.clem)
+    1000u16 7u8 % println
+    1000000u32 255u8 % println
+    1000000u32 1000u16 % println
+    1000000000u64 255u8 % println
+    1000000000u64 1000u16 % println
+    1000000000u64 100000u32 % println
+
+    1000i16 7i8 % println
+    1000000i32 127i8 % println
+    1000000i32 1000i16 % println
+    1000000000i64 127i8 % println
+    1000000000i64 1000i16 % println
+    1000000000i64 100000i32 % println
+
     // ===== Mixed operations edge cases =====
     "Edge cases:" println
     1u8 1u8 - println         // Should be 0

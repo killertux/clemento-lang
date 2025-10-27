@@ -12,8 +12,8 @@ use inkwell::{
     builder::{Builder, BuilderError},
     context::Context,
     module::Module,
-    types::{BasicMetadataTypeEnum, BasicTypeEnum, StructType},
-    values::{BasicValue, BasicValueEnum, FunctionValue},
+    types::{BasicMetadataTypeEnum, BasicTypeEnum, IntType, PointerType, StructType},
+    values::{AggregateValue, BasicValue, BasicValueEnum, FunctionValue},
 };
 use thiserror::Error;
 
@@ -32,6 +32,7 @@ pub struct CompilerContext<'ctx> {
     pub builder: Builder<'ctx>,
     pub internal_functions: Vec<InternalFunction<'ctx>>,
     pub imports: HashMap<String, Scope<'ctx>>,
+    pub ref_count: RefCount<'ctx>,
 }
 
 pub fn compile(file: impl AsRef<Path>) -> Result<PathBuf, CompilerError> {
@@ -64,6 +65,49 @@ pub fn compile(file: impl AsRef<Path>) -> Result<PathBuf, CompilerError> {
     Ok(output_path)
 }
 
+pub struct RefCount<'ctx> {
+    type_marker: IntType<'ctx>,
+    ptr_type: PointerType<'ctx>,
+    len_type: IntType<'ctx>,
+    ref_count_type: IntType<'ctx>,
+    ref_count_struct: StructType<'ctx>,
+}
+
+impl<'ctx> RefCount<'ctx> {
+    pub fn new(context: &'ctx Context) -> Self {
+        let type_marker = context.i8_type();
+        let ptr_type = context.ptr_type(AddressSpace::default());
+        let len_type = context.i64_type();
+        let ref_count_type = context.i64_type();
+        let ref_count_struct = context.struct_type(
+            &[
+                type_marker.into(),
+                ptr_type.into(),
+                len_type.into(),
+                ref_count_type.into(),
+            ],
+            true,
+        );
+        Self {
+            type_marker,
+            ptr_type,
+            len_type,
+            ref_count_type,
+            ref_count_struct,
+        }
+    }
+
+    // pub fn create(&self, builder: &Builder<'ctx>, ptr: PointerType<'ctx>) -> StructValue<'ctx> {
+    //     let type_marker = self.type_marker;
+    //     let ptr_type = self.ptr_type;
+    //     let len_type = self.len_type;
+    //     let ref_count_type = self.ref_count_type;
+    //     let ref_count_struct = self.ref_count_struct;
+
+    //     // builder.build_gep(pointee_ty, ptr, ordered_indexes, name)
+    // }
+}
+
 impl<'ctx> CompilerContext<'ctx> {
     pub fn new(context: &'ctx Context) -> Self {
         let module = context.create_module("std");
@@ -76,6 +120,7 @@ impl<'ctx> CompilerContext<'ctx> {
             builder,
             internal_functions,
             imports: HashMap::new(),
+            ref_count: RefCount::new(context),
         }
     }
 
@@ -90,7 +135,7 @@ impl<'ctx> CompilerContext<'ctx> {
             AstNodeType::String(string) => self.compile_string(stack, string),
             AstNodeType::Boolean(boolean) => self.compile_boolean(stack, boolean),
             AstNodeType::Symbol(symbol) => {
-                scope.call_symbol(&symbol, self, program.type_definition, stack)?;
+                scope.call_symbol(&symbol, self, program.type_definition, stack, true)?;
                 Ok(())
             }
             AstNodeType::SymbolWithPath(_symbol) => {
@@ -104,7 +149,11 @@ impl<'ctx> CompilerContext<'ctx> {
 
                 Ok(())
             }
-            AstNodeType::Definition(symbol, body) => self.compile_definition(scope, &symbol, *body),
+            AstNodeType::Definition {
+                name: symbol,
+                is_private,
+                body,
+            } => self.compile_definition(scope, &symbol, *body, is_private),
             AstNodeType::ExternalDefinition(symbol, ty) => {
                 for function in &self.internal_functions {
                     if function.name == symbol && match_types(&ty.pop_types, &function.ty.pop_types)
@@ -113,6 +162,7 @@ impl<'ctx> CompilerContext<'ctx> {
                             function.name.clone(),
                             function.ty.clone(),
                             function.function.clone(),
+                            false,
                         );
                         return Ok(());
                     }
@@ -263,6 +313,7 @@ impl<'ctx> CompilerContext<'ctx> {
         scope: Scope<'ctx>,
         symbol: &str,
         body: AstNodeWithType,
+        is_private: bool,
     ) -> Result<(), CompilerError> {
         let function_type = self.get_llvm_function_type(&body.type_definition)?;
         let function_name = if symbol == "main" {
@@ -277,9 +328,9 @@ impl<'ctx> CompilerContext<'ctx> {
         };
         let function = self
             .module
-            .add_function(&function_name, function_type, None); // TODO: Handle name clashes. Probably name the function based on the scope
+            .add_function(&function_name, function_type, None);
         let ty = body.type_definition.clone();
-        scope.add_function_definition(symbol, function, ty.clone());
+        scope.add_function_definition(symbol, function, ty.clone(), is_private);
 
         let entry = self.context.append_basic_block(function, "entry");
         self.builder.position_at_end(entry);
@@ -316,20 +367,17 @@ impl<'ctx> CompilerContext<'ctx> {
                     }
                 }
                 let return_val = stack.remove_all();
-                let struct_ptr = self
-                    .builder
-                    .build_alloca(return_type, &format!("{}_return_type", symbol))?;
-                for (index, field) in return_val.into_iter().enumerate() {
-                    let field_ptr = self.builder.build_struct_gep(
-                        return_type,
-                        struct_ptr,
+                let mut struct_val = return_type.get_undef().as_aggregate_value_enum();
+                for (index, value) in return_val.into_iter().enumerate() {
+                    struct_val = self.builder.build_insert_value(
+                        struct_val,
+                        value.1,
                         index as u32,
-                        &format!("field_{}", index),
+                        &format!("ret_{}", index),
                     )?;
-                    self.builder.build_store(field_ptr, field.1)?;
                 }
                 self.builder
-                    .build_return(Some(&struct_ptr.as_basic_value_enum()))?;
+                    .build_return(Some(&struct_val.as_basic_value_enum()))?;
             }
             None => {
                 if !stack.is_empty() {
@@ -357,10 +405,7 @@ impl<'ctx> CompilerContext<'ctx> {
         if type_def.push_types.is_empty() {
             return Ok(self.context.void_type().fn_type(&param_types, false));
         }
-        Ok(self
-            .context
-            .ptr_type(AddressSpace::default())
-            .fn_type(&param_types, false))
+        Ok(self.get_return_type(type_def)?.fn_type(&param_types, false))
     }
 
     fn get_return_type(&self, type_def: &Type) -> Result<StructType<'ctx>, CompilerError> {
@@ -533,7 +578,7 @@ pub struct Scope<'ctx> {
 }
 
 struct InternalScope<'ctx> {
-    definitions: HashMap<String, Vec<(Type, DefinitionType<'ctx>)>>,
+    definitions: HashMap<String, Vec<(Type, DefinitionType<'ctx>, bool)>>,
     imported: Vec<Scope<'ctx>>,
     parent: Option<Scope<'ctx>>,
     id: u64,
@@ -563,6 +608,7 @@ impl<'ctx> Scope<'ctx> {
         context: &CompilerContext<'ctx>,
         ty: Type,
         stack: &mut Stack<'ctx>,
+        filter_private: bool,
     ) -> Result<(), CompilerError> {
         let inner = self.scope.borrow();
 
@@ -570,7 +616,10 @@ impl<'ctx> Scope<'ctx> {
             .definitions
             .get(symbol)
             .and_then(|closures| {
-                for (ty_closure, closure) in closures {
+                for (ty_closure, closure, is_private) in closures {
+                    if filter_private && *is_private {
+                        continue;
+                    }
                     if match_types(&ty.pop_types, &ty_closure.pop_types) {
                         return Some(closure(context, stack));
                     }
@@ -579,7 +628,7 @@ impl<'ctx> Scope<'ctx> {
             })
             .or_else(|| {
                 for imported in &inner.imported {
-                    let value = imported.call_symbol(symbol, context, ty.clone(), stack);
+                    let value = imported.call_symbol(symbol, context, ty.clone(), stack, true);
                     if let Err(CompilerError::UndefinedSymbol(_)) = value {
                         continue;
                     }
@@ -591,18 +640,24 @@ impl<'ctx> Scope<'ctx> {
                 inner
                     .parent
                     .as_ref()
-                    .map(|parent| parent.call_symbol(symbol, context, ty, stack))
+                    .map(|parent| parent.call_symbol(symbol, context, ty, stack, filter_private))
             })
             .ok_or(CompilerError::UndefinedSymbol(symbol.into()))?
     }
 
-    fn add_definition(&self, name: String, ty: Type, definition: DefinitionType<'ctx>) {
+    fn add_definition(
+        &self,
+        name: String,
+        ty: Type,
+        definition: DefinitionType<'ctx>,
+        is_private: bool,
+    ) {
         let mut inner = self.scope.borrow_mut();
-        inner
-            .definitions
-            .entry(name.clone())
-            .or_default()
-            .push((ty.clone(), definition));
+        inner.definitions.entry(name.clone()).or_default().push((
+            ty.clone(),
+            definition,
+            is_private,
+        ));
     }
 
     fn add_import(&self, scope: Scope<'ctx>) {
@@ -610,7 +665,13 @@ impl<'ctx> Scope<'ctx> {
         inner.imported.push(scope);
     }
 
-    fn add_function_definition(&self, symbol: &str, function: FunctionValue<'ctx>, ty: Type) {
+    fn add_function_definition(
+        &self,
+        symbol: &str,
+        function: FunctionValue<'ctx>,
+        ty: Type,
+        is_private: bool,
+    ) {
         let symbol_name = symbol.to_string();
         let function_name = function.get_name().to_string_lossy().to_string();
         let param_count = function.get_params().len();
@@ -649,27 +710,25 @@ impl<'ctx> Scope<'ctx> {
                         if value.is_right() {
                             return Ok(());
                         }
-                        let value = value.left().ok_or(CompilerError::FunctionCallError)?;
-                        let struct_value = value.into_pointer_value();
-                        let struct_type = compiler_context.get_return_type(&ty)?;
+                        let struct_value = value
+                            .left()
+                            .ok_or(CompilerError::FunctionCallError)?
+                            .into_struct_value()
+                            .as_aggregate_value_enum();
 
                         for (index, field_type) in ty.push_types.iter().enumerate() {
-                            let field_ptr = compiler_context.builder.build_struct_gep(
-                                struct_type,
+                            let field_value = compiler_context.builder.build_extract_value(
                                 struct_value,
                                 index as u32,
                                 &format!("field_{}", index),
                             )?;
-                            let field_value = compiler_context.builder.build_load(
-                                compiler_context.unit_type_to_llvm_type(field_type)?,
-                                field_ptr,
-                                &format!("field_{}_value", index),
-                            )?;
+
                             stack.push((field_type.clone(), field_value));
                         }
                         Ok(())
                     },
                 )),
+                is_private,
             ));
     }
 

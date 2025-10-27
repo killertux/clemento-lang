@@ -112,7 +112,7 @@ impl TypeChecker {
             node_results.push(node);
         }
 
-        if check_for_main && let Some(main) = scope.get_definition("main", &[]) {
+        if check_for_main && let Some(main) = scope.get_definition("main", &[], false) {
             let valid_main_definitions = [
                 Type::new(vec![], vec![]),
                 Type::new(
@@ -222,7 +222,7 @@ impl TypeChecker {
             )),
             AstNodeType::SymbolWithPath(_symbol) => todo!(),
             AstNodeType::Symbol(symbol) => {
-                let type_definition = scope.get_definition(&symbol, &type_stack).ok_or(
+                let type_definition = scope.get_definition(&symbol, &type_stack, false).ok_or(
                     TypeCheckerError::SymbolNotFound(symbol.clone(), node.position.clone(), {
                         let mut var_t_container = VarTypeToCharContainer::new();
                         format!(
@@ -251,10 +251,14 @@ impl TypeChecker {
                     substitute_types(&type_stack, ty, node.position.clone())?,
                 ))
             }
-            AstNodeType::Definition(symbol, body) => {
+            AstNodeType::Definition {
+                name: symbol,
+                is_private,
+                body,
+            } => {
                 let body = if let Some(ty) = body.type_definition.as_ref() {
                     // We use this to allow recursive types. We should probably create a better implementation latter
-                    scope.insert_definition(symbol.clone(), ty.clone());
+                    scope.insert_definition(symbol.clone(), ty.clone(), is_private);
                     let mut body = self.infer_type_definition(scope, type_stack.clone(), *body)?;
                     let body_type =
                         substitute_types(&type_stack, body.type_definition, node.position.clone())?;
@@ -265,17 +269,21 @@ impl TypeChecker {
                     let body_type =
                         substitute_types(&type_stack, body.type_definition, node.position.clone())?;
                     body.type_definition = body_type.clone();
-                    scope.insert_definition(symbol.clone(), body_type.clone());
+                    scope.insert_definition(symbol.clone(), body_type.clone(), is_private);
                     body
                 };
                 Ok(AstNodeWithType::new(
-                    AstNodeType::Definition(symbol, Box::new(body)),
+                    AstNodeType::Definition {
+                        name: symbol,
+                        is_private,
+                        body: Box::new(body),
+                    },
                     node.position.clone(),
                     Type::empty(),
                 ))
             }
             AstNodeType::ExternalDefinition(symbol, ty) => {
-                scope.insert_definition(symbol.clone(), ty.clone());
+                scope.insert_definition(symbol.clone(), ty.clone(), false);
                 Ok(AstNodeWithType::new(
                     AstNodeType::ExternalDefinition(symbol, ty),
                     node.position.clone(),
@@ -573,7 +581,7 @@ pub enum TypeCheckerError {
 pub struct TypeScope<'a> {
     parent: Option<&'a TypeScope<'a>>,
     imported: Vec<Rc<TypeScope<'static>>>,
-    definitions: HashMap<String, Vec<Type>>,
+    definitions: HashMap<String, Vec<(Type, bool)>>,
 }
 
 impl<'a> TypeScope<'a> {
@@ -585,16 +593,27 @@ impl<'a> TypeScope<'a> {
         }
     }
 
-    fn insert_definition(&mut self, symbol: String, definition: Type) {
-        self.definitions.entry(symbol).or_default().push(definition);
+    fn insert_definition(&mut self, symbol: String, definition: Type, is_private: bool) {
+        self.definitions
+            .entry(symbol)
+            .or_default()
+            .push((definition, is_private));
     }
 
-    fn get_definition(&self, symbol: &str, stack: &[UnitType]) -> Option<Type> {
+    fn get_definition(
+        &self,
+        symbol: &str,
+        stack: &[UnitType],
+        filter_private: bool,
+    ) -> Option<Type> {
         self.definitions
             .get(symbol)
             .cloned()
             .and_then(|definitions| {
-                for def in definitions {
+                for (def, is_private) in definitions {
+                    if is_private && filter_private {
+                        continue;
+                    }
                     let mut stack = stack.to_vec();
                     if stack.len() < def.pop_types.len() {
                         for _ in 0..def.pop_types.len() - stack.len() {
@@ -609,7 +628,7 @@ impl<'a> TypeScope<'a> {
             })
             .or_else(|| {
                 for imported in &self.imported {
-                    let value = imported.get_definition(symbol, stack);
+                    let value = imported.get_definition(symbol, stack, true);
                     if value.is_some() {
                         return value;
                     }
@@ -618,7 +637,7 @@ impl<'a> TypeScope<'a> {
             })
             .or_else(|| {
                 self.parent
-                    .and_then(|parent| parent.get_definition(symbol, stack))
+                    .and_then(|parent| parent.get_definition(symbol, stack, filter_private))
             })
     }
 

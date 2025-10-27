@@ -1,5 +1,5 @@
 import std::io
 
 def main {
-    12u128 println
+    "" 12u128 to_string println
 }
