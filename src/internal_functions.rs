@@ -96,8 +96,8 @@ pub fn builtins_functions<'ctx>(
                                 BasicValueEnum::PointerValue(p2),
                             ),
                         ) => {
-                            let string1_size = compiler_context.get_ptr_len(p1.clone())?;
-                            let string2_size = compiler_context.get_ptr_len(p2.clone())?;
+                            let string1_size = compiler_context.get_ptr_len(*p1)?;
+                            let string2_size = compiler_context.get_ptr_len(*p2)?;
                             let new_string_size = compiler_context.builder.build_int_add(
                                 string1_size,
                                 string2_size,
