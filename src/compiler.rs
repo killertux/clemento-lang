@@ -12,8 +12,8 @@ use inkwell::{
     builder::{Builder, BuilderError},
     context::Context,
     module::Module,
-    types::{BasicMetadataTypeEnum, BasicTypeEnum, IntType, PointerType, StructType},
-    values::{AggregateValue, BasicValue, BasicValueEnum, FunctionValue},
+    types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, IntType, PointerType, StructType},
+    values::{AggregateValue, BasicValue, BasicValueEnum, FunctionValue, IntValue, PointerValue},
 };
 use thiserror::Error;
 
@@ -97,15 +97,64 @@ impl<'ctx> RefCount<'ctx> {
         }
     }
 
-    // pub fn create(&self, builder: &Builder<'ctx>, ptr: PointerType<'ctx>) -> StructValue<'ctx> {
-    //     let type_marker = self.type_marker;
-    //     let ptr_type = self.ptr_type;
-    //     let len_type = self.len_type;
-    //     let ref_count_type = self.ref_count_type;
-    //     let ref_count_struct = self.ref_count_struct;
+    pub fn create_wit_const_len(
+        &self,
+        builder: &Builder<'ctx>,
+        ty: UnitType,
+        ptr: PointerValue<'ctx>,
+        len: u64,
+    ) -> Result<PointerValue<'ctx>, CompilerError> {
+        let type_marker = self.type_marker;
+        let len_type = self.len_type;
+        let ref_count_type = self.ref_count_type;
+        let ref_count_struct = self.ref_count_struct;
 
-    //     // builder.build_gep(pointee_ty, ptr, ordered_indexes, name)
-    // }
+        let ty = match ty {
+            UnitType::Literal(LiteralType::String) => 0,
+            _ => return Err(CompilerError::UnsupportedType(ty)),
+        };
+
+        let struct_val = builder.build_malloc(ref_count_struct, "struct_value")?;
+        let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 0, "type")?;
+        builder.build_store(field_ptr, type_marker.const_int(ty, false))?;
+        let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 1, "ptr")?;
+        builder.build_store(field_ptr, ptr)?;
+        let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 2, "len")?;
+        builder.build_store(field_ptr, len_type.const_int(len, false))?;
+        let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 3, "rc")?;
+        builder.build_store(field_ptr, ref_count_type.const_int(1, false))?;
+
+        Ok(struct_val)
+    }
+
+    pub fn create(
+        &self,
+        builder: &Builder<'ctx>,
+        ty: UnitType,
+        ptr: PointerValue<'ctx>,
+        len: IntValue<'ctx>,
+    ) -> Result<PointerValue<'ctx>, CompilerError> {
+        let type_marker = self.type_marker;
+        let ref_count_type = self.ref_count_type;
+        let ref_count_struct = self.ref_count_struct;
+
+        let ty = match ty {
+            UnitType::Literal(LiteralType::String) => 0,
+            _ => return Err(CompilerError::UnsupportedType(ty)),
+        };
+
+        let struct_val = builder.build_malloc(ref_count_struct, "struct_value")?;
+        let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 0, "type")?;
+        builder.build_store(field_ptr, type_marker.const_int(ty, false))?;
+        let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 1, "ptr")?;
+        builder.build_store(field_ptr, ptr)?;
+        let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 2, "len")?;
+        builder.build_store(field_ptr, len)?;
+        let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 3, "rc")?;
+        builder.build_store(field_ptr, ref_count_type.const_int(1, false))?;
+
+        Ok(struct_val)
+    }
 }
 
 impl<'ctx> CompilerContext<'ctx> {
@@ -124,6 +173,135 @@ impl<'ctx> CompilerContext<'ctx> {
         }
     }
 
+    pub fn drop_value(&self, value: BasicValueEnum<'ctx>) -> Result<(), CompilerError> {
+        match value {
+            BasicValueEnum::PointerValue(ptr) => {
+                let rc_field_ptr = self.builder.build_struct_gep(
+                    self.ref_count.ref_count_struct,
+                    ptr,
+                    3,
+                    "ref_count",
+                )?;
+                let rc = self
+                    .builder
+                    .build_load(self.ref_count.ref_count_type, rc_field_ptr, "get_ref_count")?
+                    .into_int_value();
+                let result = self.builder.build_int_add(
+                    rc,
+                    self.ref_count.ref_count_type.const_int(1, false),
+                    "inc_ref_count",
+                )?;
+                let condition = self.builder.build_int_compare(
+                    inkwell::IntPredicate::NE,
+                    result,
+                    self.ref_count.ref_count_type.const_int(0, false),
+                    "if_cond",
+                )?;
+
+                let current_function = self
+                    .builder
+                    .get_insert_block()
+                    .ok_or(CompilerError::IfWithoutFunction)?
+                    .get_parent()
+                    .ok_or(CompilerError::IfWithoutFunction)?;
+                let with_more_references = self
+                    .context
+                    .append_basic_block(current_function, "with_more_references");
+                let merge_block = self.context.append_basic_block(current_function, "merge");
+                let free_rc = self.context.append_basic_block(current_function, "free_rc");
+                self.builder
+                    .build_conditional_branch(condition, with_more_references, free_rc)?;
+
+                self.builder.position_at_end(with_more_references);
+                self.builder.build_store(rc_field_ptr, result)?;
+                self.builder.build_unconditional_branch(merge_block)?;
+
+                self.builder.position_at_end(free_rc);
+                let ptr_field_ptr = self.builder.build_struct_gep(
+                    self.ref_count.ref_count_struct,
+                    ptr,
+                    1,
+                    "ref_count",
+                )?;
+                let ptr_field = self
+                    .builder
+                    .build_load(self.ref_count.ptr_type, ptr_field_ptr, "get_ptr")?
+                    .into_pointer_value();
+                self.builder.build_free(ptr_field)?;
+                self.builder.build_free(ptr)?;
+                self.builder.build_unconditional_branch(merge_block)?;
+                self.builder.position_at_end(merge_block);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub fn clone_value(
+        &self,
+        value: BasicValueEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>, CompilerError> {
+        match value {
+            BasicValueEnum::PointerValue(ptr) => {
+                let rc_field_ptr = self.builder.build_struct_gep(
+                    self.ref_count.ref_count_struct,
+                    ptr,
+                    3,
+                    "ref_count",
+                )?;
+                let rc = self
+                    .builder
+                    .build_load(self.ref_count.ref_count_type, rc_field_ptr, "get_ref_count")?
+                    .into_int_value();
+                let result = self.builder.build_int_sub(
+                    rc,
+                    self.ref_count.ref_count_type.const_int(1, false),
+                    "inc_ref_count",
+                )?;
+                self.builder.build_store(rc_field_ptr, result)?;
+                Ok(BasicValueEnum::PointerValue(ptr))
+            }
+            other => Ok(other),
+        }
+    }
+
+    pub fn get_ptr_len(&self, ptr: PointerValue<'ctx>) -> Result<IntValue<'ctx>, CompilerError> {
+        let len_field_ptr =
+            self.builder
+                .build_struct_gep(self.ref_count.ref_count_struct, ptr, 2, "ref_len")?;
+        Ok(self
+            .builder
+            .build_load(
+                self.ref_count.ref_count_type,
+                len_field_ptr,
+                "get_ref_count",
+            )?
+            .into_int_value())
+    }
+
+    pub fn get_ptr_ptr(
+        &self,
+        ptr: PointerValue<'ctx>,
+    ) -> Result<PointerValue<'ctx>, CompilerError> {
+        let ptr_field_ptr =
+            self.builder
+                .build_struct_gep(self.ref_count.ref_count_struct, ptr, 1, "ref_ptr")?;
+        Ok(self
+            .builder
+            .build_load(self.ref_count.ptr_type, ptr_field_ptr, "get_ptr")?
+            .into_pointer_value())
+    }
+
+    pub fn deref_rc_if_necessary(
+        &self,
+        value: BasicValueEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>, CompilerError> {
+        match value {
+            BasicValueEnum::PointerValue(ptr) => Ok(self.get_ptr_ptr(ptr)?.into()),
+            _ => Ok(value),
+        }
+    }
+
     fn compile_ast(
         &mut self,
         scope: Scope<'ctx>,
@@ -135,7 +313,7 @@ impl<'ctx> CompilerContext<'ctx> {
             AstNodeType::String(string) => self.compile_string(stack, string),
             AstNodeType::Boolean(boolean) => self.compile_boolean(stack, boolean),
             AstNodeType::Symbol(symbol) => {
-                scope.call_symbol(&symbol, self, program.type_definition, stack, true)?;
+                scope.call_symbol(&symbol, self, program.type_definition, stack)?;
                 Ok(())
             }
             AstNodeType::SymbolWithPath(_symbol) => {
@@ -150,10 +328,8 @@ impl<'ctx> CompilerContext<'ctx> {
                 Ok(())
             }
             AstNodeType::Definition {
-                name: symbol,
-                is_private,
-                body,
-            } => self.compile_definition(scope, &symbol, *body, is_private),
+                name: symbol, body, ..
+            } => self.compile_definition(scope, &symbol, *body),
             AstNodeType::ExternalDefinition(symbol, ty) => {
                 for function in &self.internal_functions {
                     if function.name == symbol && match_types(&ty.pop_types, &function.ty.pop_types)
@@ -162,12 +338,14 @@ impl<'ctx> CompilerContext<'ctx> {
                             function.name.clone(),
                             function.ty.clone(),
                             function.function.clone(),
-                            false,
                         );
                         return Ok(());
                     }
                 }
-                Err(CompilerError::UndefinedSymbol(symbol))
+                let function_type = self.get_llvm_function_type(&ty)?;
+                self.module.add_function(&symbol, function_type, None);
+                scope.add_external_definition(symbol, ty);
+                Ok(())
             }
             AstNodeType::If(true_body, false_body) => {
                 self.compile_if(scope, *true_body, false_body, stack)
@@ -313,7 +491,6 @@ impl<'ctx> CompilerContext<'ctx> {
         scope: Scope<'ctx>,
         symbol: &str,
         body: AstNodeWithType,
-        is_private: bool,
     ) -> Result<(), CompilerError> {
         let function_type = self.get_llvm_function_type(&body.type_definition)?;
         let function_name = if symbol == "main" {
@@ -330,7 +507,7 @@ impl<'ctx> CompilerContext<'ctx> {
             .module
             .add_function(&function_name, function_type, None);
         let ty = body.type_definition.clone();
-        scope.add_function_definition(symbol, function, ty.clone(), is_private);
+        scope.add_function_definition(symbol, function, ty.clone());
 
         let entry = self.context.append_basic_block(function, "entry");
         self.builder.position_at_end(entry);
@@ -349,23 +526,21 @@ impl<'ctx> CompilerContext<'ctx> {
 
         self.compile_ast(scope, &mut stack, body)?;
 
-        match function_type.get_return_type() {
-            Some(_) => {
-                let return_type = self.get_return_type(&ty)?;
-                if symbol == "main" {
-                    if ty.push_types.is_empty() {
-                        self.builder.build_return(Some(
-                            &self.context.i32_type().const_zero().as_basic_value_enum(),
-                        ))?;
-                        return Ok(());
-                    }
-                    if ty.push_types.len() == 1 {
-                        self.builder.build_return(Some(
-                            &stack.pop().ok_or(CompilerError::StackUnderflow)?.1,
-                        ))?;
-                        return Ok(());
-                    }
+        if symbol == "main" {
+            match stack.pop() {
+                Some(value) => {
+                    self.builder.build_return(Some(&value.1))?;
                 }
+                None => {
+                    self.builder.build_return(Some(
+                        &self.context.i32_type().const_zero().as_basic_value_enum(),
+                    ))?;
+                }
+            }
+            return Ok(());
+        }
+        match function_type.get_return_type() {
+            Some(BasicTypeEnum::StructType(return_type)) => {
                 let return_val = stack.remove_all();
                 let mut struct_val = return_type.get_undef().as_aggregate_value_enum();
                 for (index, value) in return_val.into_iter().enumerate() {
@@ -378,6 +553,18 @@ impl<'ctx> CompilerContext<'ctx> {
                 }
                 self.builder
                     .build_return(Some(&struct_val.as_basic_value_enum()))?;
+            }
+            Some(return_type) => {
+                let return_val = stack.remove_all();
+                if return_val.len() != 1 {
+                    return Err(CompilerError::InvalidStackForFunction(symbol.to_string()));
+                }
+                let return_val = return_val[0].clone().1;
+
+                if return_val.get_type() != return_type {
+                    return Err(CompilerError::InvalidStackForFunction(symbol.to_string()));
+                }
+                self.builder.build_return(Some(&return_val))?;
             }
             None => {
                 if !stack.is_empty() {
@@ -408,12 +595,19 @@ impl<'ctx> CompilerContext<'ctx> {
         Ok(self.get_return_type(type_def)?.fn_type(&param_types, false))
     }
 
-    fn get_return_type(&self, type_def: &Type) -> Result<StructType<'ctx>, CompilerError> {
-        let mut return_types = Vec::new();
-        for push_types in &type_def.push_types {
-            return_types.push(self.unit_type_to_llvm_type(push_types)?);
+    fn get_return_type(&self, type_def: &Type) -> Result<BasicTypeEnum<'ctx>, CompilerError> {
+        if type_def.push_types.len() == 1 {
+            return self.unit_type_to_llvm_type(&type_def.push_types[0]);
         }
-        Ok(self.context.struct_type(&return_types, true))
+
+        let mut return_types = Vec::new();
+        for push_type in &type_def.push_types {
+            return_types.push(self.unit_type_to_llvm_type(push_type)?);
+        }
+        Ok(self
+            .context
+            .struct_type(&return_types, true)
+            .as_basic_type_enum())
     }
 
     fn unit_type_to_llvm_type(
@@ -442,7 +636,14 @@ impl<'ctx> CompilerContext<'ctx> {
         let value = self.builder.build_global_string_ptr(&string, "str")?;
         stack.push((
             UnitType::Literal(LiteralType::String),
-            value.as_pointer_value().into(),
+            self.ref_count
+                .create_wit_const_len(
+                    &self.builder,
+                    UnitType::Literal(LiteralType::String),
+                    value.as_pointer_value(),
+                    (string.len() + 1) as u64,
+                )?
+                .as_basic_value_enum(),
         ));
         Ok(())
     }
@@ -578,7 +779,8 @@ pub struct Scope<'ctx> {
 }
 
 struct InternalScope<'ctx> {
-    definitions: HashMap<String, Vec<(Type, DefinitionType<'ctx>, bool)>>,
+    definitions: HashMap<String, Vec<(Type, DefinitionType<'ctx>)>>,
+    external_definitions: HashMap<String, Type>,
     imported: Vec<Scope<'ctx>>,
     parent: Option<Scope<'ctx>>,
     id: u64,
@@ -590,6 +792,7 @@ impl<'ctx> Scope<'ctx> {
     fn with_parent(parent: Scope<'ctx>) -> Self {
         Self {
             scope: Rc::new(RefCell::new(InternalScope {
+                external_definitions: HashMap::new(),
                 definitions: HashMap::new(),
                 imported: Vec::new(),
                 parent: Some(parent),
@@ -608,7 +811,6 @@ impl<'ctx> Scope<'ctx> {
         context: &CompilerContext<'ctx>,
         ty: Type,
         stack: &mut Stack<'ctx>,
-        filter_private: bool,
     ) -> Result<(), CompilerError> {
         let inner = self.scope.borrow();
 
@@ -616,10 +818,7 @@ impl<'ctx> Scope<'ctx> {
             .definitions
             .get(symbol)
             .and_then(|closures| {
-                for (ty_closure, closure, is_private) in closures {
-                    if filter_private && *is_private {
-                        continue;
-                    }
+                for (ty_closure, closure) in closures {
                     if match_types(&ty.pop_types, &ty_closure.pop_types) {
                         return Some(closure(context, stack));
                     }
@@ -627,8 +826,36 @@ impl<'ctx> Scope<'ctx> {
                 None
             })
             .or_else(|| {
+                inner
+                    .external_definitions
+                    .get(symbol)
+                    .and_then(|external_ty| {
+                        if match_types(&ty.pop_types, &external_ty.pop_types) {
+                            Some(call_function(
+                                context,
+                                stack,
+                                symbol.to_string(),
+                                symbol.to_string(),
+                                ty.clone(),
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+            })
+            .or_else(|| {
                 for imported in &inner.imported {
-                    let value = imported.call_symbol(symbol, context, ty.clone(), stack, true);
+                    let value = imported.call_symbol(symbol, context, ty.clone(), stack);
+                    if let Err(CompilerError::UndefinedSymbol(_)) = value {
+                        continue;
+                    }
+                    return Some(value);
+                }
+                None
+            })
+            .or_else(|| {
+                for imported in &inner.imported {
+                    let value = imported.call_symbol(symbol, context, ty.clone(), stack);
                     if let Err(CompilerError::UndefinedSymbol(_)) = value {
                         continue;
                     }
@@ -640,24 +867,18 @@ impl<'ctx> Scope<'ctx> {
                 inner
                     .parent
                     .as_ref()
-                    .map(|parent| parent.call_symbol(symbol, context, ty, stack, filter_private))
+                    .map(|parent| parent.call_symbol(symbol, context, ty, stack))
             })
             .ok_or(CompilerError::UndefinedSymbol(symbol.into()))?
     }
 
-    fn add_definition(
-        &self,
-        name: String,
-        ty: Type,
-        definition: DefinitionType<'ctx>,
-        is_private: bool,
-    ) {
+    fn add_definition(&self, name: String, ty: Type, definition: DefinitionType<'ctx>) {
         let mut inner = self.scope.borrow_mut();
-        inner.definitions.entry(name.clone()).or_default().push((
-            ty.clone(),
-            definition,
-            is_private,
-        ));
+        inner
+            .definitions
+            .entry(name.clone())
+            .or_default()
+            .push((ty.clone(), definition));
     }
 
     fn add_import(&self, scope: Scope<'ctx>) {
@@ -665,16 +886,9 @@ impl<'ctx> Scope<'ctx> {
         inner.imported.push(scope);
     }
 
-    fn add_function_definition(
-        &self,
-        symbol: &str,
-        function: FunctionValue<'ctx>,
-        ty: Type,
-        is_private: bool,
-    ) {
+    fn add_function_definition(&self, symbol: &str, function: FunctionValue<'ctx>, ty: Type) {
         let symbol_name = symbol.to_string();
         let function_name = function.get_name().to_string_lossy().to_string();
-        let param_count = function.get_params().len();
         let mut inner = self.scope.borrow_mut();
 
         inner
@@ -687,48 +901,15 @@ impl<'ctx> Scope<'ctx> {
                     move |compiler_context: &CompilerContext<'ctx>,
                           stack: &mut Stack<'ctx>|
                           -> Result<(), CompilerError> {
-                        let params = stack.pop_n(param_count);
-                        if params.len() != param_count {
-                            return Err(CompilerError::StackUnderflow);
-                        }
-
-                        let function = compiler_context
-                            .module
-                            .get_function(&function_name)
-                            .ok_or(CompilerError::FunctionCallError)?;
-
-                        let call = compiler_context.builder.build_call(
-                            function,
-                            &params
-                                .into_iter()
-                                .map(|param| param.1.into())
-                                .collect::<Vec<_>>(),
-                            &format!("{}_call", symbol_name),
-                        )?;
-
-                        let value = call.try_as_basic_value();
-                        if value.is_right() {
-                            return Ok(());
-                        }
-                        let struct_value = value
-                            .left()
-                            .ok_or(CompilerError::FunctionCallError)?
-                            .into_struct_value()
-                            .as_aggregate_value_enum();
-
-                        for (index, field_type) in ty.push_types.iter().enumerate() {
-                            let field_value = compiler_context.builder.build_extract_value(
-                                struct_value,
-                                index as u32,
-                                &format!("field_{}", index),
-                            )?;
-
-                            stack.push((field_type.clone(), field_value));
-                        }
-                        Ok(())
+                        call_function(
+                            compiler_context,
+                            stack,
+                            symbol_name.clone(),
+                            function_name.clone(),
+                            ty.clone(),
+                        )
                     },
                 )),
-                is_private,
             ));
     }
 
@@ -736,12 +917,73 @@ impl<'ctx> Scope<'ctx> {
         Self {
             scope: Rc::new(RefCell::new(InternalScope {
                 definitions: HashMap::new(),
+                external_definitions: HashMap::new(),
                 imported: Vec::new(),
                 parent: None,
                 id: SCOPE_ID.fetch_add(1, Ordering::Relaxed),
             })),
         }
     }
+
+    fn add_external_definition(&self, symbol: String, ty: Type) {
+        self.scope
+            .borrow_mut()
+            .external_definitions
+            .insert(symbol, ty);
+    }
+}
+
+fn call_function<'ctx>(
+    compiler_context: &CompilerContext<'ctx>,
+    stack: &mut Stack<'ctx>,
+    symbol_name: String,
+    function_name: String,
+    ty: Type,
+) -> Result<(), CompilerError> {
+    let params = stack.pop_n(ty.pop_types.len());
+    if params.len() != ty.pop_types.len() {
+        return Err(CompilerError::StackUnderflow);
+    }
+
+    let function = compiler_context
+        .module
+        .get_function(&function_name)
+        .ok_or(CompilerError::FunctionCallError)?;
+
+    let call = compiler_context.builder.build_call(
+        function,
+        &params
+            .into_iter()
+            .map(|param| param.1.into())
+            .collect::<Vec<_>>(),
+        &format!("{}_call", symbol_name),
+    )?;
+    if ty.push_types.is_empty() {
+        return Ok(());
+    }
+
+    let value = call.try_as_basic_value();
+    if value.is_right() {
+        return Ok(());
+    }
+    let return_value = value.left().ok_or(CompilerError::FunctionCallError)?;
+    if ty.push_types.len() == 1 {
+        stack.push((ty.push_types[0].clone(), return_value));
+    } else {
+        let struct_value = return_value.into_struct_value().as_aggregate_value_enum();
+
+        for (index, field_type) in ty.push_types.iter().enumerate() {
+            let field_value = compiler_context.builder.build_extract_value(
+                struct_value,
+                index as u32,
+                &format!("field_{}", index),
+            )?;
+
+            stack.push((field_type.clone(), field_value));
+        }
+    }
+
+    Ok(())
 }
 
 fn match_types(left: &[UnitType], right: &[UnitType]) -> bool {
@@ -798,4 +1040,6 @@ pub enum CompilerError {
     InvalidImportType(Position),
     #[error("Import not found")]
     ImportNotFound,
+    #[error("Unsupported type")]
+    UnsupportedType(UnitType),
 }
