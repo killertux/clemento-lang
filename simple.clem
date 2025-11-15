@@ -1,5 +1,9 @@
 import std::io
 
+def paulo (U128 String -> String) {
+    swap 1U128 - dup 0U128 = if { drop } else { swap }
+}
+
 def main {
-    "" 12u128 to_string println
+    23 "Paulo" paulo println println
 }
