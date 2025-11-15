@@ -13,7 +13,7 @@ use inkwell::{
     context::Context,
     module::Module,
     types::{BasicMetadataTypeEnum, BasicTypeEnum, IntType, PointerType, StructType},
-    values::{AggregateValue, BasicValue, BasicValueEnum, FunctionValue},
+    values::{AggregateValue, BasicValue, BasicValueEnum, FunctionValue, IntValue, PointerValue},
 };
 use thiserror::Error;
 
@@ -97,15 +97,35 @@ impl<'ctx> RefCount<'ctx> {
         }
     }
 
-    // pub fn create(&self, builder: &Builder<'ctx>, ptr: PointerType<'ctx>) -> StructValue<'ctx> {
-    //     let type_marker = self.type_marker;
-    //     let ptr_type = self.ptr_type;
-    //     let len_type = self.len_type;
-    //     let ref_count_type = self.ref_count_type;
-    //     let ref_count_struct = self.ref_count_struct;
+    pub fn create(
+        &self,
+        builder: &Builder<'ctx>,
+        ty: UnitType,
+        ptr: PointerValue<'ctx>,
+        len: u64,
+    ) -> Result<PointerValue<'ctx>, CompilerError> {
+        let type_marker = self.type_marker;
+        let len_type = self.len_type;
+        let ref_count_type = self.ref_count_type;
+        let ref_count_struct = self.ref_count_struct;
 
-    //     // builder.build_gep(pointee_ty, ptr, ordered_indexes, name)
-    // }
+        let ty = match ty {
+            UnitType::Literal(LiteralType::String) => 0,
+            _ => return Err(CompilerError::UnsupportedType(ty)),
+        };
+
+        let struct_val = builder.build_malloc(ref_count_struct, "struct_value")?;
+        let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 0, "type")?;
+        builder.build_store(field_ptr, type_marker.const_int(ty, false))?;
+        let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 1, "ptr")?;
+        builder.build_store(field_ptr, ptr)?;
+        let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 2, "len")?;
+        builder.build_store(field_ptr, len_type.const_int(len, false))?;
+        let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 3, "rc")?;
+        builder.build_store(field_ptr, ref_count_type.const_int(1, false))?;
+
+        Ok(struct_val)
+    }
 }
 
 impl<'ctx> CompilerContext<'ctx> {
@@ -122,6 +142,117 @@ impl<'ctx> CompilerContext<'ctx> {
             imports: HashMap::new(),
             ref_count: RefCount::new(context),
         }
+    }
+
+    pub fn drop_value(&self, value: BasicValueEnum<'ctx>) -> Result<(), CompilerError> {
+        match value {
+            BasicValueEnum::PointerValue(ptr) => {
+                let rc_field_ptr = self.builder.build_struct_gep(
+                    self.ref_count.ref_count_struct,
+                    ptr,
+                    3,
+                    "ref_count",
+                )?;
+                let rc = self
+                    .builder
+                    .build_load(self.ref_count.ref_count_type, rc_field_ptr, "get_ref_count")?
+                    .into_int_value();
+                let result = self.builder.build_int_add(
+                    rc,
+                    self.ref_count.ref_count_type.const_int(1, false),
+                    "inc_ref_count",
+                )?;
+                let current_function = self
+                    .builder
+                    .get_insert_block()
+                    .ok_or(CompilerError::IfWithoutFunction)?
+                    .get_parent()
+                    .ok_or(CompilerError::IfWithoutFunction)?;
+                let with_more_references = self
+                    .context
+                    .append_basic_block(current_function, "with_more_references");
+                let merge_block = self.context.append_basic_block(current_function, "merge");
+                let free_rc = self.context.append_basic_block(current_function, "free_rc");
+                self.builder
+                    .build_conditional_branch(result, with_more_references, free_rc)?;
+
+                self.builder.position_at_end(with_more_references);
+                self.builder.build_store(rc_field_ptr, result)?;
+                self.builder.build_unconditional_branch(merge_block)?;
+
+                self.builder.position_at_end(free_rc);
+                let ptr_field_ptr = self.builder.build_struct_gep(
+                    self.ref_count.ref_count_struct,
+                    ptr,
+                    1,
+                    "ref_count",
+                )?;
+                let ptr_field = self
+                    .builder
+                    .build_load(self.ref_count.ptr_type, ptr_field_ptr, "get_ptr")?
+                    .into_pointer_value();
+                self.builder.build_free(ptr_field)?;
+                self.builder.build_free(ptr)?;
+                self.builder.position_at_end(merge_block);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub fn clone_value(
+        &self,
+        value: BasicValueEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>, CompilerError> {
+        match value {
+            BasicValueEnum::PointerValue(ptr) => {
+                let rc_field_ptr = self.builder.build_struct_gep(
+                    self.ref_count.ref_count_struct,
+                    ptr,
+                    3,
+                    "ref_count",
+                )?;
+                let rc = self
+                    .builder
+                    .build_load(self.ref_count.ref_count_type, rc_field_ptr, "get_ref_count")?
+                    .into_int_value();
+                let result = self.builder.build_int_sub(
+                    rc,
+                    self.ref_count.ref_count_type.const_int(1, false),
+                    "inc_ref_count",
+                )?;
+                self.builder.build_store(rc_field_ptr, result)?;
+                Ok(BasicValueEnum::PointerValue(ptr))
+            }
+            other => Ok(other),
+        }
+    }
+
+    pub fn get_ptr_len(&self, ptr: PointerValue<'ctx>) -> Result<IntValue<'ctx>, CompilerError> {
+        let len_field_ptr =
+            self.builder
+                .build_struct_gep(self.ref_count.ref_count_struct, ptr, 2, "ref_len")?;
+        Ok(self
+            .builder
+            .build_load(
+                self.ref_count.ref_count_type,
+                len_field_ptr,
+                "get_ref_count",
+            )?
+            .into_int_value())
+    }
+
+    pub fn get_ptr_ptr(
+        &self,
+        ptr: PointerValue<'ctx>,
+    ) -> Result<PointerValue<'ctx>, CompilerError> {
+        let ptr_field_ptr =
+            self.builder
+                .build_struct_gep(self.ref_count.ref_count_struct, ptr, 1, "ref_ptr")?;
+        Ok(self
+            .builder
+            .build_load(self.ref_count.ptr_type, ptr_field_ptr, "get_ptr")?
+            .into_pointer_value())
     }
 
     fn compile_ast(
@@ -798,4 +929,6 @@ pub enum CompilerError {
     InvalidImportType(Position),
     #[error("Import not found")]
     ImportNotFound,
+    #[error("Unsupported type")]
+    UnsupportedType(UnitType),
 }
