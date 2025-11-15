@@ -97,7 +97,7 @@ impl<'ctx> RefCount<'ctx> {
         }
     }
 
-    pub fn create(
+    pub fn create_wit_const_len(
         &self,
         builder: &Builder<'ctx>,
         ty: UnitType,
@@ -121,6 +121,35 @@ impl<'ctx> RefCount<'ctx> {
         builder.build_store(field_ptr, ptr)?;
         let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 2, "len")?;
         builder.build_store(field_ptr, len_type.const_int(len, false))?;
+        let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 3, "rc")?;
+        builder.build_store(field_ptr, ref_count_type.const_int(1, false))?;
+
+        Ok(struct_val)
+    }
+
+    pub fn create(
+        &self,
+        builder: &Builder<'ctx>,
+        ty: UnitType,
+        ptr: PointerValue<'ctx>,
+        len: IntValue<'ctx>,
+    ) -> Result<PointerValue<'ctx>, CompilerError> {
+        let type_marker = self.type_marker;
+        let ref_count_type = self.ref_count_type;
+        let ref_count_struct = self.ref_count_struct;
+
+        let ty = match ty {
+            UnitType::Literal(LiteralType::String) => 0,
+            _ => return Err(CompilerError::UnsupportedType(ty)),
+        };
+
+        let struct_val = builder.build_malloc(ref_count_struct, "struct_value")?;
+        let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 0, "type")?;
+        builder.build_store(field_ptr, type_marker.const_int(ty, false))?;
+        let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 1, "ptr")?;
+        builder.build_store(field_ptr, ptr)?;
+        let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 2, "len")?;
+        builder.build_store(field_ptr, len)?;
         let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 3, "rc")?;
         builder.build_store(field_ptr, ref_count_type.const_int(1, false))?;
 
@@ -162,6 +191,13 @@ impl<'ctx> CompilerContext<'ctx> {
                     self.ref_count.ref_count_type.const_int(1, false),
                     "inc_ref_count",
                 )?;
+                let condition = self.builder.build_int_compare(
+                    inkwell::IntPredicate::NE,
+                    result,
+                    self.ref_count.ref_count_type.const_int(0, false),
+                    "if_cond",
+                )?;
+
                 let current_function = self
                     .builder
                     .get_insert_block()
@@ -174,7 +210,7 @@ impl<'ctx> CompilerContext<'ctx> {
                 let merge_block = self.context.append_basic_block(current_function, "merge");
                 let free_rc = self.context.append_basic_block(current_function, "free_rc");
                 self.builder
-                    .build_conditional_branch(result, with_more_references, free_rc)?;
+                    .build_conditional_branch(condition, with_more_references, free_rc)?;
 
                 self.builder.position_at_end(with_more_references);
                 self.builder.build_store(rc_field_ptr, result)?;
@@ -193,6 +229,7 @@ impl<'ctx> CompilerContext<'ctx> {
                     .into_pointer_value();
                 self.builder.build_free(ptr_field)?;
                 self.builder.build_free(ptr)?;
+                self.builder.build_unconditional_branch(merge_block)?;
                 self.builder.position_at_end(merge_block);
                 Ok(())
             }
@@ -253,6 +290,16 @@ impl<'ctx> CompilerContext<'ctx> {
             .builder
             .build_load(self.ref_count.ptr_type, ptr_field_ptr, "get_ptr")?
             .into_pointer_value())
+    }
+
+    pub fn deref_rc_if_necessary(
+        &self,
+        value: BasicValueEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>, CompilerError> {
+        match value {
+            BasicValueEnum::PointerValue(ptr) => Ok(self.get_ptr_ptr(ptr)?.into()),
+            _ => Ok(value),
+        }
     }
 
     fn compile_ast(
@@ -590,7 +637,7 @@ impl<'ctx> CompilerContext<'ctx> {
         stack.push((
             UnitType::Literal(LiteralType::String),
             self.ref_count
-                .create(
+                .create_wit_const_len(
                     &self.builder,
                     UnitType::Literal(LiteralType::String),
                     value.as_pointer_value(),

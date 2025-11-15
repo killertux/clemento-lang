@@ -1,0 +1,7 @@
+import std::io
+
+defx pow (F64 F64 -> F64)
+
+def main {
+    10.0 2.0 pow println
+}
