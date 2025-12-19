@@ -293,64 +293,155 @@ impl<'a> Parser<'a> {
             TokenType::SymbolWithPath(symbol) => symbol,
             _ => return Err(ParserError::UnexpectedToken(symbol.token_type, position)),
         };
-
-        let paths = if symbol.last().is_some_and(|last| last == "*") {
-            let dir = PathBuf::from_iter(symbol.iter().take(symbol.len() - 1));
-            let mut paths = Vec::new();
-            for entry in std::fs::read_dir(&dir).map_err(|err| {
-                ParserError::ImportError(dir.display().to_string(), err.to_string())
-            })? {
-                let entry = entry.map_err(|err| {
-                    ParserError::ImportError(dir.display().to_string(), err.to_string())
-                })?;
-                if entry
-                    .file_type()
-                    .map_err(|err| {
-                        ParserError::ImportError(dir.display().to_string(), err.to_string())
-                    })?
-                    .is_file()
-                {
-                    paths.push(entry.path().with_extension("clem"));
+        let mut functions = Vec::new();
+        if self
+            .tokens
+            .peek()
+            .map(|token| {
+                token
+                    .as_ref()
+                    .map(|token| token.token_type == TokenType::LeftParen)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+        {
+            functions = self.parse_import_function_list(position.clone())?;
+        }
+        let alias = self
+            .tokens
+            .next_if(|next| {
+                next.as_ref()
+                    .map(|next| next.token_type == TokenType::Symbol("as".into()))
+                    .unwrap_or(false)
+            })
+            .transpose()?
+            .map(|_| -> Result<String, ParserError> {
+                let token = self
+                    .tokens
+                    .next()
+                    .transpose()?
+                    .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
+                match token.token_type {
+                    TokenType::Symbol(alias) => Ok(alias),
+                    token_type => Err(ParserError::UnexpectedToken(token_type, token.position)),
                 }
-            }
-            paths
-        } else {
-            vec![PathBuf::from_iter(symbol.iter()).with_extension("clem")]
+            })
+            .transpose()?;
+        let path = PathBuf::from_iter(symbol.iter()).with_extension("clem");
+        let path_as_string = path.display().to_string();
+        let name = symbol
+            .last()
+            .expect("A path will always have at least one element")
+            .clone();
+        let name = NameWithAlias {
+            name: path_as_string,
+            alias: alias.unwrap_or(name),
         };
 
-        let mut nodes = Vec::new();
-        for path in paths {
-            let path_as_string = path.display().to_string();
-            if self.imports.contains(&path_as_string) {
-                nodes.push(Import {
-                    name: path_as_string,
+        let node = {
+            if self.imports.contains(&name.name) {
+                Import {
+                    name,
+                    functions,
                     node: None,
-                });
-                continue;
+                }
+            } else {
+                let file_content = read_to_string(&path)
+                    .map_err(|err| ParserError::ImportError(name.name.clone(), err.to_string()))?;
+
+                let program = Parser::new_from_file(&file_content, name.name.clone())
+                    .collect::<Result<Vec<AstNode>, ParserError>>()?;
+
+                self.imports.insert(name.name.clone());
+                Import {
+                    name,
+                    functions,
+                    node: Some(AstNode {
+                        node_type: AstNodeType::Block(program),
+                        position: Position::default(),
+                        type_definition: None,
+                    }),
+                }
             }
-
-            let file_content = read_to_string(&path)
-                .map_err(|err| ParserError::ImportError(path_as_string.clone(), err.to_string()))?;
-
-            let program = Parser::new_from_file(&file_content, path_as_string.clone())
-                .collect::<Result<Vec<AstNode>, ParserError>>()?;
-
-            self.imports.insert(path_as_string.clone());
-            nodes.push(Import {
-                name: path_as_string,
-                node: Some(AstNode {
-                    node_type: AstNodeType::Block(program),
-                    position: Position::default(),
-                    type_definition: None,
-                }),
-            });
-        }
+        };
 
         Ok(Some(AstNode {
-            node_type: AstNodeType::Import(symbol, nodes),
+            node_type: AstNodeType::Import(symbol, Box::new(node)),
             position,
             type_definition: None,
         }))
+    }
+
+    fn parse_import_function_list(
+        &mut self,
+        position: Position,
+    ) -> Result<Vec<NameWithAlias>, ParserError> {
+        let symbol = self
+            .tokens
+            .next()
+            .transpose()?
+            .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
+        assert_token_type(&symbol, TokenType::LeftParen)?;
+        let mut functions = Vec::new();
+        loop {
+            let symbol = self
+                .tokens
+                .next()
+                .transpose()?
+                .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
+            if symbol.token_type == TokenType::RightParen {
+                break;
+            }
+
+            match symbol.token_type {
+                TokenType::Symbol(name) => {
+                    let alias = self
+                        .tokens
+                        .next_if(|next| {
+                            next.as_ref()
+                                .map(|next| next.token_type == TokenType::Symbol("as".into()))
+                                .unwrap_or(false)
+                        })
+                        .transpose()?
+                        .map(|_| -> Result<String, ParserError> {
+                            let token = self
+                                .tokens
+                                .next()
+                                .transpose()?
+                                .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
+                            match token.token_type {
+                                TokenType::Symbol(alias) => Ok(alias),
+                                token_type => {
+                                    Err(ParserError::UnexpectedToken(token_type, token.position))
+                                }
+                            }
+                        })
+                        .transpose()?;
+                    functions.push(NameWithAlias {
+                        name: name.clone(),
+                        alias: alias.unwrap_or(name),
+                    });
+                }
+                _ => {
+                    return Err(ParserError::UnexpectedToken(
+                        symbol.token_type.clone(),
+                        position,
+                    ));
+                }
+            }
+        }
+        Ok(functions)
+    }
+}
+
+fn assert_token_type(token: &Token, expected_type: TokenType) -> Result<(), ParserError> {
+    if token.token_type == expected_type {
+        Ok(())
+    } else {
+        Err(ParserError::UnexpectedToken(
+            token.token_type.clone(),
+            token.position.clone(),
+        ))
     }
 }
 
@@ -404,7 +495,7 @@ pub enum AstNodeType<T> {
     Boolean(bool),
     Symbol(String),
     SymbolWithPath(Vec<String>),
-    Import(Vec<String>, Vec<Import<T>>),
+    Import(Vec<String>, Box<Import<T>>),
     Definition {
         name: String,
         is_private: bool,
@@ -417,8 +508,15 @@ pub enum AstNodeType<T> {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Import<T> {
-    pub name: String,
+    pub name: NameWithAlias,
+    pub functions: Vec<NameWithAlias>,
     pub node: Option<T>,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct NameWithAlias {
+    pub name: String,
+    pub alias: String,
 }
 
 impl<T> Display for AstNodeType<T>
@@ -444,7 +542,31 @@ where
                 }
             }
             AstNodeType::ExternalDefinition(symbol, ty) => writeln!(f, "defx {} {}", symbol, ty),
-            AstNodeType::Import(symbol, _) => write!(f, "import {}", symbol.join("::")),
+            AstNodeType::Import(symbol, import) => {
+                write!(f, "import {}", symbol.join("::"))?;
+                if import.functions.len() > 0 {
+                    write!(
+                        f,
+                        "({})",
+                        import
+                            .functions
+                            .iter()
+                            .map(|func| {
+                                if func.name != func.alias {
+                                    format!("{} as {}", func.name, func.alias)
+                                } else {
+                                    func.name.to_string()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    )?;
+                }
+                if import.name.alias != symbol[symbol.len() - 1] {
+                    write!(f, " as {}", import.name.alias)?;
+                }
+                Ok(())
+            }
             AstNodeType::If(true_body, Some(false_body)) => {
                 write!(f, "if {} else {}", true_body, false_body)
             }
@@ -1120,6 +1242,136 @@ mod tests {
                 position: Position::new(1, 1, None),
                 type_definition: None,
             }))
+        );
+    }
+
+    #[test]
+    fn parse_simple_import() {
+        let input = "import std::stack";
+        let mut parser = Parser::new_from_str(input);
+        let token = parser.next().unwrap().unwrap();
+        let AstNodeType::Import(_, import_node) = token.node_type.clone() else {
+            panic!("Expected Import node type");
+        };
+        assert_eq!(
+            token,
+            AstNode {
+                node_type: AstNodeType::Import(
+                    vec!["std".into(), "stack".into()],
+                    Box::new(Import {
+                        name: NameWithAlias {
+                            name: "std/stack.clem".into(),
+                            alias: "stack".into()
+                        },
+                        functions: vec![],
+                        node: import_node.node,
+                    })
+                ),
+                position: Position::new(1, 1, None),
+                type_definition: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_simple_import_with_alias() {
+        let input = "import std::stack as stack_op";
+        let mut parser = Parser::new_from_str(input);
+        let token = parser.next().unwrap().unwrap();
+        let AstNodeType::Import(_, import_node) = token.node_type.clone() else {
+            panic!("Expected Import node type");
+        };
+        assert_eq!(
+            token,
+            AstNode {
+                node_type: AstNodeType::Import(
+                    vec!["std".into(), "stack".into()],
+                    Box::new(Import {
+                        name: NameWithAlias {
+                            name: "std/stack.clem".into(),
+                            alias: "stack_op".into()
+                        },
+                        functions: vec![],
+                        node: import_node.node,
+                    })
+                ),
+                position: Position::new(1, 1, None),
+                type_definition: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_simple_import_with_functions() {
+        let input = "import std::stack(dup pop)";
+        let mut parser = Parser::new_from_str(input);
+        let token = parser.next().unwrap().unwrap();
+        let AstNodeType::Import(_, import_node) = token.node_type.clone() else {
+            panic!("Expected Import node type");
+        };
+        assert_eq!(
+            token,
+            AstNode {
+                node_type: AstNodeType::Import(
+                    vec!["std".into(), "stack".into()],
+                    Box::new(Import {
+                        name: NameWithAlias {
+                            name: "std/stack.clem".into(),
+                            alias: "stack".into()
+                        },
+                        functions: vec![
+                            NameWithAlias {
+                                name: "dup".into(),
+                                alias: "dup".into()
+                            },
+                            NameWithAlias {
+                                name: "pop".into(),
+                                alias: "pop".into()
+                            }
+                        ],
+                        node: import_node.node,
+                    })
+                ),
+                position: Position::new(1, 1, None),
+                type_definition: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_simple_import_with_functions_with_alias() {
+        let input = "import std::stack(dup as dup_alias pop as pop_alias) as stack_alias";
+        let mut parser = Parser::new_from_str(input);
+        let token = parser.next().unwrap().unwrap();
+        let AstNodeType::Import(_, import_node) = token.node_type.clone() else {
+            panic!("Expected Import node type");
+        };
+        assert_eq!(
+            token,
+            AstNode {
+                node_type: AstNodeType::Import(
+                    vec!["std".into(), "stack".into()],
+                    Box::new(Import {
+                        name: NameWithAlias {
+                            name: "std/stack.clem".into(),
+                            alias: "stack_alias".into()
+                        },
+                        functions: vec![
+                            NameWithAlias {
+                                name: "dup".into(),
+                                alias: "dup_alias".into()
+                            },
+                            NameWithAlias {
+                                name: "pop".into(),
+                                alias: "pop_alias".into()
+                            }
+                        ],
+                        node: import_node.node,
+                    })
+                ),
+                position: Position::new(1, 1, None),
+                type_definition: None,
+            }
         );
     }
 }

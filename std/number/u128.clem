@@ -1,0 +1,22 @@
+import std::number::u8
+import std::stack(swap rot swap dup drop touch)
+import std::string(concat)
+
+defx + (U128 U128 -> U128)
+defx - (U128 U128 -> U128)
+defx * (U128 U128 -> U128)
+defx / (U128 U128 -> U128)
+defx % (U128 U128 -> U128)
+defx %u8 (U128 U8 -> U8)
+defx %u16 (U128 U16 -> U16)
+defx %u32 (U128 U32 -> U32)
+defx %u64 (U128 U64 -> U64)
+defx > (U128 U128 -> Boolean)
+defx < (U128 U128 -> Boolean)
+defx = (U128 U128 -> Boolean)
+defx != (U128 U128 -> Boolean)
+
+defp inner_to_string (String U128 -> String) {
+    dup 10u128 / swap 10u8 %u8 u8::to_string rot concat swap dup 0u128 = if { drop touch } else { inner_to_string }
+}
+def to_string (U128 -> String) { "" swap inner_to_string }

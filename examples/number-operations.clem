@@ -1,179 +1,190 @@
-import std::*
+import std::number::u8
+import std::number::u16
+import std::number::u32
+import std::number::u64
+import std::number::u128
+import std::number::i8
+import std::number::i16
+import std::number::i32
+import std::number::i64
+import std::number::i128
+import std::number::f64
+import std::io
 
 def main {
     // ===== u8 tests =====
-    "u8 tests:" println
-    0u8 0u8 + println
-    0u8 255u8 + println
-    2u8 40u8 + println
-    255u8 1u8 - println
-    100u8 50u8 - println
-    10u8 5u8 * println
-    100u8 4u8 / println
+    "u8 tests:" io::println
+    0u8 0u8 u8::+ u8::to_string io::println
+    0u8 255u8 u8::+ u8::to_string io::println
+    2u8 40u8 u8::+ u8::to_string io::println
+    255u8 1u8 u8::- u8::to_string io::println
+    100u8 50u8 u8::- u8::to_string io::println
+    10u8 5u8 u8::* u8::to_string io::println
+    100u8 4u8 u8::/ u8::to_string io::println
 
     // ===== u16 tests =====
-    "u16 tests:" println
-    0u16 0u16 + println
-    1000u16 2000u16 + println
-    65535u16 1u16 - println
-    200u16 100u16 - println
-    100u16 200u16 * println
-    1000u16 10u16 / println
+    "u16 tests:" io::println
+    0u16 0u16 u16::+ u16::to_string io::println
+    1000u16 2000u16 u16::+ u16::to_string io::println
+    65535u16 1u16 u16::- u16::to_string io::println
+    200u16 100u16 u16::- u16::to_string io::println
+    100u16 200u16 u16::* u16::to_string io::println
+    1000u16 10u16 u16::/ u16::to_string io::println
 
     // ===== u32 tests =====
-    "u32 tests:" println
-    0u32 1u32 + println
-    1000000u32 2000000u32 + println
-    4294967295u32 1u32 - println
-    500u32 200u32 - println
-    1000u32 1000u32 * println
-    10000u32 100u32 / println
+    "u32 tests:" io::println
+    0u32 1u32 u32::+ u32::to_string io::println
+    1000000u32 2000000u32 u32::+ u32::to_string io::println
+    4294967295u32 1u32 u32::- u32::to_string io::println
+    500u32 200u32 u32::- u32::to_string io::println
+    1000u32 1000u32 u32::* u32::to_string io::println
+    10000u32 100u32 u32::/ u32::to_string io::println
 
     // ===== u64 tests =====
-    "u64 tests:" println
-    0u64 1u64 + println
-    9223372036854775807u64 1u64 + println
-    1000u64 500u64 - println
-    1000u64 2000u64 * println
-    10000u64 100u64 / println
+    "u64 tests:" io::println
+    0u64 1u64 u64::+ u64::to_string io::println
+    9223372036854775807u64 1u64 u64::+ u64::to_string io::println
+    1000u64 500u64 u64::- u64::to_string io::println
+    1000u64 2000u64 u64::* u64::to_string io::println
+    10000u64 100u64 u64::/ u64::to_string io::println
 
     // ===== u128 tests =====
-    "u128 tests:" println
-    0u128 1u128 + println
-    1000000000000000000000000000000u128 1u128 + println
-    2000u128 1000u128 - println
-    100u128 100u128 * println
-    10000u128 100u128 / println
+    "u128 tests:" io::println
+    0u128 1u128 u128::+ u128::to_string io::println
+    1000000000000000000000000000000u128 1u128 u128::+ u128::to_string io::println
+    2000u128 1000u128 u128::- u128::to_string io::println
+    100u128 100u128 u128::* u128::to_string io::println
+    10000u128 100u128 u128::/ u128::to_string io::println
 
     // ===== i8 tests =====
-    "i8 tests:" println
-    0i8 0i8 + println
-    -10i8 20i8 + println
-    127i8 -1i8 + println
-    10i8 5i8 - println
-    -10i8 -5i8 - println
-    10i8 -5i8 * println
-    -20i8 4i8 / println
+    "i8 tests:" io::println
+    0i8 0i8 i8::+ i8::to_string io::println
+    -10i8 20i8 i8::+ i8::to_string io::println
+    127i8 -1i8 i8::+ i8::to_string io::println
+    10i8 5i8 i8::- i8::to_string io::println
+    -10i8 -5i8 i8::- i8::to_string io::println
+    10i8 -5i8 i8::* i8::to_string io::println
+    -20i8 4i8 i8::/ i8::to_string io::println
 
     // ===== i16 tests =====
-    "i16 tests:" println
-    0i16 1i16 + println
-    -1000i16 2000i16 + println
-    32767i16 -1i16 + println
-    100i16 50i16 - println
-    -10i16 -5i16 * println
-    100i16 -4i16 / println
+    "i16 tests:" io::println
+    0i16 1i16 i16::+ i16::to_string io::println
+    -1000i16 2000i16 i16::+ i16::to_string io::println
+    32767i16 -1i16 i16::+ i16::to_string io::println
+    100i16 50i16 i16::- i16::to_string io::println
+    -10i16 -5i16 i16::* i16::to_string io::println
+    100i16 -4i16 i16::/ i16::to_string io::println
 
     // ===== i32 tests =====
-    "i32 tests:" println
-    0i32 1i32 + println
-    -1000000i32 2000000i32 + println
-    2147483647i32 -1i32 + println
-    200i32 100i32 - println
-    -100i32 200i32 * println
-    -1000i32 10i32 / println
+    "i32 tests:" io::println
+    0i32 1i32 i32::+ i32::to_string io::println
+    -1000000i32 2000000i32 i32::+ i32::to_string io::println
+    2147483647i32 -1i32 i32::+ i32::to_string io::println
+    200i32 100i32 i32::- i32::to_string io::println
+    -100i32 200i32 i32::* i32::to_string io::println
+    -1000i32 10i32 i32::/ i32::to_string io::println
 
     // ===== i64 tests =====
-    "i64 tests:" println
-    0i64 1i64 + println
-    -9223372036854775807i64 1i64 + println
-    1000i64 -500i64 - println
-    -100i64 -200i64 * println
-    10000i64 -100i64 / println
+    "i64 tests:" io::println
+    0i64 1i64 i64::+ i64::to_string io::println
+    -9223372036854775807i64 1i64 i64::+ i64::to_string io::println
+    1000i64 -500i64 i64::- i64::to_string io::println
+    -100i64 -200i64 i64::* i64::to_string io::println
+    10000i64 -100i64 i64::/ i64::to_string io::println
 
     // ===== i128 tests =====
-    "i128 tests:" println
-    0i128 1i128 + println
-    -1000000000000000000000000000000i128 1i128 + println
-    2000i128 -1000i128 - println
-    -100i128 100i128 * println
-    -10000i128 100i128 / println
+    "i128 tests:" io::println
+    0i128 1i128 i128::+ i128::to_string io::println
+    -1000000000000000000000000000000i128 1i128 i128::+ i128::to_string io::println
+    2000i128 -1000i128 i128::- i128::to_string io::println
+    -100i128 100i128 i128::* i128::to_string io::println
+    -10000i128 100i128 i128::/ i128::to_string io::println
 
     // ===== f64 tests =====
-    "f64 tests:" println
-    0.0f64 1.0f64 + println
-    3.14159f64 2.71828f64 + println
-    10.5f64 3.2f64 - println
-    -5.5f64 2.0f64 - println
-    3.14f64 2.0f64 * println
-    -10.0f64 -2.5f64 * println
-    15.0f64 3.0f64 / println
-    -20.0f64 4.0f64 / println
+    "f64 tests:" io::println
+    0.0f64 1.0f64 f64::+ f64::to_string io::println
+    3.14159f64 2.71828f64 f64::+ f64::to_string io::println
+    10.5f64 3.2f64 f64::- f64::to_string io::println
+    -5.5f64 2.0f64 f64::- f64::to_string io::println
+    3.14f64 2.0f64 f64::* f64::to_string io::println
+    -10.0f64 -2.5f64 f64::* f64::to_string io::println
+    15.0f64 3.0f64 f64::/ f64::to_string io::println
+    -20.0f64 4.0f64 f64::/ f64::to_string io::println
 
     // ===== Modulus (%) operations =====
-    "Modulus tests:" println
+    "Modulus tests:" io::println
 
     // u8 modulus
-    10u8 3u8 % println
-    100u8 7u8 % println
-    255u8 10u8 % println
-    5u8 10u8 % println
+    10u8 3u8 u8::% u8::to_string io::println
+    100u8 7u8 u8::% u8::to_string io::println
+    255u8 10u8 u8::% u8::to_string io::println
+    5u8 10u8 u8::% u8::to_string io::println
 
     // u16 modulus
-    1000u16 7u16 % println
-    65535u16 100u16 % println
-    50u16 13u16 % println
+    1000u16 7u16 u16::% u16::to_string io::println
+    65535u16 100u16 u16::% u16::to_string io::println
+    50u16 13u16 u16::% u16::to_string io::println
 
     // u32 modulus
-    1000000u32 999u32 % println
-    12345u32 100u32 % println
-    7u32 10u32 % println
+    1000000u32 999u32 u32::% u32::to_string io::println
+    12345u32 100u32 u32::% u32::to_string io::println
+    7u32 10u32 u32::% u32::to_string io::println
 
     // u64 modulus
-    123456789u64 1000u64 % println
-    9999u64 7u64 % println
+    123456789u64 1000u64 u64::% u64::to_string io::println
+    9999u64 7u64 u64::% u64::to_string io::println
 
     // u128 modulus
-    1000000000000000000000000000000u128 999999999999999999999999999999u128 % println
-    12345u128 67u128 % println
+    1000000000000000000000000000000u128 999999999999999999999999999999u128 u128::% u128::to_string io::println
+    12345u128 67u128 u128::% u128::to_string io::println
 
     // i8 modulus
-    10i8 3i8 % println
-    -10i8 3i8 % println
-    10i8 -3i8 % println
-    -10i8 -3i8 % println
+    10i8 3i8 i8::% i8::to_string io::println
+    -10i8 3i8 i8::% i8::to_string io::println
+    10i8 -3i8 i8::% i8::to_string io::println
+    -10i8 -3i8 i8::% i8::to_string io::println
 
     // i16 modulus
-    1000i16 7i16 % println
-    -1000i16 7i16 % println
-    1000i16 -7i16 % println
-    -1000i16 -7i16 % println
+    1000i16 7i16 i16::% i16::to_string io::println
+    -1000i16 7i16 i16::% i16::to_string io::println
+    1000i16 -7i16 i16::% i16::to_string io::println
+    -1000i16 -7i16 i16::% i16::to_string io::println
 
     // i32 modulus
-    12345i32 100i32 % println
-    -12345i32 100i32 % println
-    12345i32 -100i32 % println
-    -12345i32 -100i32 % println
+    12345i32 100i32 i32::% i32::to_string io::println
+    -12345i32 100i32 i32::% i32::to_string io::println
+    12345i32 -100i32 i32::% i32::to_string io::println
+    -12345i32 -100i32 i32::% i32::to_string io::println
 
     // i64 modulus
-    123456789i64 1000i64 % println
-    -123456789i64 1000i64 % println
+    123456789i64 1000i64 i64::% i64::to_string io::println
+    -123456789i64 1000i64 i64::% i64::to_string io::println
 
     // i128 modulus
-    12345678901234567890i128 999999999i128 % println
-    -12345678901234567890i128 999999999i128 % println
+    12345678901234567890i128 999999999i128 i128::% i128::to_string io::println
+    -12345678901234567890i128 999999999i128 i128::% i128::to_string io::println
 
     // Mixed type modulus (testing various combinations from math.clem)
-    1000u16 7u8 % println
-    1000000u32 255u8 % println
-    1000000u32 1000u16 % println
-    1000000000u64 255u8 % println
-    1000000000u64 1000u16 % println
-    1000000000u64 100000u32 % println
+    1000u16 7u8 u16::%u8 u8::to_string io::println
+    1000000u32 255u8 u32::%u8 u8::to_string io::println
+    1000000u32 1000u16 u32::%u16 u16::to_string io::println
+    1000000000u64 255u8 u64::%u8 u8::to_string io::println
+    1000000000u64 1000u16 u64::%u16 u16::to_string io::println
+    1000000000u64 100000u32 u64::%u32 u32::to_string io::println
 
-    1000i16 7i8 % println
-    1000000i32 127i8 % println
-    1000000i32 1000i16 % println
-    1000000000i64 127i8 % println
-    1000000000i64 1000i16 % println
-    1000000000i64 100000i32 % println
+    1000i16 7i8 i16::%i8 i8::to_string io::println
+    1000000i32 127i8 i32::%i8 i8::to_string io::println
+    1000000i32 1000i16 i32::%i16 i16::to_string io::println
+    1000000000i64 127i8 i64::%i8 i8::to_string io::println
+    1000000000i64 1000i16 i64::%i16 i16::to_string io::println
+    1000000000i64 100000i32 i64::%i32 i32::to_string io::println
 
     // ===== Mixed operations edge cases =====
-    "Edge cases:" println
-    1u8 1u8 - println         // Should be 0
-    0u8 1u8 * println         // Should be 0
-    0i8 -5i8 + println        // Should be -5
-    -1i8 -1i8 * println       // Should be 1
-    1.0f64 3.0f64 / println   // Should be ~0.333...
-    0.0f64 5.0f64 * println   // Should be 0.0
+    "Edge cases:" io::println
+    1u8 1u8 u8::- u8::to_string io::println         // Should be 0
+    0u8 1u8 u8::* u8::to_string io::println         // Should be 0
+    0i8 -5i8 i8::+ i8::to_string io::println        // Should be -5
+    -1i8 -1i8 i8::* i8::to_string io::println       // Should be 1
+    1.0f64 3.0f64 f64::/ f64::to_string io::println // Should be ~0.333...
+    0.0f64 5.0f64 f64::* f64::to_string io::println // Should be 0.0
 }

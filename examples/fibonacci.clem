@@ -1,4 +1,6 @@
-import std::*
+import std::stack(dup drop swap dup2 drop2)
+import std::number::i64(< = + - to_string)
+import std::io(println)
 
 def fibonacci (I64 -> I64) {
     dup 2 < if {
@@ -10,11 +12,11 @@ def fibonacci (I64 -> I64) {
     }
 }
 
-def print_fibonacci (I64 I64 -> ) {
-    dup2 = if drop2 else { dup fibonacci println 1 +  print_fibonacci }
+def inner_print_fibonacci (I64 I64 -> ) {
+    dup2 = if drop2 else { dup fibonacci to_string println 1 +  inner_print_fibonacci }
 }
 def print_fibonacci (I64 -> ) {
-    0 print_fibonacci
+    0 inner_print_fibonacci
 }
 
 def main {

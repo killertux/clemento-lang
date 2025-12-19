@@ -1,7 +1,8 @@
 import std::io
+import std::number::f64
 
 defx pow (F64 F64 -> F64)
 
 def main {
-    10.0 2.0 pow println
+    10.0 2.0 pow f64::to_string io::println
 }

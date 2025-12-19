@@ -1,0 +1,16 @@
+import std::stack(dup touch)
+
+defx + (I8 I8 -> I8)
+defx - (I8 I8 -> I8)
+defx * (I8 I8 -> I8)
+defx / (I8 I8 -> I8)
+defx % (I8 I8 -> I8)
+defx to_string (I8 -> String)
+defx > (I8 I8 -> Boolean)
+defx < (I8 I8 -> Boolean)
+defx = (I8 I8 -> Boolean)
+defx != (I8 I8 -> Boolean)
+
+def abs (I8 -> I8) {
+    dup 0i8 < if { -1i8 * } else { touch }
+}

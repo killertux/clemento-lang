@@ -1,16 +1,18 @@
-import std::*
+import std::io(println)
+import std::stack(dup drop)
+import std::number::i64(= - * to_string)
 
 def factorial (I64 -> I64) {
     dup 0 = if { drop 1 } else { dup 1 - factorial * }
 }
 
 def main {
-    0 factorial println
-    1 factorial println
-    2 factorial println
-    3 factorial println
-    4 factorial println
-    5 factorial println
-    6 factorial println
-    7 factorial println
+    0 factorial to_string println
+    1 factorial to_string println
+    2 factorial to_string println
+    3 factorial to_string println
+    4 factorial to_string println
+    5 factorial to_string println
+    6 factorial to_string println
+    7 factorial to_string println
 }

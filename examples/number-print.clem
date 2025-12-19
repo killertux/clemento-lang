@@ -1,25 +1,36 @@
-import std::*
+import std::number::u8
+import std::number::u16
+import std::number::u32
+import std::number::u64
+import std::number::u128
+import std::number::i8
+import std::number::i16
+import std::number::i32
+import std::number::i64
+import std::number::i128
+import std::number::f64
+import std::io
 
 def main {
-    0u8 println
-    255u8 println
-    0u16 println
-    65535u16 println
-    0u32 println
-    4294967295u32 println
-    0u64 println
-    18446744073709551615u64 println
-    0u128 println
-    340282366920938463463374607431768211455u128 println
-    -128i8 println
-    127i8 println
-    -32768i16 println
-    32767i16 println
-    -2147483648i32 println
-    2147483647i32 println
-    -9223372036854775808i64 println
-    9223372036854775807i64 println
-    -170141183460469231731687303715884105728i128 println
-    170141183460469231731687303715884105727i128 println
-    3.1415926 println
+    0u8 u8::to_string io::println
+    255u8 u8::to_string io::println
+    0u16 u16::to_string io::println
+    65535u16 u16::to_string io::println
+    0u32 u32::to_string io::println
+    4294967295u32 u32::to_string io::println
+    0u64 u64::to_string io::println
+    18446744073709551615u64 u64::to_string io::println
+    0u128 u128::to_string io::println
+    340282366920938463463374607431768211455u128 u128::to_string io::println
+    -128i8 i8::to_string io::println
+    127i8 i8::to_string io::println
+    -32768i16 i16::to_string io::println
+    32767i16 i16::to_string io::println
+    -2147483648i32 i32::to_string io::println
+    2147483647i32 i32::to_string io::println
+    -9223372036854775808i64 i64::to_string io::println
+    9223372036854775807i64 i64::to_string io::println
+    -170141183460469231731687303715884105728i128 i128::to_string io::println
+    170141183460469231731687303715884105727i128 i128::to_string io::println
+    3.1415926 f64::to_string io::println
 }

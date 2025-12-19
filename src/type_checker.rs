@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt::Display, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, fmt::Display, rc::Rc};
 
 use thiserror::Error;
 
@@ -38,7 +38,7 @@ impl AstNodeWithType {
 }
 
 pub struct TypeChecker {
-    imports: HashMap<String, Rc<TypeScope<'static>>>,
+    imports: HashMap<String, TypeScope>,
 }
 
 impl TypeChecker {
@@ -52,7 +52,7 @@ impl TypeChecker {
         &mut self,
         program: AstNode,
         check_for_main: bool,
-    ) -> Result<(AstNodeWithType, TypeScope<'static>), TypeCheckerError> {
+    ) -> Result<(AstNodeWithType, TypeScope), TypeCheckerError> {
         let mut scope = TypeScope::empty();
         let AstNodeType::Block(nodes) = program.node_type else {
             return Err(TypeCheckerError::InvalidModuleDefinition(Box::new(
@@ -112,7 +112,8 @@ impl TypeChecker {
             node_results.push(node);
         }
 
-        if check_for_main && let Some(main) = scope.get_definition("main", &[], false) {
+        if check_for_main && let Some(main) = scope.get_definition(vec!["main".to_string()], false)
+        {
             let valid_main_definitions = [
                 Type::new(vec![], vec![]),
                 Type::new(
@@ -220,9 +221,33 @@ impl TypeChecker {
                 node.position.clone(),
                 Type::boolean(),
             )),
-            AstNodeType::SymbolWithPath(_symbol) => todo!(),
+            AstNodeType::SymbolWithPath(symbol) => {
+                let type_definition = scope.get_definition(symbol.clone(), false).ok_or(
+                    TypeCheckerError::SymbolNotFound(symbol.join("::"), node.position.clone(), {
+                        let mut var_t_container = VarTypeToCharContainer::new();
+                        format!(
+                            "<...{}>",
+                            type_stack[type_stack.len().saturating_sub(5)..]
+                                .iter()
+                                .map(|t| t.to_consistent_string(&mut var_t_container))
+                                .collect::<Vec<String>>()
+                                .join(",")
+                        )
+                    }),
+                )?;
+                validate_type_against_type_stack(
+                    &type_stack,
+                    &type_definition,
+                    node.position.clone(),
+                )?;
+                Ok(AstNodeWithType::new(
+                    AstNodeType::SymbolWithPath(symbol),
+                    node.position.clone(),
+                    substitute_types(&type_stack, type_definition, node.position.clone())?,
+                ))
+            }
             AstNodeType::Symbol(symbol) => {
-                let type_definition = scope.get_definition(&symbol, &type_stack, false).ok_or(
+                let type_definition = scope.get_definition(vec![symbol.clone()], false).ok_or(
                     TypeCheckerError::SymbolNotFound(symbol.clone(), node.position.clone(), {
                         let mut var_t_container = VarTypeToCharContainer::new();
                         format!(
@@ -235,6 +260,11 @@ impl TypeChecker {
                         )
                     }),
                 )?;
+                validate_type_against_type_stack(
+                    &type_stack,
+                    &type_definition,
+                    node.position.clone(),
+                )?;
                 Ok(AstNodeWithType::new(
                     AstNodeType::Symbol(symbol),
                     node.position.clone(),
@@ -242,7 +272,7 @@ impl TypeChecker {
                 ))
             }
             AstNodeType::Block(nodes) => {
-                let mut scope = TypeScope::with_parent(scope);
+                let mut scope = TypeScope::with_parent(scope.clone());
                 let (ty, nodes) =
                     self.type_check_block(&mut scope, type_stack.clone(), nodes, false)?;
                 Ok(AstNodeWithType::new(
@@ -258,18 +288,30 @@ impl TypeChecker {
             } => {
                 let body = if let Some(ty) = body.type_definition.as_ref() {
                     // We use this to allow recursive types. We should probably create a better implementation latter
-                    scope.insert_definition(symbol.clone(), ty.clone(), is_private);
+                    scope.insert_definition(
+                        symbol.clone(),
+                        ty.clone(),
+                        TypeScope::empty(),
+                        is_private,
+                    );
                     let mut body = self.infer_type_definition(scope, type_stack.clone(), *body)?;
                     let body_type =
                         substitute_types(&type_stack, body.type_definition, node.position.clone())?;
                     body.type_definition = body_type.clone();
                     body
                 } else {
-                    let mut body = self.infer_type_definition(scope, type_stack.clone(), *body)?;
+                    let mut new_scope = TypeScope::with_parent(scope.clone());
+                    let mut body =
+                        self.infer_type_definition(&mut new_scope, type_stack.clone(), *body)?;
                     let body_type =
                         substitute_types(&type_stack, body.type_definition, node.position.clone())?;
                     body.type_definition = body_type.clone();
-                    scope.insert_definition(symbol.clone(), body_type.clone(), is_private);
+                    scope.insert_definition(
+                        symbol.clone(),
+                        body_type.clone(),
+                        new_scope,
+                        is_private,
+                    );
                     body
                 };
                 Ok(AstNodeWithType::new(
@@ -283,37 +325,51 @@ impl TypeChecker {
                 ))
             }
             AstNodeType::ExternalDefinition(symbol, ty) => {
-                scope.insert_definition(symbol.clone(), ty.clone(), false);
+                scope.insert_definition(symbol.clone(), ty.clone(), TypeScope::empty(), false);
                 Ok(AstNodeWithType::new(
                     AstNodeType::ExternalDefinition(symbol, ty),
                     node.position.clone(),
                     Type::empty(),
                 ))
             }
-            AstNodeType::Import(_path, import_nodes) => {
-                let mut result_nodes = Vec::new();
-                for import_node in import_nodes {
-                    if let Some(nodes) = import_node.node {
-                        let result = self.type_check(nodes, false)?;
-                        result_nodes.push(Import {
-                            name: import_node.name,
-                            node: Some(result.0),
-                        });
-                        scope.imported.push(Rc::new(result.1));
-                    } else {
-                        result_nodes.push(Import {
-                            name: import_node.name.clone(),
-                            node: None,
-                        });
-                        let imported_scope = self
-                            .imports
-                            .get(&import_node.name)
-                            .ok_or(TypeCheckerError::MissingImport(import_node.name.clone()))?;
-                        scope.imported.push(imported_scope.clone());
+            AstNodeType::Import(_path, import_node) => {
+                let result_node = if let Some(nodes) = import_node.node {
+                    let result = self.type_check(nodes, false)?;
+                    scope.insert_import(import_node.name.alias.clone(), result.1);
+                    for function in &import_node.functions {
+                        scope.insert_function_import(
+                            function.alias.clone(),
+                            function.name.clone(),
+                            import_node.name.alias.clone(),
+                        );
                     }
-                }
+
+                    Import {
+                        name: import_node.name,
+                        functions: import_node.functions,
+                        node: Some(result.0),
+                    }
+                } else {
+                    let imported_scope = self.imports.get(&import_node.name.name).ok_or(
+                        TypeCheckerError::MissingImport(import_node.name.alias.clone()),
+                    )?;
+                    scope.insert_import(import_node.name.alias.clone(), imported_scope.clone());
+                    for function in &import_node.functions {
+                        scope.insert_function_import(
+                            function.alias.clone(),
+                            function.name.clone(),
+                            import_node.name.alias.clone(),
+                        );
+                    }
+                    Import {
+                        name: import_node.name,
+                        functions: import_node.functions,
+                        node: None,
+                    }
+                };
+
                 Ok(AstNodeWithType::new(
-                    AstNodeType::Import(_path, result_nodes),
+                    AstNodeType::Import(_path, Box::new(result_node)),
                     node.position.clone(),
                     Type::empty(),
                 ))
@@ -546,8 +602,8 @@ pub fn validate_type_against_type_stack(
             (other1, other2) => {
                 return Err(TypeCheckerError::TypeConflict(
                     position,
-                    Box::new(other1.clone()),
                     Box::new(other2.clone()),
+                    Box::new(other1.clone()),
                 ));
             }
         }
@@ -577,75 +633,124 @@ pub enum TypeCheckerError {
     MissingImport(String),
 }
 
-#[derive(Debug)]
-pub struct TypeScope<'a> {
-    parent: Option<&'a TypeScope<'a>>,
-    imported: Vec<Rc<TypeScope<'static>>>,
-    definitions: HashMap<String, Vec<(Type, bool)>>,
+#[derive(Debug, Clone)]
+pub struct TypeScope {
+    inner: Rc<RefCell<InnerTypeScope>>,
 }
 
-impl<'a> TypeScope<'a> {
-    fn with_parent(parent: &'a TypeScope<'a>) -> TypeScope<'a> {
+#[derive(Debug, Clone)]
+struct InnerTypeScope {
+    parent: Option<TypeScope>,
+    imported: HashMap<String, TypeScope>,
+    imported_functions: HashMap<String, (String, String)>,
+    definitions: HashMap<String, (Type, TypeScope, bool)>,
+}
+
+impl TypeScope {
+    fn with_parent(parent: TypeScope) -> TypeScope {
         TypeScope {
-            parent: Some(parent),
-            imported: Vec::new(),
-            definitions: HashMap::new(),
+            inner: Rc::new(RefCell::new(InnerTypeScope {
+                parent: Some(parent),
+                imported: HashMap::new(),
+                imported_functions: HashMap::new(),
+                definitions: HashMap::new(),
+            })),
         }
     }
 
-    fn insert_definition(&mut self, symbol: String, definition: Type, is_private: bool) {
-        self.definitions
-            .entry(symbol)
-            .or_default()
-            .push((definition, is_private));
+    fn insert_definition(
+        &mut self,
+        symbol: String,
+        definition: Type,
+        scope: TypeScope,
+        is_private: bool,
+    ) {
+        let mut inner = self.inner.borrow_mut();
+        inner
+            .definitions
+            .insert(symbol, (definition, scope, is_private));
     }
 
-    fn get_definition(
-        &self,
-        symbol: &str,
-        stack: &[UnitType],
-        filter_private: bool,
-    ) -> Option<Type> {
-        self.definitions
-            .get(symbol)
-            .cloned()
-            .and_then(|definitions| {
-                for (def, is_private) in definitions {
-                    if is_private && filter_private {
-                        continue;
-                    }
-                    let mut stack = stack.to_vec();
-                    if stack.len() < def.pop_types.len() {
-                        for _ in 0..def.pop_types.len() - stack.len() {
-                            stack.insert(0, UnitType::Var(VarType::new()));
-                        }
-                    }
-                    if validate_type_against_type_stack(&stack, &def, Position::default()).is_ok() {
-                        return Some(def);
-                    }
-                }
-                None
-            })
-            .or_else(|| {
-                for imported in &self.imported {
-                    let value = imported.get_definition(symbol, stack, true);
-                    if value.is_some() {
-                        return value;
-                    }
-                }
-                None
-            })
-            .or_else(|| {
-                self.parent
-                    .and_then(|parent| parent.get_definition(symbol, stack, filter_private))
-            })
+    fn insert_import(&mut self, symbol: String, scope: TypeScope) {
+        let mut inner = self.inner.borrow_mut();
+        inner.imported.insert(symbol, scope);
     }
 
-    fn empty() -> TypeScope<'a> {
+    fn insert_function_import(
+        &mut self,
+        function_alias: String,
+        function_name: String,
+        module: String,
+    ) {
+        let mut inner = self.inner.borrow_mut();
+        inner
+            .imported_functions
+            .insert(function_alias, (function_name, module));
+    }
+
+    fn get_definition(&self, mut symbol: Vec<String>, filter_private: bool) -> Option<Type> {
+        match symbol.len() {
+            1 => {
+                let inner = self.inner.borrow();
+                let last = symbol
+                    .last()
+                    .expect("We checked for the symbol size")
+                    .clone();
+                if let Some(from_definitions) =
+                    inner
+                        .definitions
+                        .get(&last)
+                        .cloned()
+                        .and_then(|definitions| {
+                            let (def, _scope, is_private) = definitions;
+                            if is_private && filter_private {
+                                None
+                            } else {
+                                Some(def)
+                            }
+                        })
+                {
+                    return Some(from_definitions);
+                }
+                if let Some(imported_functions) = inner.imported_functions.get(&last) {
+                    return self.get_definition(
+                        vec![imported_functions.1.clone(), imported_functions.0.clone()],
+                        filter_private,
+                    );
+                }
+                if let Some(parent) = inner.parent.as_ref() {
+                    return parent.get_definition(symbol, filter_private);
+                }
+                None
+            }
+            0 => None,
+            _ => {
+                let inner = self.inner.borrow();
+                let first = symbol.remove(0);
+                if let Some(from_definitions) = inner.definitions.get(&first) {
+                    return from_definitions.1.get_definition(symbol, filter_private);
+                }
+                if let Some(from_imports) = inner.imported.get(&first) {
+                    return from_imports.get_definition(symbol, filter_private);
+                }
+                if let Some(parent) = inner.parent.as_ref() {
+                    symbol.insert(0, first);
+                    return parent.get_definition(symbol, filter_private);
+                }
+
+                None
+            }
+        }
+    }
+
+    fn empty() -> TypeScope {
         TypeScope {
-            parent: None,
-            imported: Vec::new(),
-            definitions: HashMap::new(),
+            inner: Rc::new(RefCell::new(InnerTypeScope {
+                parent: None,
+                imported: HashMap::new(),
+                imported_functions: HashMap::new(),
+                definitions: HashMap::new(),
+            })),
         }
     }
 }
@@ -680,64 +785,46 @@ mod test {
     }
 
     #[test]
-    fn program_with_multiple_definitions_with_different_types() {
-        let contents = r#"
-        import std::*
-
-        def greet (String I64 -> ) { swap print println}
-        def greet (String I32 -> ) { print println}
-
-        def main {
-            " The answer for the meaning of life is " dup 40i32 2i32 + greet  40i64 2i64 + greet
-        }"#;
-
-        let program = parse_and_type_check(contents, true).unwrap();
-        let expected_output = "( -> ) {( -> ) import std::* ( -> ) def greet (String I64 -> ) {(String I64 -> I64 String) swap (String -> ) print (I64 -> ) println}\n ( -> ) def greet (String I32 -> ) {(I32 -> ) print (String -> ) println}\n ( -> ) def main ( -> ) {( -> String) \" The answer for the meaning of life is \" (String -> String String) dup ( -> I32) 40i32 ( -> I32) 2i32 (I32 I32 -> I32) + (String I32 -> ) greet ( -> I64) 40i64 ( -> I64) 2i64 (I64 I64 -> I64) + (String I64 -> ) greet}\n}";
-
-        assert_eq!(program, expected_output);
-    }
-
-    #[test]
     fn basic_number_literals() {
-        let contents = "import std::io 42u8 print 100u16 print 1000u32 print";
+        let contents = "import std::stack(drop) 42u8 drop 100u16 drop 1000u32 drop";
         let program = parse_and_type_check(contents, false).unwrap();
 
         assert_eq!(
             program,
-            "( -> ) {( -> ) import std::io ( -> U8) 42u8 (U8 -> ) print ( -> U16) 100u16 (U16 -> ) print ( -> U32) 1000u32 (U32 -> ) print}"
+            "( -> ) {( -> ) import std::stack(drop) ( -> U8) 42u8 (U8 -> ) drop ( -> U16) 100u16 (U16 -> ) drop ( -> U32) 1000u32 (U32 -> ) drop}"
         );
     }
 
     #[test]
     fn signed_number_literals() {
-        let contents = "import std::io -42i8 print -100i16 print -1000i32 print";
+        let contents = "import std::stack(drop) -42i8 drop -100i16 drop -1000i32 drop";
         let program = parse_and_type_check(contents, false).unwrap();
 
         assert_eq!(
             program,
-            "( -> ) {( -> ) import std::io ( -> I8) -42i8 (I8 -> ) print ( -> I16) -100i16 (I16 -> ) print ( -> I32) -1000i32 (I32 -> ) print}"
+            "( -> ) {( -> ) import std::stack(drop) ( -> I8) -42i8 (I8 -> ) drop ( -> I16) -100i16 (I16 -> ) drop ( -> I32) -1000i32 (I32 -> ) drop}"
         )
     }
 
     #[test]
     fn float_and_string_literals() {
-        let contents = r#"import std::io 3.14 print "hello world" println"#;
+        let contents = r#"import std::stack 3.14 stack::drop "hello world" stack::drop"#;
         let program = parse_and_type_check(contents, false).unwrap();
 
         assert_eq!(
             program,
-            "( -> ) {( -> ) import std::io ( -> F64) 3.14 (F64 -> ) print ( -> String) \"hello world\" (String -> ) println}"
+            "( -> ) {( -> ) import std::stack ( -> F64) 3.14 (F64 -> ) stack::drop ( -> String) \"hello world\" (String -> ) stack::drop}"
         );
     }
 
     #[test]
     fn simple_block() {
-        let contents = "import std::io { 42u8 \"test\" print print }";
+        let contents = "import std::stack(drop) { 42u8 \"test\" stack::drop drop }";
         let program = parse_and_type_check(contents, false).unwrap();
 
         assert_eq!(
             program,
-            "( -> ) {( -> ) import std::io ( -> ) {( -> U8) 42u8 ( -> String) \"test\" (String -> ) print (U8 -> ) print}}"
+            "( -> ) {( -> ) import std::stack(drop) ( -> ) {( -> U8) 42u8 ( -> String) \"test\" (String -> ) stack::drop (U8 -> ) drop}}"
         );
     }
 
@@ -755,32 +842,32 @@ mod test {
     #[test]
     fn if_without_else() {
         let contents = r#"
-            import std::io
+            import std::stack
 
             def main {
-                true if { 42u8 print }
+                true if { 42u8 stack::drop }
             }
         "#;
         let program = parse_and_type_check(contents, true).unwrap();
         assert_eq!(
             program,
-            "( -> ) {( -> ) import std::io ( -> ) def main ( -> ) {( -> Boolean) true (Boolean -> ) if ( -> ) {( -> U8) 42u8 (U8 -> ) print}}\n}"
+            "( -> ) {( -> ) import std::stack ( -> ) def main ( -> ) {( -> Boolean) true (Boolean -> ) if ( -> ) {( -> U8) 42u8 (U8 -> ) stack::drop}}\n}"
         );
     }
 
     #[test]
     fn if_with_else_same_types() {
         let contents = r#"
-            import std::io
+            import std::stack
 
             def main {
-                true if { 42u8 } else { 24u8 } print
+                true if { 42u8 } else { 24u8 } stack::drop
             }
         "#;
         let program = parse_and_type_check(contents, true).unwrap();
         assert_eq!(
             program,
-            "( -> ) {( -> ) import std::io ( -> ) def main ( -> ) {( -> Boolean) true (Boolean -> U8) if ( -> U8) {( -> U8) 42u8} else ( -> U8) {( -> U8) 24u8} (U8 -> ) print}\n}"
+            "( -> ) {( -> ) import std::stack ( -> ) def main ( -> ) {( -> Boolean) true (Boolean -> U8) if ( -> U8) {( -> U8) 42u8} else ( -> U8) {( -> U8) 24u8} (U8 -> ) stack::drop}\n}"
         );
     }
 
@@ -857,24 +944,25 @@ mod test {
     #[test]
     fn builtin_functions_work() {
         let contents = r#"
-            import std::io
+            import std::stack(drop)
 
             def main {
-                42u8 print
-                "hello" println
+                42u8 drop
+                "hello" drop
             }
         "#;
         let result = parse_and_type_check(contents, true).unwrap();
         assert_eq!(
             result,
-            "( -> ) {( -> ) import std::io ( -> ) def main ( -> ) {( -> U8) 42u8 (U8 -> ) print ( -> String) \"hello\" (String -> ) println}\n}"
+            "( -> ) {( -> ) import std::stack(drop) ( -> ) def main ( -> ) {( -> U8) 42u8 (U8 -> ) drop ( -> String) \"hello\" (String -> ) drop}\n}"
         );
     }
 
     #[test]
     fn arithmetic_operations() {
         let contents = r#"
-import std::*
+import std::number::i32(+ -)
+import std::stack(drop)
 
 def main {
     5i32 3i32 +
@@ -884,47 +972,47 @@ def main {
         let result = parse_and_type_check(contents, true).unwrap();
         assert_eq!(
             result,
-            "( -> ) {( -> ) import std::* ( -> ) def main ( -> ) {( -> I32) 5i32 ( -> I32) 3i32 (I32 I32 -> I32) + ( -> I32) 10i32 ( -> I32) 2i32 (I32 I32 -> I32) - ( -> I32) 15i32 ( -> I32) 3i32 (I32 I32 -> I32) + (I32 -> ) drop (I32 -> ) drop (I32 -> ) drop}\n}"
+            "( -> ) {( -> ) import std::number::i32(+ -) ( -> ) import std::stack(drop) ( -> ) def main ( -> ) {( -> I32) 5i32 ( -> I32) 3i32 (I32 I32 -> I32) + ( -> I32) 10i32 ( -> I32) 2i32 (I32 I32 -> I32) - ( -> I32) 15i32 ( -> I32) 3i32 (I32 I32 -> I32) + (I32 -> ) drop (I32 -> ) drop (I32 -> ) drop}\n}"
         );
     }
 
     #[test]
     fn nested_blocks() {
         let contents = r#"
-            import std::io
+            import std::stack
 
             def main {
-                { { 42u8 print } }
+                { { 42u8 stack::drop } }
             }
         "#;
         let result = parse_and_type_check(contents, true).unwrap();
         assert_eq!(
             result,
-            "( -> ) {( -> ) import std::io ( -> ) def main ( -> ) {( -> ) {( -> ) {( -> U8) 42u8 (U8 -> ) print}}}\n}"
+            "( -> ) {( -> ) import std::stack ( -> ) def main ( -> ) {( -> ) {( -> ) {( -> U8) 42u8 (U8 -> ) stack::drop}}}\n}"
         );
     }
 
     #[test]
     fn complex_stack_manipulation() {
         let contents = r#"
-            import std::*
+            import std::stack(dup drop swap)
             def main {
                 1u8 2u8
-                dup print
-                swap print print
+                dup drop
+                swap drop drop
             }
         "#;
         let result = parse_and_type_check(contents, true).unwrap();
         assert_eq!(
             result,
-            "( -> ) {( -> ) import std::* ( -> ) def main ( -> ) {( -> U8) 1u8 ( -> U8) 2u8 (U8 -> U8 U8) dup (U8 -> ) print (U8 U8 -> U8 U8) swap (U8 -> ) print (U8 -> ) print}\n}"
+            "( -> ) {( -> ) import std::stack(dup drop swap) ( -> ) def main ( -> ) {( -> U8) 1u8 ( -> U8) 2u8 (U8 -> U8 U8) dup (U8 -> ) drop (U8 U8 -> U8 U8) swap (U8 -> ) drop (U8 -> ) drop}\n}"
         );
     }
 
     #[test]
     fn type_conflict_error() {
         let contents = r#"
-            import std::stack
+            import std::stack(dup drop)
             def test (U8 -> U8) { dup drop }
             def main {
                 42i32 test  # This should fail - trying to pass I32 where U8 expected
@@ -934,9 +1022,6 @@ def main {
             .unwrap_err()
             .to_string();
 
-        assert_eq!(
-            error,
-            "Symbol test not found at 5:23 with type stack <...I32>. Maybe it is defined after the current position"
-        );
+        assert_eq!(error, "Type conflict at 5:23: expected I32, got U8");
     }
 }

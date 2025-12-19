@@ -313,11 +313,12 @@ impl<'ctx> CompilerContext<'ctx> {
             AstNodeType::String(string) => self.compile_string(stack, string),
             AstNodeType::Boolean(boolean) => self.compile_boolean(stack, boolean),
             AstNodeType::Symbol(symbol) => {
-                scope.call_symbol(&symbol, self, program.type_definition, stack)?;
+                scope.call_symbol(vec![symbol], self, program.type_definition, stack)?;
                 Ok(())
             }
-            AstNodeType::SymbolWithPath(_symbol) => {
-                todo!()
+            AstNodeType::SymbolWithPath(symbol) => {
+                scope.call_symbol(symbol, self, program.type_definition, stack)?;
+                Ok(())
             }
             AstNodeType::Block(nodes) => {
                 let scope = Scope::with_parent(scope);
@@ -336,8 +337,8 @@ impl<'ctx> CompilerContext<'ctx> {
                     {
                         scope.add_definition(
                             function.name.clone(),
-                            function.ty.clone(),
                             function.function.clone(),
+                            Scope::with_parent(scope.clone()),
                         );
                         return Ok(());
                     }
@@ -350,28 +351,34 @@ impl<'ctx> CompilerContext<'ctx> {
             AstNodeType::If(true_body, false_body) => {
                 self.compile_if(scope, *true_body, false_body, stack)
             }
-            AstNodeType::Import(_path, import_nodes) => {
-                for import_node in import_nodes {
-                    let import_scope = if let Some(nodes) = import_node.node {
-                        let AstNodeType::Block(nodes) = nodes.node_type else {
-                            return Err(CompilerError::InvalidImportType(program.position));
-                        };
-                        let import_scope = Scope::empty();
-                        for node in nodes {
-                            self.compile_ast(import_scope.clone(), stack, node)?;
-                        }
-
-                        self.imports.insert(import_node.name, import_scope.clone());
-                        import_scope
-                    } else {
-                        self.imports
-                            .get(&import_node.name)
-                            .ok_or(CompilerError::ImportNotFound)?
-                            .clone()
+            AstNodeType::Import(_path, import_node) => {
+                let import_scope = if let Some(nodes) = import_node.node {
+                    let AstNodeType::Block(nodes) = nodes.node_type else {
+                        return Err(CompilerError::InvalidImportType(program.position));
                     };
+                    let import_scope = Scope::empty();
+                    for node in nodes {
+                        self.compile_ast(import_scope.clone(), stack, node)?;
+                    }
 
-                    scope.add_import(import_scope);
+                    self.imports
+                        .insert(import_node.name.name, import_scope.clone());
+                    import_scope
+                } else {
+                    self.imports
+                        .get(&import_node.name.name)
+                        .ok_or(CompilerError::ImportNotFound)?
+                        .clone()
+                };
+                for function_import in import_node.functions {
+                    scope.add_function_import(
+                        function_import.alias,
+                        function_import.name,
+                        import_node.name.alias.clone(),
+                    );
                 }
+
+                scope.add_import(import_node.name.alias, import_scope);
                 Ok(())
             }
         }
@@ -496,7 +503,7 @@ impl<'ctx> CompilerContext<'ctx> {
         let function_name = if symbol == "main" {
             "main".into()
         } else {
-            format!("{}_{}_{}", body.type_definition, symbol, scope.id())
+            format!("{}_{}", symbol, scope.id())
         };
         let function_type = if symbol == "main" {
             self.context.i32_type().fn_type(&[], false)
@@ -507,7 +514,8 @@ impl<'ctx> CompilerContext<'ctx> {
             .module
             .add_function(&function_name, function_type, None);
         let ty = body.type_definition.clone();
-        scope.add_function_definition(symbol, function, ty.clone());
+        let new_scope = Scope::with_parent(scope.clone());
+        scope.add_function_definition(symbol, function, ty.clone(), new_scope.clone());
 
         let entry = self.context.append_basic_block(function, "entry");
         self.builder.position_at_end(entry);
@@ -524,7 +532,7 @@ impl<'ctx> CompilerContext<'ctx> {
             stack.push(param);
         }
 
-        self.compile_ast(scope, &mut stack, body)?;
+        self.compile_ast(new_scope, &mut stack, body)?;
 
         if symbol == "main" {
             match stack.pop() {
@@ -779,9 +787,10 @@ pub struct Scope<'ctx> {
 }
 
 struct InternalScope<'ctx> {
-    definitions: HashMap<String, Vec<(Type, DefinitionType<'ctx>)>>,
+    definitions: HashMap<String, (DefinitionType<'ctx>, Scope<'ctx>)>,
     external_definitions: HashMap<String, Type>,
-    imported: Vec<Scope<'ctx>>,
+    imported: HashMap<String, Scope<'ctx>>,
+    imported_functions: HashMap<String, (String, String)>,
     parent: Option<Scope<'ctx>>,
     id: u64,
 }
@@ -794,7 +803,8 @@ impl<'ctx> Scope<'ctx> {
             scope: Rc::new(RefCell::new(InternalScope {
                 external_definitions: HashMap::new(),
                 definitions: HashMap::new(),
-                imported: Vec::new(),
+                imported: HashMap::new(),
+                imported_functions: HashMap::new(),
                 parent: Some(parent),
                 id: SCOPE_ID.fetch_add(1, Ordering::Relaxed),
             })),
@@ -807,96 +817,109 @@ impl<'ctx> Scope<'ctx> {
 
     fn call_symbol(
         &self,
-        symbol: &str,
+        mut symbol: Vec<String>,
         context: &CompilerContext<'ctx>,
         ty: Type,
         stack: &mut Stack<'ctx>,
     ) -> Result<(), CompilerError> {
         let inner = self.scope.borrow();
 
-        inner
-            .definitions
-            .get(symbol)
-            .and_then(|closures| {
-                for (ty_closure, closure) in closures {
-                    if match_types(&ty.pop_types, &ty_closure.pop_types) {
-                        return Some(closure(context, stack));
-                    }
+        match symbol.len() {
+            1 => {
+                let last = symbol
+                    .last()
+                    .expect("We checked for the symbol size")
+                    .clone();
+                if let Some(from_definitions) =
+                    inner
+                        .definitions
+                        .get(&last)
+                        .cloned()
+                        .and_then(|definition| {
+                            return Some(definition.0(context, stack));
+                        })
+                {
+                    return from_definitions;
                 }
-                None
-            })
-            .or_else(|| {
-                inner
+                if let Some(from_definitions) = inner
                     .external_definitions
-                    .get(symbol)
-                    .and_then(|external_ty| {
-                        if match_types(&ty.pop_types, &external_ty.pop_types) {
-                            Some(call_function(
-                                context,
-                                stack,
-                                symbol.to_string(),
-                                symbol.to_string(),
-                                ty.clone(),
-                            ))
-                        } else {
-                            None
-                        }
+                    .get(&last)
+                    .cloned()
+                    .and_then(|_| {
+                        Some(call_function(
+                            context,
+                            stack,
+                            last.clone(),
+                            last.clone(),
+                            ty.clone(),
+                        ))
                     })
-            })
-            .or_else(|| {
-                for imported in &inner.imported {
-                    let value = imported.call_symbol(symbol, context, ty.clone(), stack);
-                    if let Err(CompilerError::UndefinedSymbol(_)) = value {
-                        continue;
-                    }
-                    return Some(value);
+                {
+                    return from_definitions;
                 }
-                None
-            })
-            .or_else(|| {
-                for imported in &inner.imported {
-                    let value = imported.call_symbol(symbol, context, ty.clone(), stack);
-                    if let Err(CompilerError::UndefinedSymbol(_)) = value {
-                        continue;
-                    }
-                    return Some(value);
+                if let Some(imported_functions) = inner.imported_functions.get(&last) {
+                    return self.call_symbol(
+                        vec![imported_functions.1.clone(), imported_functions.0.clone()],
+                        context,
+                        ty,
+                        stack,
+                    );
                 }
-                None
-            })
-            .or_else(|| {
-                inner
-                    .parent
-                    .as_ref()
-                    .map(|parent| parent.call_symbol(symbol, context, ty, stack))
-            })
-            .ok_or(CompilerError::UndefinedSymbol(symbol.into()))?
+                if let Some(parent) = inner.parent.as_ref() {
+                    return parent.call_symbol(symbol, context, ty, stack);
+                }
+                Err(CompilerError::UndefinedSymbol(symbol.join("::")))
+            }
+            0 => Err(CompilerError::UndefinedSymbol(symbol.join("::"))),
+            _ => {
+                let first = symbol.remove(0);
+                if let Some(from_definitions) = inner.definitions.get(&first) {
+                    return from_definitions.1.call_symbol(symbol, context, ty, stack);
+                }
+                if let Some(from_imports) = inner.imported.get(&first) {
+                    return from_imports.call_symbol(symbol, context, ty, stack);
+                }
+                if let Some(parent) = inner.parent.as_ref() {
+                    symbol.insert(0, first);
+                    return parent.call_symbol(symbol, context, ty, stack);
+                }
+
+                Err(CompilerError::UndefinedSymbol(symbol.join("::")))
+            }
+        }
     }
 
-    fn add_definition(&self, name: String, ty: Type, definition: DefinitionType<'ctx>) {
+    fn add_definition(&self, name: String, definition: DefinitionType<'ctx>, scope: Scope<'ctx>) {
+        let mut inner = self.scope.borrow_mut();
+        inner.definitions.insert(name.clone(), (definition, scope));
+    }
+
+    fn add_import(&self, alias: String, scope: Scope<'ctx>) {
+        let mut inner = self.scope.borrow_mut();
+        inner.imported.insert(alias, scope);
+    }
+
+    fn add_function_import(&self, alias: String, real_name: String, module_alias: String) {
         let mut inner = self.scope.borrow_mut();
         inner
-            .definitions
-            .entry(name.clone())
-            .or_default()
-            .push((ty.clone(), definition));
+            .imported_functions
+            .insert(alias, (real_name, module_alias));
     }
 
-    fn add_import(&self, scope: Scope<'ctx>) {
-        let mut inner = self.scope.borrow_mut();
-        inner.imported.push(scope);
-    }
-
-    fn add_function_definition(&self, symbol: &str, function: FunctionValue<'ctx>, ty: Type) {
+    fn add_function_definition(
+        &self,
+        symbol: &str,
+        function: FunctionValue<'ctx>,
+        ty: Type,
+        scope: Scope<'ctx>,
+    ) {
         let symbol_name = symbol.to_string();
         let function_name = function.get_name().to_string_lossy().to_string();
         let mut inner = self.scope.borrow_mut();
 
-        inner
-            .definitions
-            .entry(symbol_name.clone())
-            .or_default()
-            .push((
-                ty.clone(),
+        inner.definitions.insert(
+            symbol_name.clone(),
+            (
                 Rc::new(Box::new(
                     move |compiler_context: &CompilerContext<'ctx>,
                           stack: &mut Stack<'ctx>|
@@ -910,7 +933,9 @@ impl<'ctx> Scope<'ctx> {
                         )
                     },
                 )),
-            ));
+                scope,
+            ),
+        );
     }
 
     fn empty() -> Scope<'ctx> {
@@ -918,7 +943,8 @@ impl<'ctx> Scope<'ctx> {
             scope: Rc::new(RefCell::new(InternalScope {
                 definitions: HashMap::new(),
                 external_definitions: HashMap::new(),
-                imported: Vec::new(),
+                imported: HashMap::new(),
+                imported_functions: HashMap::new(),
                 parent: None,
                 id: SCOPE_ID.fetch_add(1, Ordering::Relaxed),
             })),

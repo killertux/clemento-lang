@@ -154,7 +154,7 @@ pub fn builtins_functions<'ctx>(
         pop1_push1(
             &all_literal_types_minus_128_bits,
             Some(UnitType::Literal(LiteralType::String)),
-            "String".into(),
+            "to_string".into(),
             Rc::new(Box::new(
                 |compiler_context: &CompilerContext<'ctx>,
                  stack: &mut Stack<'ctx>|
@@ -3392,7 +3392,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%u8".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::U16)),
@@ -3414,7 +3414,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%u8".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::U32)),
@@ -3425,7 +3425,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%u16".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::U32)),
@@ -3447,7 +3447,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%u8".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::U64)),
@@ -3458,7 +3458,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%u16".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::U64)),
@@ -3469,7 +3469,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%u32".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::U64)),
@@ -3491,7 +3491,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%u8".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::U128)),
@@ -3502,7 +3502,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%u16".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::U128)),
@@ -3513,7 +3513,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%u32".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::U128)),
@@ -3524,7 +3524,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%u64".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::U128)),
@@ -3557,7 +3557,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%i8".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::I16)),
@@ -3579,7 +3579,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%i8".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::I32)),
@@ -3590,7 +3590,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%i16".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::I32)),
@@ -3612,7 +3612,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%i8".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::I64)),
@@ -3623,7 +3623,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%i16".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::I64)),
@@ -3634,7 +3634,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%i32".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::I64)),
@@ -3656,7 +3656,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%i8".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::I128)),
@@ -3667,7 +3667,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%i16".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::I128)),
@@ -3678,7 +3678,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%i32".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::I128)),
@@ -3689,7 +3689,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%i64".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::I128)),
