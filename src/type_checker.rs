@@ -288,30 +288,18 @@ impl TypeChecker {
             } => {
                 let body = if let Some(ty) = body.type_definition.as_ref() {
                     // We use this to allow recursive types. We should probably create a better implementation latter
-                    scope.insert_definition(
-                        symbol.clone(),
-                        ty.clone(),
-                        TypeScope::empty(),
-                        is_private,
-                    );
+                    scope.insert_definition(symbol.clone(), ty.clone(), is_private);
                     let mut body = self.infer_type_definition(scope, type_stack.clone(), *body)?;
                     let body_type =
                         substitute_types(&type_stack, body.type_definition, node.position.clone())?;
                     body.type_definition = body_type.clone();
                     body
                 } else {
-                    let mut new_scope = TypeScope::with_parent(scope.clone());
-                    let mut body =
-                        self.infer_type_definition(&mut new_scope, type_stack.clone(), *body)?;
+                    let mut body = self.infer_type_definition(scope, type_stack.clone(), *body)?;
                     let body_type =
                         substitute_types(&type_stack, body.type_definition, node.position.clone())?;
                     body.type_definition = body_type.clone();
-                    scope.insert_definition(
-                        symbol.clone(),
-                        body_type.clone(),
-                        new_scope,
-                        is_private,
-                    );
+                    scope.insert_definition(symbol.clone(), body_type.clone(), is_private);
                     body
                 };
                 Ok(AstNodeWithType::new(
@@ -325,7 +313,7 @@ impl TypeChecker {
                 ))
             }
             AstNodeType::ExternalDefinition(symbol, ty) => {
-                scope.insert_definition(symbol.clone(), ty.clone(), TypeScope::empty(), false);
+                scope.insert_definition(symbol.clone(), ty.clone(), false);
                 Ok(AstNodeWithType::new(
                     AstNodeType::ExternalDefinition(symbol, ty),
                     node.position.clone(),
@@ -643,7 +631,7 @@ struct InnerTypeScope {
     parent: Option<TypeScope>,
     imported: HashMap<String, TypeScope>,
     imported_functions: HashMap<String, (String, String)>,
-    definitions: HashMap<String, (Type, TypeScope, bool)>,
+    definitions: HashMap<String, (Type, bool)>,
 }
 
 impl TypeScope {
@@ -658,17 +646,9 @@ impl TypeScope {
         }
     }
 
-    fn insert_definition(
-        &mut self,
-        symbol: String,
-        definition: Type,
-        scope: TypeScope,
-        is_private: bool,
-    ) {
+    fn insert_definition(&mut self, symbol: String, definition: Type, is_private: bool) {
         let mut inner = self.inner.borrow_mut();
-        inner
-            .definitions
-            .insert(symbol, (definition, scope, is_private));
+        inner.definitions.insert(symbol, (definition, is_private));
     }
 
     fn insert_import(&mut self, symbol: String, scope: TypeScope) {
@@ -702,7 +682,7 @@ impl TypeScope {
                         .get(&last)
                         .cloned()
                         .and_then(|definitions| {
-                            let (def, _scope, is_private) = definitions;
+                            let (def, is_private) = definitions;
                             if is_private && filter_private {
                                 None
                             } else {
@@ -727,9 +707,6 @@ impl TypeScope {
             _ => {
                 let inner = self.inner.borrow();
                 let first = symbol.remove(0);
-                if let Some(from_definitions) = inner.definitions.get(&first) {
-                    return from_definitions.1.get_definition(symbol, filter_private);
-                }
                 if let Some(from_imports) = inner.imported.get(&first) {
                     return from_imports.get_definition(symbol, filter_private);
                 }
@@ -1022,6 +999,26 @@ def main {
             .unwrap_err()
             .to_string();
 
-        assert_eq!(error, "Type conflict at 5:23: expected I32, got U8");
+        assert_eq!(error, "Type conflict at 5:23: expected U8, got I32");
+    }
+
+    #[test]
+    fn nested_def() {
+        let contents = r#"
+            import std::stack(drop)
+            def test {
+                def test1 { drop }
+                10i32 test1
+            }
+            def main {
+                test
+            }
+        "#;
+        let result = parse_and_type_check(contents, true).unwrap();
+
+        assert_eq!(
+            result,
+            "( -> ) {( -> ) import std::stack(drop) ( -> ) def test ( -> ) {( -> ) def test1 (a -> ) {(a -> ) drop}\n ( -> I32) 10i32 (I32 -> ) test1}\n ( -> ) def main ( -> ) {( -> ) test}\n}"
+        );
     }
 }

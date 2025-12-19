@@ -335,11 +335,7 @@ impl<'ctx> CompilerContext<'ctx> {
                 for function in &self.internal_functions {
                     if function.name == symbol && match_types(&ty.pop_types, &function.ty.pop_types)
                     {
-                        scope.add_definition(
-                            function.name.clone(),
-                            function.function.clone(),
-                            Scope::with_parent(scope.clone()),
-                        );
+                        scope.add_definition(function.name.clone(), function.function.clone());
                         return Ok(());
                     }
                 }
@@ -510,12 +506,13 @@ impl<'ctx> CompilerContext<'ctx> {
         } else {
             function_type
         };
+
         let function = self
             .module
             .add_function(&function_name, function_type, None);
         let ty = body.type_definition.clone();
         let new_scope = Scope::with_parent(scope.clone());
-        scope.add_function_definition(symbol, function, ty.clone(), new_scope.clone());
+        scope.add_function_definition(symbol, function, ty.clone());
 
         let entry = self.context.append_basic_block(function, "entry");
         self.builder.position_at_end(entry);
@@ -787,7 +784,7 @@ pub struct Scope<'ctx> {
 }
 
 struct InternalScope<'ctx> {
-    definitions: HashMap<String, (DefinitionType<'ctx>, Scope<'ctx>)>,
+    definitions: HashMap<String, DefinitionType<'ctx>>,
     external_definitions: HashMap<String, Type>,
     imported: HashMap<String, Scope<'ctx>>,
     imported_functions: HashMap<String, (String, String)>,
@@ -836,7 +833,7 @@ impl<'ctx> Scope<'ctx> {
                         .get(&last)
                         .cloned()
                         .and_then(|definition| {
-                            return Some(definition.0(context, stack));
+                            return Some(definition(context, stack));
                         })
                 {
                     return from_definitions;
@@ -873,9 +870,6 @@ impl<'ctx> Scope<'ctx> {
             0 => Err(CompilerError::UndefinedSymbol(symbol.join("::"))),
             _ => {
                 let first = symbol.remove(0);
-                if let Some(from_definitions) = inner.definitions.get(&first) {
-                    return from_definitions.1.call_symbol(symbol, context, ty, stack);
-                }
                 if let Some(from_imports) = inner.imported.get(&first) {
                     return from_imports.call_symbol(symbol, context, ty, stack);
                 }
@@ -889,9 +883,9 @@ impl<'ctx> Scope<'ctx> {
         }
     }
 
-    fn add_definition(&self, name: String, definition: DefinitionType<'ctx>, scope: Scope<'ctx>) {
+    fn add_definition(&self, name: String, definition: DefinitionType<'ctx>) {
         let mut inner = self.scope.borrow_mut();
-        inner.definitions.insert(name.clone(), (definition, scope));
+        inner.definitions.insert(name.clone(), definition);
     }
 
     fn add_import(&self, alias: String, scope: Scope<'ctx>) {
@@ -906,35 +900,26 @@ impl<'ctx> Scope<'ctx> {
             .insert(alias, (real_name, module_alias));
     }
 
-    fn add_function_definition(
-        &self,
-        symbol: &str,
-        function: FunctionValue<'ctx>,
-        ty: Type,
-        scope: Scope<'ctx>,
-    ) {
+    fn add_function_definition(&self, symbol: &str, function: FunctionValue<'ctx>, ty: Type) {
         let symbol_name = symbol.to_string();
         let function_name = function.get_name().to_string_lossy().to_string();
         let mut inner = self.scope.borrow_mut();
 
         inner.definitions.insert(
             symbol_name.clone(),
-            (
-                Rc::new(Box::new(
-                    move |compiler_context: &CompilerContext<'ctx>,
-                          stack: &mut Stack<'ctx>|
-                          -> Result<(), CompilerError> {
-                        call_function(
-                            compiler_context,
-                            stack,
-                            symbol_name.clone(),
-                            function_name.clone(),
-                            ty.clone(),
-                        )
-                    },
-                )),
-                scope,
-            ),
+            Rc::new(Box::new(
+                move |compiler_context: &CompilerContext<'ctx>,
+                      stack: &mut Stack<'ctx>|
+                      -> Result<(), CompilerError> {
+                    call_function(
+                        compiler_context,
+                        stack,
+                        symbol_name.clone(),
+                        function_name.clone(),
+                        ty.clone(),
+                    )
+                },
+            )),
         );
     }
 
