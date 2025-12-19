@@ -495,6 +495,8 @@ impl<'ctx> CompilerContext<'ctx> {
         symbol: &str,
         body: AstNodeWithType,
     ) -> Result<(), CompilerError> {
+        let current_block = self.builder.get_insert_block();
+
         let function_type = self.get_llvm_function_type(&body.type_definition)?;
         let function_name = if symbol == "main" {
             "main".into()
@@ -577,6 +579,10 @@ impl<'ctx> CompilerContext<'ctx> {
                 }
                 self.builder.build_return(None)?;
             }
+        }
+
+        if let Some(block) = current_block {
+            self.builder.position_at_end(block);
         }
 
         Ok(())

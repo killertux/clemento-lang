@@ -20,14 +20,13 @@ def abs (I128 -> I128) {
     dup 0i128 < if { -1i128 * } else { touch }
 }
 
-defp inner_to_string (String I128 -> String) {
-    dup
-    10i128 /
-    swap 10i8 %i8 i8::abs i8::to_string
-    rot concat swap dup 0i128 = if { drop touch } else { inner_to_string }
-}
-
 def to_string (I128 -> String) {
+    defp inner_to_string (String I128 -> String) {
+        dup
+        10i128 /
+        swap 10i8 %i8 i8::abs i8::to_string
+        rot concat swap dup 0i128 = if { drop touch } else { inner_to_string }
+    }
     dup 0i128 < swap
     "" swap inner_to_string
     swap if { "-" } else { "" } swap concat

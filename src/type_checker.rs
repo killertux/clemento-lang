@@ -289,17 +289,15 @@ impl TypeChecker {
                 let body = if let Some(ty) = body.type_definition.as_ref() {
                     // We use this to allow recursive types. We should probably create a better implementation latter
                     scope.insert_definition(symbol.clone(), ty.clone(), is_private);
-                    let mut body = self.infer_type_definition(scope, type_stack.clone(), *body)?;
-                    let body_type =
-                        substitute_types(&type_stack, body.type_definition, node.position.clone())?;
-                    body.type_definition = body_type.clone();
+                    let body = self.infer_type_definition(scope, Vec::new(), *body)?;
                     body
                 } else {
-                    let mut body = self.infer_type_definition(scope, type_stack.clone(), *body)?;
-                    let body_type =
-                        substitute_types(&type_stack, body.type_definition, node.position.clone())?;
-                    body.type_definition = body_type.clone();
-                    scope.insert_definition(symbol.clone(), body_type.clone(), is_private);
+                    let body = self.infer_type_definition(scope, Vec::new(), *body)?;
+                    scope.insert_definition(
+                        symbol.clone(),
+                        body.type_definition.clone(),
+                        is_private,
+                    );
                     body
                 };
                 Ok(AstNodeWithType::new(
