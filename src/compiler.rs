@@ -13,7 +13,7 @@ use inkwell::{
     context::Context,
     module::Module,
     types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, IntType, PointerType, StructType},
-    values::{AggregateValue, BasicValue, BasicValueEnum, FunctionValue, IntValue, PointerValue},
+    values::{AggregateValue, BasicValue, BasicValueEnum, IntValue, PointerValue},
 };
 use thiserror::Error;
 
@@ -23,7 +23,7 @@ use crate::{
     parser::{
         AstNode, AstNodeType, LiteralType, NumberType, Parser, ParserError, Type, UnitType, VarType,
     },
-    type_checker::{AstNodeWithType, TypeChecker, TypeCheckerError},
+    type_checker::{AstNodeWithType, TypeChecker, TypeCheckerError, generate_custom_type_id},
 };
 
 pub struct CompilerContext<'ctx> {
@@ -335,7 +335,7 @@ impl<'ctx> CompilerContext<'ctx> {
                 for function in &self.internal_functions {
                     if function.name == symbol && match_types(&ty.pop_types, &function.ty.pop_types)
                     {
-                        scope.add_definition(function.name.clone(), function.function.clone());
+                        scope.add_definition(function.name.clone(), ty, function.function.clone());
                         return Ok(());
                     }
                 }
@@ -375,6 +375,18 @@ impl<'ctx> CompilerContext<'ctx> {
                 }
 
                 scope.add_import(import_node.name.alias, import_scope);
+                Ok(())
+            }
+            AstNodeType::CustomType {
+                name,
+                generics,
+                variants,
+            } => {
+                let id = generate_custom_type_id();
+                scope.insert_type_definition(name.clone(), id, generics.clone(), variants.clone());
+                // for variant in variants.into_iter() {
+                //     scope.insert_type_constructor(variant.0, name.clone(), variant.1);
+                // }
                 Ok(())
             }
         }
@@ -495,95 +507,129 @@ impl<'ctx> CompilerContext<'ctx> {
         symbol: &str,
         body: AstNodeWithType,
     ) -> Result<(), CompilerError> {
-        let current_block = self.builder.get_insert_block();
+        let cloned_scope = scope.clone();
+        let symbol_name = symbol.to_string();
+        scope.add_function_definition(
+            symbol,
+            Box::new(move |ty: Type, context: &CompilerContext<'ctx>| {
+                let cloned_scope = cloned_scope.clone();
+                let body = body.clone();
+                let current_block = context.builder.get_insert_block();
 
-        let function_type = self.get_llvm_function_type(&body.type_definition)?;
-        let function_name = if symbol == "main" {
-            "main".into()
-        } else {
-            format!("{}_{}", symbol, scope.id())
-        };
-        let function_type = if symbol == "main" {
-            self.context.i32_type().fn_type(&[], false)
-        } else {
-            function_type
-        };
+                let function_type = context.get_llvm_function_type(&ty)?;
+                let function_name = if symbol_name == "main" {
+                    "main".into()
+                } else {
+                    format!("{}_{}", symbol_name, cloned_scope.id())
+                };
+                let function_type = if symbol_name == "main" {
+                    context.context.i32_type().fn_type(&[], false)
+                } else {
+                    function_type
+                };
 
-        let function = self
-            .module
-            .add_function(&function_name, function_type, None);
-        let ty = body.type_definition.clone();
-        let new_scope = Scope::with_parent(scope.clone());
-        scope.add_function_definition(symbol, function, ty.clone());
+                let function = context
+                    .module
+                    .add_function(&function_name, function_type, None);
+                let ty = body.type_definition.clone();
+                let new_scope = Scope::with_parent(cloned_scope);
 
-        let entry = self.context.append_basic_block(function, "entry");
-        self.builder.position_at_end(entry);
+                let entry = context.context.append_basic_block(function, "entry");
+                context.builder.position_at_end(entry);
 
-        let mut stack = Stack::new();
+                let mut stack = Stack::new();
 
-        for param in body
-            .type_definition
-            .pop_types
-            .clone()
-            .into_iter()
-            .zip(function.get_param_iter())
-        {
-            stack.push(param);
-        }
-
-        self.compile_ast(new_scope, &mut stack, body)?;
-
-        if symbol == "main" {
-            match stack.pop() {
-                Some(value) => {
-                    self.builder.build_return(Some(&value.1))?;
+                for param in body
+                    .type_definition
+                    .pop_types
+                    .clone()
+                    .into_iter()
+                    .zip(function.get_param_iter())
+                {
+                    stack.push(param);
                 }
-                None => {
-                    self.builder.build_return(Some(
-                        &self.context.i32_type().const_zero().as_basic_value_enum(),
-                    ))?;
-                }
-            }
-            return Ok(());
-        }
-        match function_type.get_return_type() {
-            Some(BasicTypeEnum::StructType(return_type)) => {
-                let return_val = stack.remove_all();
-                let mut struct_val = return_type.get_undef().as_aggregate_value_enum();
-                for (index, value) in return_val.into_iter().enumerate() {
-                    struct_val = self.builder.build_insert_value(
-                        struct_val,
-                        value.1,
-                        index as u32,
-                        &format!("ret_{}", index),
-                    )?;
-                }
-                self.builder
-                    .build_return(Some(&struct_val.as_basic_value_enum()))?;
-            }
-            Some(return_type) => {
-                let return_val = stack.remove_all();
-                if return_val.len() != 1 {
-                    return Err(CompilerError::InvalidStackForFunction(symbol.to_string()));
-                }
-                let return_val = return_val[0].clone().1;
 
-                if return_val.get_type() != return_type {
-                    return Err(CompilerError::InvalidStackForFunction(symbol.to_string()));
-                }
-                self.builder.build_return(Some(&return_val))?;
-            }
-            None => {
-                if !stack.is_empty() {
-                    return Err(CompilerError::InvalidStackForFunction(symbol.into()));
-                }
-                self.builder.build_return(None)?;
-            }
-        }
+                context.compile_ast(new_scope, &mut stack, body)?;
 
-        if let Some(block) = current_block {
-            self.builder.position_at_end(block);
-        }
+                if symbol_name == "main" {
+                    match stack.pop() {
+                        Some(value) => {
+                            context.builder.build_return(Some(&value.1))?;
+                        }
+                        None => {
+                            context.builder.build_return(Some(
+                                &context
+                                    .context
+                                    .i32_type()
+                                    .const_zero()
+                                    .as_basic_value_enum(),
+                            ))?;
+                        }
+                    }
+                    return Ok(Rc::new(Box::new(|_, _| Ok(()))));
+                }
+                match function_type.get_return_type() {
+                    Some(BasicTypeEnum::StructType(return_type)) => {
+                        let return_val = stack.remove_all();
+                        let mut struct_val = return_type.get_undef().as_aggregate_value_enum();
+                        for (index, value) in return_val.into_iter().enumerate() {
+                            struct_val = context.builder.build_insert_value(
+                                struct_val,
+                                value.1,
+                                index as u32,
+                                &format!("ret_{}", index),
+                            )?;
+                        }
+                        context
+                            .builder
+                            .build_return(Some(&struct_val.as_basic_value_enum()))?;
+                    }
+                    Some(return_type) => {
+                        let return_val = stack.remove_all();
+                        if return_val.len() != 1 {
+                            return Err(CompilerError::InvalidStackForFunction(
+                                symbol_name.to_string(),
+                            ));
+                        }
+                        let return_val = return_val[0].clone().1;
+
+                        if return_val.get_type() != return_type {
+                            return Err(CompilerError::InvalidStackForFunction(
+                                symbol_name.to_string(),
+                            ));
+                        }
+                        context.builder.build_return(Some(&return_val))?;
+                    }
+                    None => {
+                        if !stack.is_empty() {
+                            return Err(CompilerError::InvalidStackForFunction(
+                                symbol_name.clone(),
+                            ));
+                        }
+                        context.builder.build_return(None)?;
+                    }
+                }
+
+                if let Some(block) = current_block {
+                    context.builder.position_at_end(block);
+                }
+
+                let symbol_name_cloned = symbol_name.clone();
+                Ok(Rc::new(Box::new(
+                    move |compiler_context: &CompilerContext<'ctx>,
+                          stack: &mut Stack<'ctx>|
+                          -> Result<(), CompilerError> {
+                        call_function(
+                            compiler_context,
+                            stack,
+                            symbol_name_cloned.clone(),
+                            function_name.clone(),
+                            ty.clone(),
+                        )
+                    },
+                )))
+            }),
+        );
 
         Ok(())
     }
@@ -640,6 +686,7 @@ impl<'ctx> CompilerContext<'ctx> {
             },
             UnitType::Var(_) => todo!("Handle variatic types"),
             UnitType::Type(_) => todo!("Handle function types"),
+            UnitType::Custom { .. } => todo!("Handle custom types"),
         }
     }
 
@@ -790,10 +837,33 @@ pub struct Scope<'ctx> {
 }
 
 struct InternalScope<'ctx> {
-    definitions: HashMap<String, DefinitionType<'ctx>>,
+    definitions: HashMap<
+        String,
+        (
+            Option<
+                Box<
+                    dyn (FnMut(
+                            Type,
+                            &CompilerContext<'ctx>,
+                        )
+                            -> Result<DefinitionType<'ctx>, CompilerError>)
+                        + 'ctx,
+                >,
+            >,
+            Vec<(Type, DefinitionType<'ctx>)>,
+        ),
+    >,
     external_definitions: HashMap<String, Type>,
     imported: HashMap<String, Scope<'ctx>>,
     imported_functions: HashMap<String, (String, String)>,
+    type_definitions: HashMap<
+        String,
+        (
+            u64,
+            Vec<(String, VarType)>,
+            Vec<(String, Vec<(String, UnitType)>)>,
+        ),
+    >,
     parent: Option<Scope<'ctx>>,
     id: u64,
 }
@@ -809,6 +879,8 @@ impl<'ctx> Scope<'ctx> {
                 imported: HashMap::new(),
                 imported_functions: HashMap::new(),
                 parent: Some(parent),
+                type_definitions: HashMap::new(),
+
                 id: SCOPE_ID.fetch_add(1, Ordering::Relaxed),
             })),
         }
@@ -825,7 +897,7 @@ impl<'ctx> Scope<'ctx> {
         ty: Type,
         stack: &mut Stack<'ctx>,
     ) -> Result<(), CompilerError> {
-        let inner = self.scope.borrow();
+        let mut inner = self.scope.borrow_mut();
 
         match symbol.len() {
             1 => {
@@ -836,10 +908,21 @@ impl<'ctx> Scope<'ctx> {
                 if let Some(from_definitions) =
                     inner
                         .definitions
-                        .get(&last)
-                        .cloned()
-                        .and_then(|definition| {
-                            return Some(definition(context, stack));
+                        .get_mut(&last)
+                        .and_then(|(creator, definitions)| {
+                            if let Some(definition) =
+                                definitions.iter().find(|def_ty| ty == def_ty.0)
+                            {
+                                return Some(definition.1(context, stack));
+                            }
+                            if let Some(creator) = creator {
+                                let function = creator(ty.clone(), &context).ok()?;
+                                let value = function(context, stack);
+                                definitions.push((ty.clone(), function));
+                                return Some(value);
+                            }
+
+                            None
                         })
                 {
                     return from_definitions;
@@ -889,9 +972,11 @@ impl<'ctx> Scope<'ctx> {
         }
     }
 
-    fn add_definition(&self, name: String, definition: DefinitionType<'ctx>) {
+    fn add_definition(&self, name: String, ty: Type, definition: DefinitionType<'ctx>) {
         let mut inner = self.scope.borrow_mut();
-        inner.definitions.insert(name.clone(), definition);
+        inner
+            .definitions
+            .insert(name.clone(), (None, vec![(ty, definition)]));
     }
 
     fn add_import(&self, alias: String, scope: Scope<'ctx>) {
@@ -906,27 +991,40 @@ impl<'ctx> Scope<'ctx> {
             .insert(alias, (real_name, module_alias));
     }
 
-    fn add_function_definition(&self, symbol: &str, function: FunctionValue<'ctx>, ty: Type) {
-        let symbol_name = symbol.to_string();
-        let function_name = function.get_name().to_string_lossy().to_string();
+    fn add_function_definition(
+        &self,
+        symbol: &str,
+        creator: Box<
+            dyn (FnMut(Type, &CompilerContext<'ctx>) -> Result<DefinitionType<'ctx>, CompilerError>)
+                + 'ctx,
+        >,
+    ) {
         let mut inner = self.scope.borrow_mut();
+        inner
+            .definitions
+            .insert(symbol.to_string(), (Some(creator), vec![]));
 
-        inner.definitions.insert(
-            symbol_name.clone(),
-            Rc::new(Box::new(
-                move |compiler_context: &CompilerContext<'ctx>,
-                      stack: &mut Stack<'ctx>|
-                      -> Result<(), CompilerError> {
-                    call_function(
-                        compiler_context,
-                        stack,
-                        symbol_name.clone(),
-                        function_name.clone(),
-                        ty.clone(),
-                    )
-                },
-            )),
-        );
+        // let symbol_name = symbol.to_string();
+        // let function_name = function.get_name().to_string_lossy().to_string();
+        // let mut inner = self.scope.borrow_mut();
+
+        // inner.definitions.insert(
+        //     symbol_name.clone(),
+        //     (Some(creator))
+        //     Rc::new(Box::new(
+        //         move |compiler_context: &CompilerContext<'ctx>,
+        //               stack: &mut Stack<'ctx>|
+        //               -> Result<(), CompilerError> {
+        //             call_function(
+        //                 compiler_context,
+        //                 stack,
+        //                 symbol_name.clone(),
+        //                 function_name.clone(),
+        //                 ty.clone(),
+        //             )
+        //         },
+        //     )),
+        // );
     }
 
     fn empty() -> Scope<'ctx> {
@@ -936,9 +1034,75 @@ impl<'ctx> Scope<'ctx> {
                 external_definitions: HashMap::new(),
                 imported: HashMap::new(),
                 imported_functions: HashMap::new(),
+                type_definitions: HashMap::new(),
                 parent: None,
                 id: SCOPE_ID.fetch_add(1, Ordering::Relaxed),
             })),
+        }
+    }
+
+    fn insert_type_definition(
+        &self,
+        name: String,
+        id: u64,
+        generics: Vec<(String, VarType)>,
+        variants: Vec<(String, Vec<(String, UnitType)>)>,
+    ) {
+        let mut inner = self.scope.borrow_mut();
+        inner
+            .type_definitions
+            .insert(name, (id, generics, variants));
+    }
+
+    fn get_type(&self, mut name: Vec<String>, generic_types: Vec<UnitType>) -> Option<UnitType> {
+        match name.len() {
+            0 => None,
+            1 => {
+                let inner = self.scope.borrow();
+                let last = name.last().expect("We checked for the name size").clone();
+                if let Some(from_definitions) =
+                    inner
+                        .type_definitions
+                        .get(&last)
+                        .cloned()
+                        .and_then(|type_definition| {
+                            let (id, generics, _) = type_definition;
+                            if generic_types.len() != generics.len() {
+                                return None;
+                            }
+                            Some(UnitType::Custom {
+                                id: Some(id),
+                                name: name.clone(),
+                                generic_types: generic_types.clone(),
+                            })
+                        })
+                {
+                    return Some(from_definitions);
+                }
+                if let Some(imported_functions) = inner.imported_functions.get(&last) {
+                    return self.get_type(
+                        vec![imported_functions.1.clone(), imported_functions.0.clone()],
+                        generic_types,
+                    );
+                }
+                if let Some(parent) = inner.parent.as_ref() {
+                    return parent.get_type(name, generic_types);
+                }
+                None
+            }
+            _ => {
+                let inner = self.scope.borrow();
+                let first = name.remove(0);
+                if let Some(from_imports) = inner.imported.get(&first) {
+                    return from_imports.get_type(name, generic_types);
+                }
+                if let Some(parent) = inner.parent.as_ref() {
+                    name.insert(0, first);
+                    return parent.get_type(name, generic_types);
+                }
+
+                None
+            }
         }
     }
 

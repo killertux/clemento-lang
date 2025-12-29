@@ -1,4 +1,10 @@
-use std::{cell::RefCell, collections::HashMap, fmt::Display, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    fmt::Display,
+    rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use thiserror::Error;
 
@@ -35,6 +41,11 @@ impl AstNodeWithType {
             type_definition,
         }
     }
+}
+
+static CUSTOM_TYPE_ID: AtomicU64 = AtomicU64::new(0);
+pub fn generate_custom_type_id() -> u64 {
+    CUSTOM_TYPE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 pub struct TypeChecker {
@@ -100,11 +111,9 @@ impl TypeChecker {
                 pop_type_stack = [new_types.to_vec(), pop_type_stack.clone()].concat();
                 local_stack = [new_types.to_vec(), local_stack.clone()].concat();
             }
-            let push_types = validate_and_get_push_types(
-                &type_stack,
-                type_definition.clone(),
-                node.position.clone(),
-            )?;
+            let push_types =
+                substitute_types(&type_stack, type_definition.clone(), node.position.clone())?
+                    .push_types;
             type_stack.truncate(type_stack.len() - pop_size);
             type_stack.extend(push_types.clone().into_iter());
             local_stack.truncate(local_stack.len() - pop_size);
@@ -235,9 +244,9 @@ impl TypeChecker {
                         )
                     }),
                 )?;
-                validate_type_against_type_stack(
+                validate_types_and_return_variable_substitution(
                     &type_stack,
-                    &type_definition,
+                    &type_definition.pop_types,
                     node.position.clone(),
                 )?;
                 Ok(AstNodeWithType::new(
@@ -260,9 +269,9 @@ impl TypeChecker {
                         )
                     }),
                 )?;
-                validate_type_against_type_stack(
+                validate_types_and_return_variable_substitution(
                     &type_stack,
-                    &type_definition,
+                    &type_definition.pop_types,
                     node.position.clone(),
                 )?;
                 Ok(AstNodeWithType::new(
@@ -385,16 +394,18 @@ impl TypeChecker {
                         node.position.clone(),
                     )?;
 
-                    let true_push_types = validate_and_get_push_types(
+                    let true_push_types = substitute_types(
                         type_stack_without_last_element,
                         true_body.type_definition.clone(),
                         true_body.position.clone(),
-                    )?;
-                    let false_push_types = validate_and_get_push_types(
+                    )?
+                    .push_types;
+                    let false_push_types = substitute_types(
                         type_stack_without_last_element,
                         false_body.type_definition.clone(),
                         false_body.position.clone(),
-                    )?;
+                    )?
+                    .push_types;
 
                     let true_type =
                         Type::new(true_body.type_definition.pop_types.clone(), true_push_types);
@@ -446,15 +457,58 @@ impl TypeChecker {
                     ))
                 }
             }
+            AstNodeType::CustomType {
+                name,
+                generics,
+                variants,
+            } => {
+                let id = generate_custom_type_id();
+                scope.insert_type_definition(name.clone(), id, generics.clone(), variants.clone());
+                for variant in variants.iter() {
+                    scope.insert_definition(
+                        variant.0.clone(),
+                        Type::new(
+                            variant.1.iter().map(|(_, ty)| ty.clone()).collect(),
+                            vec![UnitType::Custom {
+                                name: vec![name.clone()],
+                                id: Some(id),
+                                generic_types: generics
+                                    .iter()
+                                    .map(|g| UnitType::Var(g.1.clone()))
+                                    .collect(),
+                            }],
+                        ),
+                        false,
+                    );
+                }
+
+                Ok(AstNodeWithType::new(
+                    AstNodeType::CustomType {
+                        name,
+                        generics,
+                        variants,
+                    },
+                    node.position.clone(),
+                    Type::empty(),
+                ))
+            }
         }?;
         Ok(match node.type_definition.clone() {
             Some(ty) => {
-                let push_types = validate_and_get_push_types(
+                let ty = self.replace_custom_type(scope, ty)?;
+                let push_types = substitute_types(
                     &type_stack,
                     inferred_type.type_definition.clone(),
                     node.position.clone(),
-                )?;
-                if push_types != ty.push_types
+                )?
+                .push_types;
+
+                if validate_types_and_return_variable_substitution(
+                    &ty.push_types,
+                    &push_types,
+                    node.position.clone(),
+                )
+                .is_err()
                     || inferred_type.type_definition.pop_types.len() != ty.pop_types.len()
                 {
                     return Err(TypeCheckerError::TypeConflict(
@@ -468,27 +522,66 @@ impl TypeChecker {
             None => inferred_type,
         })
     }
-}
 
-fn validate_and_get_push_types(
-    type_stack: &[UnitType],
-    type_definition: Type,
-    position: Position,
-) -> Result<Vec<UnitType>, TypeCheckerError> {
-    let variable_substitution =
-        validate_type_against_type_stack(type_stack, &type_definition, position)?;
-
-    Ok(type_definition
-        .push_types
-        .into_iter()
-        .map(|ty| match ty {
-            UnitType::Var(var) => variable_substitution
-                .get(&var)
-                .cloned()
-                .unwrap_or(UnitType::Var(var)),
-            other => other,
-        })
-        .collect())
+    fn replace_custom_type(
+        &self,
+        scope: &mut TypeScope,
+        ty: Type,
+    ) -> Result<Type, TypeCheckerError> {
+        let pop_types = ty
+            .pop_types
+            .into_iter()
+            .map(|ty| match ty {
+                UnitType::Custom {
+                    id: Some(id),
+                    name,
+                    generic_types,
+                } => Ok(UnitType::Custom {
+                    id: Some(id),
+                    name,
+                    generic_types,
+                }),
+                UnitType::Custom {
+                    id: None,
+                    name,
+                    generic_types,
+                } => {
+                    let Some(ty) = scope.get_type(name.clone(), generic_types) else {
+                        return Err(TypeCheckerError::TypeNotFound(name));
+                    };
+                    Ok(ty)
+                }
+                other => Ok(other),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let push_types = ty
+            .push_types
+            .into_iter()
+            .map(|ty| match ty {
+                UnitType::Custom {
+                    id: Some(id),
+                    name,
+                    generic_types,
+                } => Ok(UnitType::Custom {
+                    id: Some(id),
+                    name,
+                    generic_types,
+                }),
+                UnitType::Custom {
+                    id: None,
+                    name,
+                    generic_types,
+                } => {
+                    let Some(ty) = scope.get_type(name.clone(), generic_types) else {
+                        return Err(TypeCheckerError::TypeNotFound(name));
+                    };
+                    Ok(ty)
+                }
+                other => Ok(other),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Type::new(pop_types, push_types))
+    }
 }
 
 fn substitute_types(
@@ -496,10 +589,20 @@ fn substitute_types(
     type_definition: Type,
     position: Position,
 ) -> Result<Type, TypeCheckerError> {
-    let variable_substitution =
-        validate_type_against_type_stack(type_stack, &type_definition, position)?;
+    let variable_substitution = validate_types_and_return_variable_substitution(
+        type_stack,
+        &type_definition.pop_types,
+        position,
+    )?;
 
-    Ok(Type::new(
+    Ok(apply_substitution(&variable_substitution, type_definition))
+}
+
+fn apply_substitution(
+    variable_substitution: &HashMap<VarType, UnitType>,
+    type_definition: Type,
+) -> Type {
+    Type::new(
         type_definition
             .pop_types
             .into_iter()
@@ -508,6 +611,24 @@ fn substitute_types(
                     .get(&var)
                     .cloned()
                     .unwrap_or(UnitType::Var(var)),
+                UnitType::Custom {
+                    id,
+                    name,
+                    generic_types,
+                } => UnitType::Custom {
+                    id,
+                    name,
+                    generic_types: generic_types
+                        .into_iter()
+                        .map(|generic_type| match generic_type {
+                            UnitType::Var(var) => variable_substitution
+                                .get(&var)
+                                .cloned()
+                                .unwrap_or(UnitType::Var(var)),
+                            other => other,
+                        })
+                        .collect(),
+                },
                 other => other,
             })
             .collect(),
@@ -519,27 +640,44 @@ fn substitute_types(
                     .get(&var)
                     .cloned()
                     .unwrap_or(UnitType::Var(var)),
+                UnitType::Custom {
+                    id,
+                    name,
+                    generic_types,
+                } => UnitType::Custom {
+                    id,
+                    name,
+                    generic_types: generic_types
+                        .into_iter()
+                        .map(|generic_type| match generic_type {
+                            UnitType::Var(var) => variable_substitution
+                                .get(&var)
+                                .cloned()
+                                .unwrap_or(UnitType::Var(var)),
+                            other => other,
+                        })
+                        .collect(),
+                },
                 other => other,
             })
             .collect(),
-    ))
+    )
 }
 
-pub fn validate_type_against_type_stack(
-    type_stack: &[UnitType],
-    type_definition: &Type,
+pub fn validate_types_and_return_variable_substitution(
+    type_stack_1: &[UnitType],
+    type_stack_2: &[UnitType],
     position: Position,
 ) -> Result<HashMap<VarType, UnitType>, TypeCheckerError> {
     let mut variable_substitution: HashMap<VarType, UnitType> = HashMap::new();
-    let stack_pop_types = &type_stack[type_stack
-        .len()
-        .saturating_sub(type_definition.pop_types.len())..];
+    let stack_pop_types = &type_stack_1[type_stack_1.len().saturating_sub(type_stack_2.len())..];
     for (i, ty) in stack_pop_types.iter().enumerate() {
-        match (ty, &type_definition.pop_types[i]) {
+        match (ty, &type_stack_2[i]) {
             (UnitType::Literal(lit1), UnitType::Literal(lit2)) if lit1 == lit2 => {}
             (UnitType::Literal(lit), UnitType::Var(var)) => {
                 let existent =
                     variable_substitution.insert(var.clone(), UnitType::Literal(lit.clone()));
+
                 if let Some(existent) = existent
                     && existent != UnitType::Literal(lit.clone())
                 {
@@ -549,6 +687,82 @@ pub fn validate_type_against_type_stack(
                         Box::new(UnitType::Literal(lit.clone())),
                     ));
                 }
+            }
+            (
+                UnitType::Custom {
+                    name,
+                    id,
+                    generic_types,
+                },
+                UnitType::Var(var),
+            ) => {
+                let ty = UnitType::Custom {
+                    name: name.clone(),
+                    id: id.clone(),
+                    generic_types: generic_types.clone(),
+                };
+                let existent = variable_substitution.insert(var.clone(), ty.clone());
+                if let Some(existent) = existent
+                    && existent != ty
+                {
+                    return Err(TypeCheckerError::TypeConflict(
+                        position,
+                        Box::new(existent),
+                        Box::new(ty),
+                    ));
+                }
+            }
+            (
+                UnitType::Custom {
+                    name: name1,
+                    id: id1,
+                    generic_types: generic_types1,
+                },
+                UnitType::Custom {
+                    name: name2,
+                    id: id2,
+                    generic_types: generic_types2,
+                },
+            ) => {
+                if id1 != id2 {
+                    return Err(TypeCheckerError::TypeConflict(
+                        position,
+                        Box::new(UnitType::Custom {
+                            name: name1.clone(),
+                            id: id1.clone(),
+                            generic_types: generic_types1.clone(),
+                        }),
+                        Box::new(UnitType::Custom {
+                            name: name2.clone(),
+                            id: id2.clone(),
+                            generic_types: generic_types2.clone(),
+                        }),
+                    ));
+                }
+                if generic_types1.len() != generic_types2.len() {
+                    return Err(TypeCheckerError::TypeConflict(
+                        position,
+                        Box::new(UnitType::Custom {
+                            name: name1.clone(),
+                            id: id1.clone(),
+                            generic_types: generic_types1.clone(),
+                        }),
+                        Box::new(UnitType::Custom {
+                            name: name2.clone(),
+                            id: id2.clone(),
+                            generic_types: generic_types2.clone(),
+                        }),
+                    ));
+                }
+
+                variable_substitution.extend(
+                    validate_types_and_return_variable_substitution(
+                        generic_types1,
+                        generic_types2,
+                        position.clone(),
+                    )?
+                    .into_iter(),
+                );
             }
             (UnitType::Type(ty1), UnitType::Type(ty2)) => {
                 if ty1 != ty2 {
@@ -617,6 +831,8 @@ pub enum TypeCheckerError {
     InvalidIfElseBody(Position, Box<Type>, Box<Type>),
     #[error("Missing import {0}")]
     MissingImport(String),
+    #[error("Type not found {0:?}")]
+    TypeNotFound(Vec<String>),
 }
 
 #[derive(Debug, Clone)]
@@ -630,6 +846,14 @@ struct InnerTypeScope {
     imported: HashMap<String, TypeScope>,
     imported_functions: HashMap<String, (String, String)>,
     definitions: HashMap<String, (Type, bool)>,
+    type_definitions: HashMap<
+        String,
+        (
+            u64,
+            Vec<(String, VarType)>,
+            Vec<(String, Vec<(String, UnitType)>)>,
+        ),
+    >,
 }
 
 impl TypeScope {
@@ -640,6 +864,7 @@ impl TypeScope {
                 imported: HashMap::new(),
                 imported_functions: HashMap::new(),
                 definitions: HashMap::new(),
+                type_definitions: HashMap::new(),
             })),
         }
     }
@@ -725,7 +950,73 @@ impl TypeScope {
                 imported: HashMap::new(),
                 imported_functions: HashMap::new(),
                 definitions: HashMap::new(),
+                type_definitions: HashMap::new(),
             })),
+        }
+    }
+
+    fn insert_type_definition(
+        &self,
+        name: String,
+        id: u64,
+        generics: Vec<(String, VarType)>,
+        variants: Vec<(String, Vec<(String, UnitType)>)>,
+    ) {
+        let mut inner = self.inner.borrow_mut();
+        inner
+            .type_definitions
+            .insert(name, (id, generics, variants));
+    }
+
+    fn get_type(&self, mut name: Vec<String>, generic_types: Vec<UnitType>) -> Option<UnitType> {
+        match name.len() {
+            0 => None,
+            1 => {
+                let inner = self.inner.borrow();
+                let last = name.last().expect("We checked for the name size").clone();
+                if let Some(from_definitions) =
+                    inner
+                        .type_definitions
+                        .get(&last)
+                        .cloned()
+                        .and_then(|type_definition| {
+                            let (id, generics, _) = type_definition;
+                            if generic_types.len() != generics.len() {
+                                return None;
+                            }
+                            Some(UnitType::Custom {
+                                id: Some(id),
+                                name: name.clone(),
+                                generic_types: generic_types.clone(),
+                            })
+                        })
+                {
+                    return Some(from_definitions);
+                }
+                if let Some(imported_functions) = inner.imported_functions.get(&last) {
+                    return self.get_type(
+                        vec![imported_functions.1.clone(), imported_functions.0.clone()],
+                        generic_types,
+                    );
+                }
+                if let Some(parent) = inner.parent.as_ref() {
+                    return parent.get_type(name, generic_types);
+                }
+                None
+            }
+            _ => {
+                let inner = self.inner.borrow();
+                let first = name.remove(0);
+                if let Some(from_imports) = inner.imported.get(&first) {
+                    return from_imports.get_type(name, generic_types);
+                }
+                if let Some(parent) = inner.parent.as_ref() {
+                    name.insert(0, first);
+                    return parent.get_type(name, generic_types);
+                }
+
+                None
+            }
         }
     }
 }
@@ -1017,6 +1308,44 @@ def main {
         assert_eq!(
             result,
             "( -> ) {( -> ) import std::stack(drop) ( -> ) def test ( -> ) {( -> ) def test1 (a -> ) {(a -> ) drop}\n ( -> I32) 10i32 (I32 -> ) test1}\n ( -> ) def main ( -> ) {( -> ) test}\n}"
+        );
+    }
+
+    #[test]
+    fn boolean_type() {
+        let contents = r#"
+            type Bool {
+                True False
+            }
+
+            def test ( -> Bool Bool) {
+                True False
+            }
+        "#;
+        let result = parse_and_type_check(contents, true).unwrap();
+
+        assert_eq!(
+            result,
+            "( -> ) {( -> ) type Bool {True False} ( -> ) def test ( -> Bool Bool) {( -> Bool) True ( -> Bool) False}\n}"
+        );
+    }
+
+    #[test]
+    fn option_type() {
+        let contents = r#"
+            type Option<a> {
+                Some(val a) None
+            }
+
+            def test ( -> Option<I64> Option<I64>) {
+                42 Some None
+            }
+        "#;
+        let result = parse_and_type_check(contents, true).unwrap();
+
+        assert_eq!(
+            result,
+            "( -> ) {( -> ) type Option<a> {Some(val a) None} ( -> ) def test ( -> Option<I64> Option<I64>) {( -> I64) 42i64 (I64 -> Option<I64>) Some ( -> Option<a>) None}\n}"
         );
     }
 }

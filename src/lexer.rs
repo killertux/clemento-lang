@@ -51,11 +51,24 @@ pub enum TokenType {
     LeftBracket,
     RightBracket,
     RightArrow,
+    LeftChevron,
+    RightChevron,
     Number(Number),
     String(String),
     Boolean(bool),
     Symbol(String),
     SymbolWithPath(Vec<String>),
+}
+
+impl TokenType {
+    pub fn as_symbol(&self) -> Option<&str> {
+        match self {
+            TokenType::LeftChevron => Some("<"),
+            TokenType::RightChevron => Some(">"),
+            TokenType::Symbol(s) => Some(s.as_ref()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +152,8 @@ impl<'a> Lexer<'a> {
             Some('}') => Ok(Some(self.create_token_here(TokenType::RightBrace))),
             Some('[') => Ok(Some(self.create_token_here(TokenType::LeftBracket))),
             Some(']') => Ok(Some(self.create_token_here(TokenType::RightBracket))),
+            Some('<') => Ok(Some(self.create_token_here(TokenType::LeftChevron))),
+            Some('>') => Ok(Some(self.create_token_here(TokenType::RightChevron))),
             Some('/') if self.input.peek().is_some_and(|c| *c == '/') => {
                 self.lex_single_line_comment()
             }
@@ -449,7 +464,7 @@ impl NumberTypeHint {
 }
 
 fn is_separator(c: &char) -> bool {
-    c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '{' | '}')
+    c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>')
 }
 
 impl<'a> Iterator for Lexer<'a> {

@@ -73,15 +73,26 @@ impl<'a> Parser<'a> {
                     "defx" => self.parse_external_definition(token.position),
                     "if" => self.parse_if(token.position),
                     "import" => self.parse_import(token.position),
+                    "type" => self.parse_custom_type(token.position),
                     _ => Ok(Some(AstNode {
                         node_type: AstNodeType::Symbol(symbol),
                         position: token.position,
                         type_definition: None,
                     })),
                 },
-                TokenType::LeftParen => self.parse_type_definition(token.position),
+                TokenType::LeftParen => self.parse_type_annotation(token.position),
                 TokenType::SymbolWithPath(path) => Ok(Some(AstNode {
                     node_type: AstNodeType::SymbolWithPath(path),
+                    position: token.position,
+                    type_definition: None,
+                })),
+                TokenType::LeftChevron => Ok(Some(AstNode {
+                    node_type: AstNodeType::Symbol("<".into()),
+                    position: token.position,
+                    type_definition: None,
+                })),
+                TokenType::RightChevron => Ok(Some(AstNode {
+                    node_type: AstNodeType::Symbol(">".into()),
                     position: token.position,
                     type_definition: None,
                 })),
@@ -108,7 +119,7 @@ impl<'a> Parser<'a> {
             .next()
             .transpose()?
             .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
-        let TokenType::Symbol(name) = name_token.token_type else {
+        let Some(name) = name_token.token_type.as_symbol() else {
             return Err(ParserError::UnexpectedToken(
                 name_token.token_type,
                 position,
@@ -119,7 +130,7 @@ impl<'a> Parser<'a> {
             .ok_or(ParserError::UnexpectedEndOfInput(name_token.position))?;
         Ok(Some(AstNode {
             node_type: AstNodeType::Definition {
-                name,
+                name: name.into(),
                 is_private,
                 body: Box::new(body),
             },
@@ -157,7 +168,7 @@ impl<'a> Parser<'a> {
         }))
     }
 
-    fn parse_type_definition(
+    fn parse_type_annotation(
         &mut self,
         position: Position,
     ) -> Result<Option<AstNode>, ParserError> {
@@ -191,7 +202,7 @@ impl<'a> Parser<'a> {
             let ty = self
                 .tokens
                 .next()
-                .map(|token| parse_unit_type(token?, &mut var_type_map))
+                .map(|token| self.parse_unit_type(token?, &mut var_type_map, true))
                 .transpose()?
                 .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
             pop_types.push(ty);
@@ -213,7 +224,7 @@ impl<'a> Parser<'a> {
             let ty = self
                 .tokens
                 .next()
-                .map(|token| parse_unit_type(token?, &mut var_type_map))
+                .map(|token| self.parse_unit_type(token?, &mut var_type_map, true))
                 .transpose()?
                 .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
             push_types.push(ty);
@@ -257,7 +268,7 @@ impl<'a> Parser<'a> {
             .next()
             .transpose()?
             .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
-        let TokenType::Symbol(name) = name_token.token_type else {
+        let Some(name) = name_token.token_type.as_symbol() else {
             return Err(ParserError::UnexpectedToken(
                 name_token.token_type,
                 position,
@@ -276,7 +287,7 @@ impl<'a> Parser<'a> {
         };
         let ty = self.parse_type(&position)?;
         Ok(Some(AstNode {
-            node_type: AstNodeType::ExternalDefinition(name, ty),
+            node_type: AstNodeType::ExternalDefinition(name.to_string(), ty),
             position,
             type_definition: None,
         }))
@@ -393,8 +404,8 @@ impl<'a> Parser<'a> {
                 break;
             }
 
-            match symbol.token_type {
-                TokenType::Symbol(name) => {
+            match symbol.token_type.as_symbol() {
+                Some(name) => {
                     let alias = self
                         .tokens
                         .next_if(|next| {
@@ -418,8 +429,8 @@ impl<'a> Parser<'a> {
                         })
                         .transpose()?;
                     functions.push(NameWithAlias {
-                        name: name.clone(),
-                        alias: alias.unwrap_or(name),
+                        name: name.to_string(),
+                        alias: alias.unwrap_or(name.to_string()),
                     });
                 }
                 _ => {
@@ -432,6 +443,242 @@ impl<'a> Parser<'a> {
         }
         Ok(functions)
     }
+
+    fn parse_custom_type(&mut self, position: Position) -> Result<Option<AstNode>, ParserError> {
+        let symbol = self
+            .tokens
+            .next()
+            .transpose()?
+            .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
+        let TokenType::Symbol(type_name) = symbol.token_type else {
+            return Err(ParserError::UnexpectedToken(
+                symbol.token_type.clone(),
+                symbol.position,
+            ));
+        };
+
+        let mut var_types = Vec::new();
+        if let Some(_) = self.tokens.next_if(|token| {
+            token
+                .as_ref()
+                .map(|token| token.token_type == TokenType::LeftChevron)
+                .unwrap_or(false)
+        }) {
+            loop {
+                let symbol = self
+                    .tokens
+                    .next()
+                    .transpose()?
+                    .ok_or(ParserError::UnexpectedEndOfInput(symbol.position.clone()))?;
+                if matches!(symbol.token_type, TokenType::RightChevron) {
+                    break;
+                }
+                let TokenType::Symbol(var_type_name) = symbol.token_type else {
+                    return Err(ParserError::UnexpectedToken(
+                        symbol.token_type.clone(),
+                        symbol.position,
+                    ));
+                };
+                if var_type_name.to_lowercase() != var_type_name {
+                    return Err(ParserError::InvalidVarType(
+                        var_type_name.clone(),
+                        symbol.position.clone(),
+                    ));
+                }
+                var_types.push((var_type_name.clone(), VarType::new()));
+            }
+        }
+
+        assert_token_type(
+            &self
+                .tokens
+                .next()
+                .transpose()?
+                .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?,
+            TokenType::LeftBrace,
+        )?;
+        let mut variants = Vec::new();
+        loop {
+            let symbol = self
+                .tokens
+                .next()
+                .transpose()?
+                .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
+            if matches!(symbol.token_type, TokenType::RightBrace) {
+                break;
+            }
+            let variant =
+                self.parse_variant(symbol.clone(), &mut var_types.iter().cloned().collect())?;
+            if variants.iter().any(|(name, _)| name == &variant.0) {
+                return Err(ParserError::DuplicateVariant(
+                    variant.0.clone(),
+                    symbol.position.clone(),
+                ));
+            }
+            variants.push(variant);
+        }
+        Ok(Some(AstNode {
+            node_type: AstNodeType::CustomType {
+                name: type_name.clone(),
+                generics: var_types,
+                variants: variants.clone(),
+            },
+            position,
+            type_definition: Some(Type::empty()),
+        }))
+    }
+
+    fn parse_variant(
+        &mut self,
+        symbol: Token,
+        var_types: &mut HashMap<String, VarType>,
+    ) -> Result<(String, Vec<(String, UnitType)>), ParserError> {
+        let TokenType::Symbol(variant_name) = symbol.token_type else {
+            return Err(ParserError::UnexpectedToken(
+                symbol.token_type.clone(),
+                symbol.position,
+            ));
+        };
+        let mut fields: Vec<(String, UnitType)> = Vec::new();
+        if let Some(_) = self.tokens.next_if(|token| {
+            token
+                .as_ref()
+                .map(|token| token.token_type == TokenType::LeftParen)
+                .unwrap_or(false)
+        }) {
+            loop {
+                let symbol = self
+                    .tokens
+                    .next()
+                    .transpose()?
+                    .ok_or(ParserError::UnexpectedEndOfInput(symbol.position.clone()))?;
+                if matches!(symbol.token_type, TokenType::RightParen) {
+                    break;
+                }
+                let TokenType::Symbol(field_name) = symbol.token_type else {
+                    return Err(ParserError::UnexpectedToken(
+                        symbol.token_type.clone(),
+                        symbol.position,
+                    ));
+                };
+                if fields.iter().any(|field| field.0 == field_name) {
+                    return Err(ParserError::DuplicateField(
+                        field_name.clone(),
+                        symbol.position,
+                    ));
+                }
+                let symbol = self
+                    .tokens
+                    .next()
+                    .transpose()?
+                    .ok_or(ParserError::UnexpectedEndOfInput(symbol.position.clone()))?;
+                let ty = self.parse_unit_type(symbol, var_types, false)?;
+                fields.push((field_name, ty));
+            }
+        }
+        Ok((variant_name, fields))
+    }
+
+    fn parse_unit_type(
+        &mut self,
+        token: Token,
+        var_type_map: &mut HashMap<String, VarType>,
+        allow_insert_new_var_type: bool,
+    ) -> Result<UnitType, ParserError> {
+        match &token.token_type {
+            TokenType::Symbol(symbol) => match symbol.as_str() {
+                "String" => Ok(UnitType::Literal(LiteralType::String)),
+                "U8" => Ok(UnitType::Literal(LiteralType::Number(NumberType::U8))),
+                "U16" => Ok(UnitType::Literal(LiteralType::Number(NumberType::U16))),
+                "U32" => Ok(UnitType::Literal(LiteralType::Number(NumberType::U32))),
+                "U64" => Ok(UnitType::Literal(LiteralType::Number(NumberType::U64))),
+                "U128" => Ok(UnitType::Literal(LiteralType::Number(NumberType::U128))),
+                "I8" => Ok(UnitType::Literal(LiteralType::Number(NumberType::I8))),
+                "I16" => Ok(UnitType::Literal(LiteralType::Number(NumberType::I16))),
+                "I32" => Ok(UnitType::Literal(LiteralType::Number(NumberType::I32))),
+                "I64" => Ok(UnitType::Literal(LiteralType::Number(NumberType::I64))),
+                "I128" => Ok(UnitType::Literal(LiteralType::Number(NumberType::I128))),
+                "F64" => Ok(UnitType::Literal(LiteralType::Number(NumberType::F64))),
+                "Boolean" => Ok(UnitType::Literal(LiteralType::Boolean)),
+                string => {
+                    if string == string.to_lowercase() {
+                        if let Some(var) = var_type_map.get(string) {
+                            Ok(UnitType::Var(var.clone()))
+                        } else if allow_insert_new_var_type {
+                            let var = VarType::new();
+                            var_type_map.insert(string.to_string(), var.clone());
+                            Ok(UnitType::Var(var))
+                        } else {
+                            Err(ParserError::InvalidVarType(
+                                string.to_string(),
+                                token.position,
+                            ))
+                        }
+                    } else {
+                        let mut types = Vec::new();
+                        if let Some(_) = self.tokens.next_if(|token| {
+                            token
+                                .as_ref()
+                                .map(|token| token.token_type == TokenType::LeftChevron)
+                                .unwrap_or(false)
+                        }) {
+                            loop {
+                                let symbol = self.tokens.next().transpose()?.ok_or(
+                                    ParserError::UnexpectedEndOfInput(token.position.clone()),
+                                )?;
+                                if matches!(symbol.token_type, TokenType::RightChevron) {
+                                    break;
+                                }
+                                let ty = self.parse_unit_type(
+                                    symbol,
+                                    var_type_map,
+                                    allow_insert_new_var_type,
+                                )?;
+                                types.push(ty);
+                            }
+                        }
+                        Ok(UnitType::Custom {
+                            id: None,
+                            name: vec![string.to_string()],
+                            generic_types: types,
+                        })
+                    }
+                }
+            },
+            TokenType::SymbolWithPath(symbol_with_path) => {
+                let mut types = Vec::new();
+                if let Some(_) = self.tokens.next_if(|token| {
+                    token
+                        .as_ref()
+                        .map(|token| token.token_type == TokenType::LeftChevron)
+                        .unwrap_or(false)
+                }) {
+                    loop {
+                        let symbol = self
+                            .tokens
+                            .next()
+                            .transpose()?
+                            .ok_or(ParserError::UnexpectedEndOfInput(token.position.clone()))?;
+                        if matches!(symbol.token_type, TokenType::RightChevron) {
+                            break;
+                        }
+                        let ty =
+                            self.parse_unit_type(symbol, var_type_map, allow_insert_new_var_type)?;
+                        types.push(ty);
+                    }
+                }
+                Ok(UnitType::Custom {
+                    id: None,
+                    name: symbol_with_path.clone(),
+                    generic_types: types,
+                })
+            }
+            _ => Err(ParserError::UnexpectedToken(
+                token.token_type,
+                token.position,
+            )),
+        }
+    }
 }
 
 fn assert_token_type(token: &Token, expected_type: TokenType) -> Result<(), ParserError> {
@@ -442,49 +689,6 @@ fn assert_token_type(token: &Token, expected_type: TokenType) -> Result<(), Pars
             token.token_type.clone(),
             token.position.clone(),
         ))
-    }
-}
-
-fn parse_unit_type(
-    token: Token,
-    var_type_map: &mut HashMap<String, VarType>,
-) -> Result<UnitType, ParserError> {
-    match &token.token_type {
-        TokenType::Symbol(symbol) => match symbol.as_str() {
-            "String" => Ok(UnitType::Literal(LiteralType::String)),
-            "U8" => Ok(UnitType::Literal(LiteralType::Number(NumberType::U8))),
-            "U16" => Ok(UnitType::Literal(LiteralType::Number(NumberType::U16))),
-            "U32" => Ok(UnitType::Literal(LiteralType::Number(NumberType::U32))),
-            "U64" => Ok(UnitType::Literal(LiteralType::Number(NumberType::U64))),
-            "U128" => Ok(UnitType::Literal(LiteralType::Number(NumberType::U128))),
-            "I8" => Ok(UnitType::Literal(LiteralType::Number(NumberType::I8))),
-            "I16" => Ok(UnitType::Literal(LiteralType::Number(NumberType::I16))),
-            "I32" => Ok(UnitType::Literal(LiteralType::Number(NumberType::I32))),
-            "I64" => Ok(UnitType::Literal(LiteralType::Number(NumberType::I64))),
-            "I128" => Ok(UnitType::Literal(LiteralType::Number(NumberType::I128))),
-            "F64" => Ok(UnitType::Literal(LiteralType::Number(NumberType::F64))),
-            "Boolean" => Ok(UnitType::Literal(LiteralType::Boolean)),
-            string => {
-                if string == string.to_lowercase() {
-                    if let Some(var) = var_type_map.get(string) {
-                        Ok(UnitType::Var(var.clone()))
-                    } else {
-                        let var = VarType::new();
-                        var_type_map.insert(string.to_string(), var.clone());
-                        Ok(UnitType::Var(var))
-                    }
-                } else {
-                    Err(ParserError::UnexpectedToken(
-                        token.token_type,
-                        token.position,
-                    ))
-                }
-            }
-        },
-        _ => Err(ParserError::UnexpectedToken(
-            token.token_type,
-            token.position,
-        )),
     }
 }
 
@@ -504,6 +708,11 @@ pub enum AstNodeType<T> {
     ExternalDefinition(String, Type),
     Block(Vec<T>),
     If(Box<T>, Option<Box<T>>),
+    CustomType {
+        name: String,
+        generics: Vec<(String, VarType)>,
+        variants: Vec<(String, Vec<(String, UnitType)>)>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -582,6 +791,44 @@ where
                     .collect::<Vec<_>>()
                     .join(" ")
             ),
+            AstNodeType::CustomType {
+                name,
+                generics,
+                variants,
+            } => {
+                write!(f, "type {}", name)?;
+                if !generics.is_empty() {
+                    write!(f, "<")?;
+
+                    write!(
+                        f,
+                        "{}",
+                        generics
+                            .iter()
+                            .map(|(name, _)| name.clone())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    )?;
+                    write!(f, ">")?;
+                }
+                write!(f, " {{")?;
+
+                let mut variants_str = Vec::new();
+                for (variant, fields) in variants {
+                    let mut variant_str = variant.clone();
+                    if !fields.is_empty() {
+                        variant_str += "(";
+
+                        for (field, ty) in fields {
+                            variant_str += &format!("{} {}", field, ty);
+                        }
+                        variant_str += ")";
+                    }
+                    variants_str.push(variant_str);
+                }
+                write!(f, "{}", variants_str.join(" "))?;
+                write!(f, "}}")
+            }
         }
     }
 }
@@ -599,11 +846,39 @@ pub struct Type {
     pub push_types: Vec<UnitType>,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, Eq, Clone)]
 pub enum UnitType {
     Literal(LiteralType),
     Var(VarType),
+    Custom {
+        id: Option<u64>,
+        name: Vec<String>,
+        generic_types: Vec<UnitType>,
+    },
     Type(Type),
+}
+
+impl PartialEq for UnitType {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (UnitType::Literal(l1), UnitType::Literal(l2)) => l1 == l2,
+            (UnitType::Var(v1), UnitType::Var(v2)) => v1 == v2,
+            (
+                UnitType::Custom {
+                    id: id1,
+                    generic_types: gt1,
+                    ..
+                },
+                UnitType::Custom {
+                    id: id2,
+                    generic_types: gt2,
+                    ..
+                },
+            ) => id1 == id2 && gt1 == gt2,
+            (UnitType::Type(t1), UnitType::Type(t2)) => t1 == t2,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -683,6 +958,25 @@ impl UnitType {
             UnitType::Literal(LiteralType::String) => "String".into(),
             UnitType::Literal(LiteralType::Boolean) => "Boolean".into(),
             UnitType::Var(var_type) => var_t.get_string(var_type),
+            UnitType::Custom {
+                name,
+                generic_types,
+                ..
+            } => {
+                if generic_types.is_empty() {
+                    name.join("::")
+                } else {
+                    format!(
+                        "{}<{}>",
+                        name.join("::"),
+                        generic_types
+                            .iter()
+                            .map(|ty| ty.to_consistent_string(var_t))
+                            .collect::<Vec<String>>()
+                            .join(" ")
+                    )
+                }
+            }
             UnitType::Type(ty) => {
                 format!("{}", ty)
             }
@@ -836,6 +1130,12 @@ pub enum ParserError {
     UnexpectedToken(TokenType, Position),
     #[error("Unexpected end of input at {0}")]
     UnexpectedEndOfInput(Position),
+    #[error("Invalid generic type {0} at {1}. A generic type must be lowercase")]
+    InvalidVarType(String, Position),
+    #[error("Duplicate field {0} at {1}")]
+    DuplicateField(String, Position),
+    #[error("Duplicate variant {0} at {1}")]
+    DuplicateVariant(String, Position),
 }
 
 impl<'a> Iterator for Parser<'a> {
@@ -1372,6 +1672,133 @@ mod tests {
                 position: Position::new(1, 1, None),
                 type_definition: None,
             }
+        );
+    }
+
+    #[test]
+    fn parse_boolean_type() {
+        let input = "type Boolean { True False }";
+        let mut parser = Parser::new_from_str(input);
+        assert_eq!(
+            parser.next(),
+            Some(Ok(AstNode {
+                node_type: AstNodeType::CustomType {
+                    name: "Boolean".into(),
+                    generics: Vec::new(),
+                    variants: vec![("True".into(), vec![]), ("False".into(), vec![])]
+                },
+                position: Position::new(1, 1, None),
+                type_definition: Some(Type::empty()),
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_option_type() {
+        let input = "type Option<a> { Some(value a) None }";
+        let mut parser = Parser::new_from_str(input);
+        let node = parser.next();
+        let generics = node
+            .as_ref()
+            .map(|token| {
+                token
+                    .as_ref()
+                    .map(|token| {
+                        let AstNodeType::CustomType { generics, .. } = &token.node_type else {
+                            panic!("Unexpected token")
+                        };
+                        generics
+                    })
+                    .unwrap()
+            })
+            .unwrap();
+        let var_type = generics.iter().find(|g| g.0 == "a").unwrap().clone().1;
+        assert_eq!(
+            node,
+            Some(Ok(AstNode {
+                node_type: AstNodeType::CustomType {
+                    name: "Option".into(),
+                    generics: vec![("a".into(), var_type.clone())],
+                    variants: vec![
+                        (
+                            "Some".into(),
+                            vec![("value".into(), UnitType::Var(var_type))]
+                        ),
+                        ("None".into(), vec![])
+                    ]
+                },
+                position: Position::new(1, 1, None),
+                type_definition: Some(Type::empty()),
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_result_type() {
+        let input = "type Result<val err> { Ok(value val) Err(error err) }";
+        let mut parser = Parser::new_from_str(input);
+        let node = parser.next();
+        let generics = node
+            .as_ref()
+            .map(|token| {
+                token
+                    .as_ref()
+                    .map(|token| {
+                        let AstNodeType::CustomType { generics, .. } = &token.node_type else {
+                            panic!("Unexpected token")
+                        };
+                        generics
+                    })
+                    .unwrap()
+            })
+            .unwrap();
+        let val = generics.iter().find(|g| g.0 == "val").unwrap().clone().1;
+        let err = generics.iter().find(|g| g.0 == "err").unwrap().clone().1;
+        assert_eq!(
+            node,
+            Some(Ok(AstNode {
+                node_type: AstNodeType::CustomType {
+                    name: "Result".into(),
+                    generics: vec![
+                        ("val".to_string(), val.clone()),
+                        ("err".to_string(), err.clone())
+                    ],
+                    variants: vec![
+                        ("Ok".into(), vec![("value".into(), UnitType::Var(val))]),
+                        ("Err".into(), vec![("error".into(), UnitType::Var(err))])
+                    ]
+                },
+                position: Position::new(1, 1, None),
+                type_definition: Some(Type::empty()),
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_record() {
+        let input = "type User { User(name String age U32) }";
+        let mut parser = Parser::new_from_str(input);
+
+        assert_eq!(
+            parser.next(),
+            Some(Ok(AstNode {
+                node_type: AstNodeType::CustomType {
+                    name: "User".into(),
+                    generics: Vec::new(),
+                    variants: vec![(
+                        "User".into(),
+                        vec![
+                            ("name".into(), UnitType::Literal(LiteralType::String)),
+                            (
+                                "age".into(),
+                                UnitType::Literal(LiteralType::Number(NumberType::U32))
+                            )
+                        ]
+                    ),]
+                },
+                position: Position::new(1, 1, None),
+                type_definition: Some(Type::empty()),
+            }))
         );
     }
 }

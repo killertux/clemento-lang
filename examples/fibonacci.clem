@@ -12,10 +12,10 @@ def fibonacci (I64 -> I64) {
     }
 }
 
-def inner_print_fibonacci (I64 I64 -> ) {
-    dup2 = if drop2 else { dup fibonacci to_string println 1 +  inner_print_fibonacci }
-}
 def print_fibonacci (I64 -> ) {
+    def inner_print_fibonacci (I64 I64 -> ) {
+        dup2 = if drop2 else { dup fibonacci to_string println 1 +  inner_print_fibonacci }
+    }
     0 inner_print_fibonacci
 }
 
