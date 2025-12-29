@@ -86,16 +86,14 @@ impl<'a> Parser<'a> {
                     position: token.position,
                     type_definition: None,
                 })),
-                TokenType::LeftChevron => Ok(Some(AstNode {
-                    node_type: AstNodeType::Symbol("<".into()),
-                    position: token.position,
-                    type_definition: None,
-                })),
-                TokenType::RightChevron => Ok(Some(AstNode {
-                    node_type: AstNodeType::Symbol(">".into()),
-                    position: token.position,
-                    type_definition: None,
-                })),
+                TokenType::LeftChevron => Err(ParserError::UnexpectedToken(
+                    token.token_type,
+                    token.position,
+                )),
+                TokenType::RightChevron => Err(ParserError::UnexpectedToken(
+                    token.token_type,
+                    token.position,
+                )),
                 TokenType::RightParen
                 | TokenType::RightBrace
                 | TokenType::RightBracket
@@ -119,7 +117,7 @@ impl<'a> Parser<'a> {
             .next()
             .transpose()?
             .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
-        let Some(name) = name_token.token_type.as_symbol() else {
+        let TokenType::Symbol(name) = name_token.token_type else {
             return Err(ParserError::UnexpectedToken(
                 name_token.token_type,
                 position,
@@ -268,7 +266,7 @@ impl<'a> Parser<'a> {
             .next()
             .transpose()?
             .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
-        let Some(name) = name_token.token_type.as_symbol() else {
+        let TokenType::Symbol(name) = name_token.token_type else {
             return Err(ParserError::UnexpectedToken(
                 name_token.token_type,
                 position,
@@ -404,8 +402,8 @@ impl<'a> Parser<'a> {
                 break;
             }
 
-            match symbol.token_type.as_symbol() {
-                Some(name) => {
+            match symbol.token_type {
+                TokenType::Symbol(name) => {
                     let alias = self
                         .tokens
                         .next_if(|next| {

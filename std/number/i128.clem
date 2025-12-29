@@ -11,13 +11,13 @@ defx %i8 (I128 I8 -> I8)
 defx %i16 (I128 I16 -> I16)
 defx %i32 (I128 I32 -> I32)
 defx %i64 (I128 I64 -> I64)
-defx > (I128 I128 -> Boolean)
-defx < (I128 I128 -> Boolean)
+defx gt (I128 I128 -> Boolean)
+defx lt (I128 I128 -> Boolean)
 defx = (I128 I128 -> Boolean)
 defx != (I128 I128 -> Boolean)
 
 def abs (I128 -> I128) {
-    dup 0i128 < if { -1i128 * } else { touch }
+    dup 0i128 lt if { -1i128 * } else { touch }
 }
 
 def to_string (I128 -> String) {
@@ -27,7 +27,7 @@ def to_string (I128 -> String) {
         swap 10i8 %i8 i8::abs i8::to_string
         rot concat swap dup 0i128 = if { drop touch } else { inner_to_string }
     }
-    dup 0i128 < swap
+    dup 0i128 lt swap
     "" swap inner_to_string
     swap if { "-" } else { "" } swap concat
 }

@@ -1358,7 +1358,7 @@ pub fn builtins_functions<'ctx>(
         pop2_push1(
             &all_literal_types,
             Some(UnitType::Literal(LiteralType::Boolean)),
-            ">".into(),
+            "gt".into(),
             Rc::new(Box::new(
                 |compiler_context: &CompilerContext<'ctx>,
                  stack: &mut Stack<'ctx>|
@@ -1669,7 +1669,7 @@ pub fn builtins_functions<'ctx>(
         pop2_push1(
             &all_literal_types,
             Some(UnitType::Literal(LiteralType::Boolean)),
-            "<".into(),
+            "lt".into(),
             Rc::new(Box::new(
                 |compiler_context: &CompilerContext<'ctx>,
                  stack: &mut Stack<'ctx>|

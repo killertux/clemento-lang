@@ -60,17 +60,6 @@ pub enum TokenType {
     SymbolWithPath(Vec<String>),
 }
 
-impl TokenType {
-    pub fn as_symbol(&self) -> Option<&str> {
-        match self {
-            TokenType::LeftChevron => Some("<"),
-            TokenType::RightChevron => Some(">"),
-            TokenType::Symbol(s) => Some(s.as_ref()),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Number {
     Integer(IntegerNumber),

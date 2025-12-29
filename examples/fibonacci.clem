@@ -1,9 +1,9 @@
 import std::stack(dup drop swap dup2 drop2)
-import std::number::i64(< = + - to_string)
+import std::number::i64(lt = + - to_string)
 import std::io(println)
 
 def fibonacci (I64 -> I64) {
-    dup 2 < if {
+    dup 2 lt if {
         drop 1
     } else {
         dup 1 - fibonacci
