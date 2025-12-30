@@ -97,7 +97,7 @@ impl<'ctx> RefCount<'ctx> {
         }
     }
 
-    pub fn create_wit_const_len(
+    pub fn create_with_const_len(
         &self,
         builder: &Builder<'ctx>,
         ty: UnitType,
@@ -111,6 +111,7 @@ impl<'ctx> RefCount<'ctx> {
 
         let ty = match ty {
             UnitType::Literal(LiteralType::String) => 0,
+            UnitType::Custom { .. } => 1,
             _ => return Err(CompilerError::UnsupportedType(ty)),
         };
 
@@ -140,6 +141,7 @@ impl<'ctx> RefCount<'ctx> {
 
         let ty = match ty {
             UnitType::Literal(LiteralType::String) => 0,
+            UnitType::Custom { .. } => 1,
             _ => return Err(CompilerError::UnsupportedType(ty)),
         };
 
@@ -399,9 +401,56 @@ impl<'ctx> CompilerContext<'ctx> {
             } => {
                 let id = generate_custom_type_id();
                 scope.insert_type_definition(name.clone(), id, generics.clone(), variants.clone());
-                // for variant in variants.into_iter() {
-                //     scope.insert_type_constructor(variant.0, name.clone(), variant.1);
-                // }
+                for (index, variant) in variants.into_iter().enumerate() {
+                    let generics = generics.clone();
+                    scope.add_function_definition(
+                        variant.0.clone().as_str(),
+                        Box::new(
+                            move |ty: Type,
+                                  _: &mut CompilerContext<'ctx>,
+                                  definitions: Rc<RefCell<Vec<(Type, DefinitionType<'ctx>)>>>|
+                                  -> Result<(), CompilerError> {
+                                let mut definitions = definitions.borrow_mut();
+                                let variant = variant.clone();
+                                let UnitType::Custom { id:_, name:_, generic_types } = &ty.clone().push_types[0] else {
+                                    return Err(CompilerError::UnexpectedType);
+                                };
+                                let generics_map = generics.iter().map(|generic| generic.1.clone()).zip(generic_types.iter().cloned()).collect::<HashMap<_, _>>();
+                                definitions.push((ty.clone(), Rc::new(Box::new(move |compiler_context: &CompilerContext<'ctx>,
+                                      stack: &mut Stack<'ctx>|
+                                      -> Result<(), CompilerError> {
+                                          let mut fields = vec![compiler_context.context.i8_type().into()];
+                                          variant.1.iter().try_for_each(|field| -> Result<(), CompilerError> {
+                                              Ok(fields.push(compiler_context.unit_type_to_llvm_type(match &field.1 {
+                                                  UnitType::Var(var) => generics_map.get(var).ok_or(CompilerError::FunctionCallError)?,
+                                                  other => other
+                                              })?))
+                                          })?;
+
+                                        let variant_struct = compiler_context.context.struct_type(
+                                            &fields,
+                                            true,
+                                        );
+                                        let values = stack.pop_n(ty.pop_types.len());
+
+                                        let struct_val = compiler_context.builder.build_malloc(variant_struct, "struct_value")?;
+                                        let field_ptr = compiler_context.builder.build_struct_gep(variant_struct, struct_val, 0, "variant")?;
+                                        compiler_context.builder.build_store(field_ptr, compiler_context.context.i8_type().const_int(index as u64, false))?;
+                                        (1..fields.len()).try_for_each(|field_index| -> Result<(), CompilerError> {
+                                            let field_ptr = compiler_context.builder.build_struct_gep(variant_struct, struct_val, field_index as u32, &format!("field_{}", field_index))?;
+                                            compiler_context.builder.build_store(field_ptr, values[field_index - 1].1)?;
+                                            Ok(())
+                                        })?;
+                                        let ref_count = compiler_context.ref_count.create_with_const_len(&compiler_context.builder, ty.push_types[0].clone(), struct_val, 0)?;
+                                        stack.push((ty.push_types[0].clone(), ref_count.into()));
+                                        Ok(())
+                                }))));
+                                Ok(())
+                            },
+                        ),
+                    );
+                }
+
                 Ok(())
             }
         }
@@ -749,7 +798,7 @@ impl<'ctx> CompilerContext<'ctx> {
         stack.push((
             UnitType::Literal(LiteralType::String),
             self.ref_count
-                .create_wit_const_len(
+                .create_with_const_len(
                     &self.builder,
                     UnitType::Literal(LiteralType::String),
                     value.as_pointer_value(),
@@ -1175,20 +1224,20 @@ fn call_function<'ctx>(
     if params.len() != ty.pop_types.len() {
         return Err(CompilerError::StackUnderflow);
     }
+    let params = params
+        .into_iter()
+        .map(|param| param.1.into())
+        .collect::<Vec<_>>();
 
     let function = compiler_context
         .module
         .get_function(&function_name)
         .ok_or(CompilerError::FunctionCallError)?;
 
-    let call = compiler_context.builder.build_call(
-        function,
-        &params
-            .into_iter()
-            .map(|param| param.1.into())
-            .collect::<Vec<_>>(),
-        &format!("{}_call", symbol_name),
-    )?;
+    let call =
+        compiler_context
+            .builder
+            .build_call(function, &params, &format!("{}_call", symbol_name))?;
     if ty.push_types.is_empty() {
         return Ok(());
     }
@@ -1197,6 +1246,14 @@ fn call_function<'ctx>(
     if value.is_right() {
         return Ok(());
     }
+    params.into_iter().try_for_each(|param| {
+        compiler_context.drop_value(
+            param
+                .try_into()
+                .expect("Created from a basic value enum. Should never fail"),
+        )
+    })?;
+
     let return_value = value.left().ok_or(CompilerError::FunctionCallError)?;
     if ty.push_types.len() == 1 {
         stack.push((ty.push_types[0].clone(), return_value));

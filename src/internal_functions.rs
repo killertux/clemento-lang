@@ -170,7 +170,7 @@ pub fn builtins_functions<'ctx>(
                                 compiler_context.context.i8_type().array_type(40),
                                 "output_buffer",
                             )?;
-                            let ref_count = compiler_context.ref_count.create_wit_const_len(
+                            let ref_count = compiler_context.ref_count.create_with_const_len(
                                 &compiler_context.builder,
                                 UnitType::Literal(LiteralType::String),
                                 output_buffer,
