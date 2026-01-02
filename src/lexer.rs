@@ -7,6 +7,8 @@ use std::{
 
 use thiserror::Error;
 
+use crate::parser::{LiteralType, NumberType, UnitType};
+
 pub struct Lexer<'a> {
     input: Peekable<Chars<'a>>,
     line: usize,
@@ -64,6 +66,44 @@ pub enum TokenType {
 pub enum Number {
     Integer(IntegerNumber),
     Float(String),
+}
+
+impl Number {
+    pub fn to_unit_type(&self) -> UnitType {
+        match self {
+            Number::Integer(IntegerNumber::U8(_)) => {
+                UnitType::Literal(LiteralType::Number(NumberType::U8))
+            }
+            Number::Integer(IntegerNumber::U16(_)) => {
+                UnitType::Literal(LiteralType::Number(NumberType::U16))
+            }
+            Number::Integer(IntegerNumber::U32(_)) => {
+                UnitType::Literal(LiteralType::Number(NumberType::U32))
+            }
+            Number::Integer(IntegerNumber::U64(_)) => {
+                UnitType::Literal(LiteralType::Number(NumberType::U64))
+            }
+            Number::Integer(IntegerNumber::U128(_)) => {
+                UnitType::Literal(LiteralType::Number(NumberType::U128))
+            }
+            Number::Integer(IntegerNumber::I8(_)) => {
+                UnitType::Literal(LiteralType::Number(NumberType::I8))
+            }
+            Number::Integer(IntegerNumber::I16(_)) => {
+                UnitType::Literal(LiteralType::Number(NumberType::I16))
+            }
+            Number::Integer(IntegerNumber::I32(_)) => {
+                UnitType::Literal(LiteralType::Number(NumberType::I32))
+            }
+            Number::Integer(IntegerNumber::I64(_)) => {
+                UnitType::Literal(LiteralType::Number(NumberType::I64))
+            }
+            Number::Integer(IntegerNumber::I128(_)) => {
+                UnitType::Literal(LiteralType::Number(NumberType::I128))
+            }
+            Number::Float(_) => UnitType::Literal(LiteralType::Number(NumberType::F64)),
+        }
+    }
 }
 
 impl Display for Number {

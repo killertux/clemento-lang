@@ -74,6 +74,7 @@ impl<'a> Parser<'a> {
                     "if" => self.parse_if(token.position),
                     "import" => self.parse_import(token.position),
                     "type" => self.parse_custom_type(token.position),
+                    "match" => self.parse_match(token.position),
                     _ => Ok(Some(AstNode {
                         node_type: AstNodeType::Symbol(symbol),
                         position: token.position,
@@ -314,7 +315,7 @@ impl<'a> Parser<'a> {
             })
             .unwrap_or(false)
         {
-            functions = self.parse_import_function_list(position.clone())?;
+            functions = self.parse_name_with_alias(position.clone())?;
         }
         let alias = self
             .tokens
@@ -381,7 +382,7 @@ impl<'a> Parser<'a> {
         }))
     }
 
-    fn parse_import_function_list(
+    fn parse_name_with_alias(
         &mut self,
         position: Position,
     ) -> Result<Vec<NameWithAlias>, ParserError> {
@@ -636,7 +637,6 @@ impl<'a> Parser<'a> {
                             }
                         }
                         Ok(UnitType::Custom {
-                            id: None,
                             name: vec![string.to_string()],
                             generic_types: types,
                         })
@@ -666,7 +666,6 @@ impl<'a> Parser<'a> {
                     }
                 }
                 Ok(UnitType::Custom {
-                    id: None,
                     name: symbol_with_path.clone(),
                     generic_types: types,
                 })
@@ -675,6 +674,142 @@ impl<'a> Parser<'a> {
                 token.token_type,
                 token.position,
             )),
+        }
+    }
+
+    fn parse_match(&mut self, position: Position) -> Result<Option<AstNode>, ParserError> {
+        assert_token_type(
+            &self
+                .tokens
+                .next()
+                .transpose()?
+                .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?,
+            TokenType::LeftBrace,
+        )?;
+        let mut cases = Vec::new();
+        let mut last_position = position.clone();
+        while self
+            .tokens
+            .peek()
+            .map(|token| {
+                token
+                    .as_ref()
+                    .map(|token| token.token_type != TokenType::RightBrace)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+        {
+            let pattern = self.parse_pattern(last_position)?;
+            last_position = pattern.1;
+            let token = self
+                .tokens
+                .next()
+                .transpose()?
+                .ok_or(ParserError::UnexpectedEndOfInput(last_position))?;
+            assert_token_type(&token, TokenType::RightArrow)?;
+            last_position = token.position;
+            let Some(body) = self.parse()? else {
+                return Err(ParserError::UnexpectedEndOfInput(last_position));
+            };
+            last_position = body.position.clone();
+            cases.push(Case {
+                pattern: pattern.0,
+                body: Box::new(body),
+            });
+        }
+        assert_token_type(
+            &self
+                .tokens
+                .next()
+                .transpose()?
+                .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?,
+            TokenType::RightBrace,
+        )?;
+        Ok(Some(AstNode {
+            node_type: AstNodeType::Match(cases),
+            position,
+            type_definition: None,
+        }))
+    }
+
+    fn parse_pattern(&mut self, position: Position) -> Result<(Pattern, Position), ParserError> {
+        let token = self
+            .tokens
+            .next()
+            .transpose()?
+            .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
+        match token.token_type {
+            TokenType::Number(number) => Ok((Pattern::Number(number), token.position)),
+            TokenType::Symbol(symbol) if symbol == "*" => {
+                if let Some(as_token) = self.tokens.next_if(|token| {
+                    token
+                        .as_ref()
+                        .map(|token| matches!(&token.token_type, TokenType::Symbol(s) if s == "as"))
+                        .unwrap_or(false)
+                }) {
+                    let as_token = as_token?;
+                    let alias_token = self
+                        .tokens
+                        .next()
+                        .transpose()?
+                        .ok_or(ParserError::UnexpectedEndOfInput(as_token.position))?;
+                    let TokenType::Symbol(alias) = alias_token.token_type else {
+                        return Err(ParserError::UnexpectedToken(
+                            alias_token.token_type.clone(),
+                            alias_token.position.clone(),
+                        ));
+                    };
+                    return Ok((Pattern::Wildcard(Some(alias)), alias_token.position));
+                }
+                Ok((Pattern::Wildcard(None), token.position))
+            }
+            TokenType::Symbol(symbol) => {
+                let mut fields = Vec::new();
+                if self
+                    .tokens
+                    .peek()
+                    .map(|token| {
+                        token
+                            .as_ref()
+                            .map(|token| token.token_type == TokenType::LeftParen)
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false)
+                {
+                    fields = self.parse_name_with_alias(token.position.clone())?;
+                }
+                Ok((
+                    Pattern::Variant {
+                        variant_name: vec![symbol],
+                        fields,
+                    },
+                    token.position,
+                ))
+            }
+            TokenType::SymbolWithPath(symbol) => {
+                let mut fields = Vec::new();
+                if self
+                    .tokens
+                    .peek()
+                    .map(|token| {
+                        token
+                            .as_ref()
+                            .map(|token| token.token_type == TokenType::LeftParen)
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false)
+                {
+                    fields = self.parse_name_with_alias(token.position.clone())?;
+                }
+                Ok((
+                    Pattern::Variant {
+                        variant_name: symbol,
+                        fields,
+                    },
+                    token.position,
+                ))
+            }
+            other => Err(ParserError::UnexpectedToken(other, token.position)),
         }
     }
 }
@@ -711,6 +846,58 @@ pub enum AstNodeType<T> {
         generics: Vec<(String, VarType)>,
         variants: Vec<(String, Vec<(String, UnitType)>)>,
     },
+    Match(Vec<Case<T>>),
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct Case<T> {
+    pub pattern: Pattern,
+    pub body: Box<T>,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum Pattern {
+    Wildcard(Option<String>),
+    Number(Number),
+    Variant {
+        variant_name: Vec<String>,
+        fields: Vec<NameWithAlias>,
+    },
+}
+
+impl Display for Pattern {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Pattern::Wildcard(Some(name)) => write!(f, "* as {}", name),
+            Pattern::Wildcard(None) => write!(f, "*"),
+            Pattern::Number(number) => write!(f, "{}", number),
+            Pattern::Variant {
+                variant_name,
+                fields,
+            } => {
+                if fields.is_empty() {
+                    write!(f, "{}", variant_name.join("::"))
+                } else {
+                    write!(
+                        f,
+                        "{}({})",
+                        variant_name.join("::"),
+                        fields
+                            .iter()
+                            .map(|field| {
+                                if field.name == field.alias {
+                                    field.name.clone()
+                                } else {
+                                    format!("{} as {}", field.name, field.alias)
+                                }
+                            })
+                            .collect::<Vec<String>>()
+                            .join(" ")
+                    )
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -827,6 +1014,51 @@ where
                 write!(f, "{}", variants_str.join(" "))?;
                 write!(f, "}}")
             }
+            AstNodeType::Match(cases) => {
+                write!(f, "match {{")?;
+
+                let mut case_str = Vec::new();
+                for case in cases {
+                    match &case.pattern {
+                        Pattern::Wildcard(name) => match name {
+                            Some(name) => {
+                                case_str.push(format!("* as {} => {}", name, case.body));
+                            }
+                            None => {
+                                case_str.push(format!("* => {}", case.body));
+                            }
+                        },
+                        Pattern::Number(number) => {
+                            case_str.push(format!("{} => {}", number, case.body));
+                        }
+                        Pattern::Variant {
+                            variant_name,
+                            fields,
+                        } => {
+                            let mut variant_str = variant_name.join("::");
+                            if !fields.is_empty() {
+                                variant_str += "(";
+
+                                let mut variants = Vec::new();
+                                for name_with_alias in fields {
+                                    if name_with_alias.name == name_with_alias.alias {
+                                        variants.push(name_with_alias.name.clone());
+                                    } else {
+                                        variants.push(format!(
+                                            "{} as {}",
+                                            name_with_alias.name, name_with_alias.alias
+                                        ));
+                                    }
+                                }
+                                variant_str = format!("({})", variants.join(" "));
+                            }
+                            case_str.push(format!("{} => {}", variant_str, case.body));
+                        }
+                    }
+                }
+                write!(f, "{}", case_str.join(" "))?;
+                write!(f, "}}")
+            }
         }
     }
 }
@@ -844,39 +1076,15 @@ pub struct Type {
     pub push_types: Vec<UnitType>,
 }
 
-#[derive(Debug, Eq, Clone)]
+#[derive(Debug, Eq, PartialEq, Clone)]
 pub enum UnitType {
     Literal(LiteralType),
     Var(VarType),
     Custom {
-        id: Option<u64>,
         name: Vec<String>,
         generic_types: Vec<UnitType>,
     },
     Type(Type),
-}
-
-impl PartialEq for UnitType {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (UnitType::Literal(l1), UnitType::Literal(l2)) => l1 == l2,
-            (UnitType::Var(v1), UnitType::Var(v2)) => v1 == v2,
-            (
-                UnitType::Custom {
-                    id: id1,
-                    generic_types: gt1,
-                    ..
-                },
-                UnitType::Custom {
-                    id: id2,
-                    generic_types: gt2,
-                    ..
-                },
-            ) => id1 == id2 && gt1 == gt2,
-            (UnitType::Type(t1), UnitType::Type(t2)) => t1 == t2,
-            _ => false,
-        }
-    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -1796,6 +2004,185 @@ mod tests {
                 },
                 position: Position::new(1, 1, None),
                 type_definition: Some(Type::empty()),
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_empty_match() {
+        let input = "match {}";
+        let mut parser = Parser::new_from_str(input);
+
+        assert_eq!(
+            parser.next(),
+            Some(Ok(AstNode {
+                node_type: AstNodeType::Match(vec![]),
+                position: Position::new(1, 1, None),
+                type_definition: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_match_with_numbers() {
+        let input = "match { 1 -> 2 3 -> { 4 } }";
+        let mut parser = Parser::new_from_str(input);
+
+        assert_eq!(
+            parser.next(),
+            Some(Ok(AstNode {
+                node_type: AstNodeType::Match(vec![
+                    Case {
+                        pattern: Pattern::Number(Number::Integer(IntegerNumber::I64(1))),
+                        body: Box::new(AstNode {
+                            node_type: AstNodeType::Number(Number::Integer(IntegerNumber::I64(2))),
+                            position: Position::new(1, 14, None),
+                            type_definition: Some(Type::i64()),
+                        })
+                    },
+                    Case {
+                        pattern: Pattern::Number(Number::Integer(IntegerNumber::I64(3))),
+                        body: Box::new(AstNode {
+                            node_type: AstNodeType::Block(vec![AstNode {
+                                node_type: AstNodeType::Number(Number::Integer(
+                                    IntegerNumber::I64(4)
+                                )),
+                                position: Position::new(1, 23, None),
+                                type_definition: Some(Type::i64()),
+                            }]),
+                            position: Position::new(1, 21, None),
+                            type_definition: None,
+                        })
+                    }
+                ]),
+                position: Position::new(1, 1, None),
+                type_definition: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_match_with_wildcard_and_no_alias() {
+        let input = "match { * -> 1 }";
+        let mut parser = Parser::new_from_str(input);
+
+        assert_eq!(
+            parser.next(),
+            Some(Ok(AstNode {
+                node_type: AstNodeType::Match(vec![Case {
+                    pattern: Pattern::Wildcard(None),
+                    body: Box::new(AstNode {
+                        node_type: AstNodeType::Number(Number::Integer(IntegerNumber::I64(1))),
+                        position: Position::new(1, 14, None),
+                        type_definition: Some(Type::i64()),
+                    })
+                },]),
+                position: Position::new(1, 1, None),
+                type_definition: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_match_with_wildcard_with_alias() {
+        let input = "match { * as n -> n }";
+        let mut parser = Parser::new_from_str(input);
+
+        assert_eq!(
+            parser.next(),
+            Some(Ok(AstNode {
+                node_type: AstNodeType::Match(vec![Case {
+                    pattern: Pattern::Wildcard(Some("n".to_string())),
+                    body: Box::new(AstNode {
+                        node_type: AstNodeType::Symbol("n".to_string()),
+                        position: Position::new(1, 19, None),
+                        type_definition: None,
+                    })
+                },]),
+                position: Position::new(1, 1, None),
+                type_definition: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_match_boolean() {
+        let input = "match { True -> 1 False -> 0 }";
+        let mut parser = Parser::new_from_str(input);
+
+        assert_eq!(
+            parser.next(),
+            Some(Ok(AstNode {
+                node_type: AstNodeType::Match(vec![
+                    Case {
+                        pattern: Pattern::Variant {
+                            variant_name: vec!["True".into()],
+                            fields: vec![]
+                        },
+                        body: Box::new(AstNode {
+                            node_type: AstNodeType::Number(Number::Integer(IntegerNumber::I64(1))),
+                            position: Position::new(1, 17, None),
+                            type_definition: Some(Type::i64()),
+                        })
+                    },
+                    Case {
+                        pattern: Pattern::Variant {
+                            variant_name: vec!["False".into()],
+                            fields: vec![]
+                        },
+                        body: Box::new(AstNode {
+                            node_type: AstNodeType::Number(Number::Integer(IntegerNumber::I64(0))),
+                            position: Position::new(1, 28, None),
+                            type_definition: Some(Type::i64()),
+                        })
+                    }
+                ]),
+                position: Position::new(1, 1, None),
+                type_definition: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_match_result() {
+        let input = "match { Ok(val) -> 1 Err(err as error) -> 0 }";
+        let mut parser = Parser::new_from_str(input);
+
+        assert_eq!(
+            parser.next(),
+            Some(Ok(AstNode {
+                node_type: AstNodeType::Match(vec![
+                    Case {
+                        pattern: Pattern::Variant {
+                            variant_name: vec!["Ok".into()],
+                            fields: vec![NameWithAlias {
+                                name: "val".into(),
+                                alias: "val".into()
+                            }]
+                        },
+                        body: Box::new(AstNode {
+                            node_type: AstNodeType::Number(Number::Integer(IntegerNumber::I64(1))),
+                            position: Position::new(1, 20, None),
+                            type_definition: Some(Type::i64()),
+                        })
+                    },
+                    Case {
+                        pattern: Pattern::Variant {
+                            variant_name: vec!["Err".into()],
+                            fields: vec![NameWithAlias {
+                                name: "err".into(),
+                                alias: "error".into()
+                            }]
+                        },
+                        body: Box::new(AstNode {
+                            node_type: AstNodeType::Number(Number::Integer(IntegerNumber::I64(0))),
+                            position: Position::new(1, 43, None),
+                            type_definition: Some(Type::i64()),
+                        })
+                    }
+                ]),
+                position: Position::new(1, 1, None),
+                type_definition: None,
             }))
         );
     }

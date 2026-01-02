@@ -3726,7 +3726,9 @@ fn get_format_str(value: UnitType) -> Result<&'static str, CompilerError> {
         UnitType::Literal(LiteralType::Number(NumberType::F64)) => "%f",
         UnitType::Literal(LiteralType::String) => "%s",
         UnitType::Literal(LiteralType::Boolean) => "%d",
-        _other => return Err(CompilerError::FunctionCallError),
+        _other => {
+            return Err(CompilerError::FunctionCallError);
+        }
     };
     Ok(format_str)
 }

@@ -1,18 +1,12 @@
-use std::{
-    cell::RefCell,
-    collections::HashMap,
-    fmt::Display,
-    rc::Rc,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::{cell::RefCell, collections::HashMap, fmt::Display, rc::Rc};
 
 use thiserror::Error;
 
 use crate::{
     lexer::{IntegerNumber, Number, Position},
     parser::{
-        AstNode, AstNodeType, Import, LiteralType, NumberType, Type, UnitType, VarType,
-        VarTypeToCharContainer,
+        AstNode, AstNodeType, Case, Import, LiteralType, NumberType, Pattern, Type, UnitType,
+        VarType, VarTypeToCharContainer,
     },
 };
 
@@ -43,11 +37,6 @@ impl AstNodeWithType {
     }
 }
 
-static CUSTOM_TYPE_ID: AtomicU64 = AtomicU64::new(0);
-pub fn generate_custom_type_id() -> u64 {
-    CUSTOM_TYPE_ID.fetch_add(1, Ordering::Relaxed)
-}
-
 pub struct TypeChecker {
     imports: HashMap<String, TypeScope>,
 }
@@ -63,6 +52,7 @@ impl TypeChecker {
         &mut self,
         program: AstNode,
         check_for_main: bool,
+        module_path: Vec<String>,
     ) -> Result<(AstNodeWithType, TypeScope), TypeCheckerError> {
         let mut scope = TypeScope::empty();
         let AstNodeType::Block(nodes) = program.node_type else {
@@ -72,7 +62,7 @@ impl TypeChecker {
         };
 
         let (block_type_check_result, nodes_with_types) =
-            self.type_check_block(&mut scope, Vec::new(), nodes, check_for_main)?;
+            self.type_check_block(&mut scope, Vec::new(), nodes, check_for_main, module_path)?;
         if block_type_check_result != Type::empty() {
             return Err(TypeCheckerError::InvalidModuleDefinition(Box::new(
                 block_type_check_result,
@@ -94,12 +84,14 @@ impl TypeChecker {
         mut type_stack: Vec<UnitType>,
         program: Vec<AstNode>,
         check_for_main: bool,
+        module_path: Vec<String>,
     ) -> Result<(Type, Vec<AstNodeWithType>), TypeCheckerError> {
         let mut node_results = Vec::new();
         let mut pop_type_stack: Vec<UnitType> = Vec::new();
         let mut local_stack: Vec<UnitType> = Vec::new();
         for node in program {
-            let node = self.infer_type_definition(scope, type_stack.clone(), node)?;
+            let node =
+                self.infer_type_definition(scope, type_stack.clone(), node, module_path.clone())?;
             let type_definition = &node.type_definition;
             let pop_size = type_definition.pop_types.len();
             if pop_size > type_stack.len() {
@@ -142,8 +134,13 @@ impl TypeChecker {
         &mut self,
         scope: &mut TypeScope,
         type_stack: Vec<UnitType>,
-        node: AstNode,
+        mut node: AstNode,
+        module_path: Vec<String>,
     ) -> Result<AstNodeWithType, TypeCheckerError> {
+        node.type_definition = match node.type_definition {
+            Some(ty) => Some(self.replace_custom_type(scope, ty.clone())?),
+            None => None,
+        };
         let type_stack = match &node.type_definition {
             Some(ty) => ty.pop_types.clone(),
             None => type_stack,
@@ -282,8 +279,13 @@ impl TypeChecker {
             }
             AstNodeType::Block(nodes) => {
                 let mut scope = TypeScope::with_parent(scope.clone());
-                let (ty, nodes) =
-                    self.type_check_block(&mut scope, type_stack.clone(), nodes, false)?;
+                let (ty, nodes) = self.type_check_block(
+                    &mut scope,
+                    type_stack.clone(),
+                    nodes,
+                    false,
+                    module_path,
+                )?;
                 Ok(AstNodeWithType::new(
                     AstNodeType::Block(nodes),
                     node.position.clone(),
@@ -297,11 +299,12 @@ impl TypeChecker {
             } => {
                 let body = if let Some(ty) = body.type_definition.as_ref() {
                     // We use this to allow recursive types. We should probably create a better implementation latter
-                    scope.insert_definition(symbol.clone(), ty.clone(), is_private);
-                    let body = self.infer_type_definition(scope, Vec::new(), *body)?;
+                    let ty = self.replace_custom_type(scope, ty.clone())?;
+                    scope.insert_definition(symbol.clone(), ty, is_private);
+                    let body = self.infer_type_definition(scope, Vec::new(), *body, module_path)?;
                     body
                 } else {
-                    let body = self.infer_type_definition(scope, Vec::new(), *body)?;
+                    let body = self.infer_type_definition(scope, Vec::new(), *body, module_path)?;
                     scope.insert_definition(
                         symbol.clone(),
                         body.type_definition.clone(),
@@ -327,9 +330,11 @@ impl TypeChecker {
                     Type::empty(),
                 ))
             }
-            AstNodeType::Import(_path, import_node) => {
+            AstNodeType::Import(path, import_node) => {
                 let result_node = if let Some(nodes) = import_node.node {
-                    let result = self.type_check(nodes, false)?;
+                    let mut module_path = module_path.clone();
+                    module_path.extend(path.clone());
+                    let result = self.type_check(nodes, false, module_path)?;
                     scope.insert_import(import_node.name.alias.clone(), result.1);
                     for function in &import_node.functions {
                         scope.insert_function_import(
@@ -364,7 +369,7 @@ impl TypeChecker {
                 };
 
                 Ok(AstNodeWithType::new(
-                    AstNodeType::Import(_path, Box::new(result_node)),
+                    AstNodeType::Import(path, Box::new(result_node)),
                     node.position.clone(),
                     Type::empty(),
                 ))
@@ -376,6 +381,7 @@ impl TypeChecker {
                     scope,
                     type_stack_without_last_element.clone(),
                     *true_body,
+                    module_path.clone(),
                 )?;
                 true_body.type_definition = substitute_types(
                     type_stack_without_last_element,
@@ -387,6 +393,7 @@ impl TypeChecker {
                         scope,
                         type_stack_without_last_element.clone(),
                         *false_body,
+                        module_path,
                     )?;
                     false_body.type_definition = substitute_types(
                         type_stack_without_last_element,
@@ -462,16 +469,20 @@ impl TypeChecker {
                 generics,
                 variants,
             } => {
-                let id = generate_custom_type_id();
-                scope.insert_type_definition(name.clone(), id, generics.clone(), variants.clone());
+                let mut name_with_path = module_path.clone();
+                name_with_path.push(name.clone());
+                scope.insert_type_definition(
+                    name_with_path.clone(),
+                    generics.clone(),
+                    variants.clone(),
+                );
                 for variant in variants.iter() {
                     scope.insert_definition(
                         variant.0.clone(),
                         Type::new(
                             variant.1.iter().map(|(_, ty)| ty.clone()).collect(),
                             vec![UnitType::Custom {
-                                name: vec![name.clone()],
-                                id: Some(id),
+                                name: name_with_path.clone(),
                                 generic_types: generics
                                     .iter()
                                     .map(|g| UnitType::Var(g.1.clone()))
@@ -492,10 +503,16 @@ impl TypeChecker {
                     Type::empty(),
                 ))
             }
+            AstNodeType::Match(cases) => self.type_check_match(
+                scope,
+                cases,
+                &type_stack,
+                node.position.clone(),
+                module_path,
+            ),
         }?;
         Ok(match node.type_definition.clone() {
             Some(ty) => {
-                let ty = self.replace_custom_type(scope, ty)?;
                 let push_types = substitute_types(
                     &type_stack,
                     inferred_type.type_definition.clone(),
@@ -533,23 +550,19 @@ impl TypeChecker {
             .into_iter()
             .map(|ty| match ty {
                 UnitType::Custom {
-                    id: Some(id),
-                    name,
-                    generic_types,
-                } => Ok(UnitType::Custom {
-                    id: Some(id),
-                    name,
-                    generic_types,
-                }),
-                UnitType::Custom {
-                    id: None,
                     name,
                     generic_types,
                 } => {
-                    let Some(ty) = scope.get_type(name.clone(), generic_types) else {
+                    let Some(ty) = scope.get_type(name.clone()) else {
                         return Err(TypeCheckerError::TypeNotFound(name));
                     };
-                    Ok(ty)
+                    if ty.generics.len() != generic_types.len() {
+                        return Err(TypeCheckerError::TypeNotFound(name));
+                    }
+                    Ok(UnitType::Custom {
+                        name: ty.name,
+                        generic_types,
+                    })
                 }
                 other => Ok(other),
             })
@@ -559,28 +572,323 @@ impl TypeChecker {
             .into_iter()
             .map(|ty| match ty {
                 UnitType::Custom {
-                    id: Some(id),
-                    name,
-                    generic_types,
-                } => Ok(UnitType::Custom {
-                    id: Some(id),
-                    name,
-                    generic_types,
-                }),
-                UnitType::Custom {
-                    id: None,
                     name,
                     generic_types,
                 } => {
-                    let Some(ty) = scope.get_type(name.clone(), generic_types) else {
+                    let Some(ty) = scope.get_type(name.clone()) else {
                         return Err(TypeCheckerError::TypeNotFound(name));
                     };
-                    Ok(ty)
+                    if ty.generics.len() != generic_types.len() {
+                        return Err(TypeCheckerError::TypeNotFound(name));
+                    }
+                    Ok(UnitType::Custom {
+                        name: ty.name,
+                        generic_types,
+                    })
                 }
                 other => Ok(other),
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Type::new(pop_types, push_types))
+    }
+
+    fn type_check_match(
+        &mut self,
+        scope: &mut TypeScope,
+        cases: Vec<Case<AstNode>>,
+        type_stack: &[UnitType],
+        position: Position,
+        module_path: Vec<String>,
+    ) -> Result<AstNodeWithType, TypeCheckerError> {
+        let match_type = type_stack
+            .last()
+            .cloned()
+            .ok_or(TypeCheckerError::MatchCannotInferType(position.clone()))?;
+        if cases
+            .iter()
+            .position(|case| matches!(case.pattern, Pattern::Wildcard(_)))
+            .map(|pos| pos != cases.len() - 1)
+            .unwrap_or(false)
+        {
+            return Err(TypeCheckerError::MatchWildcardNotAtTheEnd(position));
+        }
+        let type_stack_without_last_element =
+            &type_stack[..type_stack.len().saturating_sub(1)].to_vec();
+        let mut pattern_body_type = None;
+        match &match_type {
+            UnitType::Literal(LiteralType::Number(_)) => {
+                let len = cases.len();
+                let mut result_cases = Vec::with_capacity(len);
+                for (pos, case) in cases.clone().into_iter().enumerate() {
+                    if pos == len - 1 && !matches!(case.pattern, Pattern::Wildcard(_)) {
+                        return Err(TypeCheckerError::MissingWildcardMatch(position));
+                    }
+                    match &case.pattern {
+                        Pattern::Number(number_pattern) => {
+                            if match_type != number_pattern.to_unit_type() {
+                                return Err(TypeCheckerError::InvalidPatternForType(
+                                    match_type.clone(),
+                                    Pattern::Number(number_pattern.clone()),
+                                    position.clone(),
+                                ));
+                            }
+                            let mut body_type = self.infer_type_definition(
+                                scope,
+                                type_stack_without_last_element.clone(),
+                                *case.body,
+                                module_path.clone(),
+                            )?;
+                            body_type.type_definition = substitute_types(
+                                type_stack_without_last_element,
+                                body_type.type_definition,
+                                position.clone(),
+                            )?;
+                            match pattern_body_type {
+                                Some(existing) => {
+                                    if existing != body_type.type_definition {
+                                        return Err(TypeCheckerError::InvalidMatchBody(
+                                            existing,
+                                            body_type.type_definition,
+                                            position.clone(),
+                                        ));
+                                    }
+                                }
+                                None => {}
+                            }
+                            result_cases.push(Case {
+                                pattern: case.pattern,
+                                body: Box::new(body_type.clone()),
+                            });
+                            pattern_body_type = Some(body_type.type_definition);
+                        }
+                        Pattern::Wildcard(name) => {
+                            let mut scope = TypeScope::with_parent(scope.clone());
+                            if let Some(name) = name {
+                                scope.insert_definition(
+                                    name.clone(),
+                                    Type::new(vec![], vec![match_type.clone()]),
+                                    false,
+                                );
+                            }
+                            let mut body_type = self.infer_type_definition(
+                                &mut scope,
+                                type_stack_without_last_element.clone(),
+                                *case.body,
+                                module_path.clone(),
+                            )?;
+                            body_type.type_definition = substitute_types(
+                                type_stack_without_last_element,
+                                body_type.type_definition,
+                                position.clone(),
+                            )?;
+                            match pattern_body_type {
+                                Some(existing) => {
+                                    if existing != body_type.type_definition {
+                                        return Err(TypeCheckerError::InvalidMatchBody(
+                                            existing,
+                                            body_type.type_definition,
+                                            position.clone(),
+                                        ));
+                                    }
+                                }
+                                None => {}
+                            }
+                            result_cases.push(Case {
+                                pattern: case.pattern,
+                                body: Box::new(body_type.clone()),
+                            });
+                            pattern_body_type = Some(body_type.type_definition);
+                        }
+                        other => {
+                            return Err(TypeCheckerError::InvalidPatternForType(
+                                match_type.clone(),
+                                other.clone(),
+                                position.clone(),
+                            ));
+                        }
+                    }
+                }
+                Ok(AstNodeWithType {
+                    node_type: AstNodeType::Match(result_cases),
+                    position: position.clone(),
+                    type_definition: Type::new(
+                        pattern_body_type
+                            .clone()
+                            .map(|mut t| {
+                                t.pop_types.extend_from_slice(&[match_type.clone()]);
+                                t.pop_types
+                            })
+                            .unwrap_or(vec![match_type]),
+                        pattern_body_type.map(|t| t.push_types).unwrap_or(vec![]),
+                    ),
+                })
+            }
+            UnitType::Custom {
+                name,
+                generic_types,
+                ..
+            } => {
+                let Some(custom_type) = scope.get_type(name.clone()) else {
+                    return Err(TypeCheckerError::TypeNotFound(name.clone()));
+                };
+                let generics_map: HashMap<VarType, UnitType> = custom_type
+                    .generics
+                    .iter()
+                    .map(|g| g.1.clone())
+                    .zip(generic_types.iter().cloned())
+                    .collect();
+                let mut variants: HashMap<String, Vec<(String, UnitType)>> =
+                    custom_type.variants.iter().cloned().collect();
+                let mut result_cases = Vec::with_capacity(cases.len());
+                for case in cases.clone().into_iter() {
+                    match &case.pattern {
+                        Pattern::Variant {
+                            variant_name,
+                            fields,
+                        } => {
+                            let Some(variant_constructor) =
+                                scope.get_definition(variant_name.clone(), true)
+                            else {
+                                return Err(TypeCheckerError::TypeNotFound(variant_name.clone()));
+                            };
+                            let UnitType::Custom { .. } = variant_constructor.push_types[0].clone()
+                            else {
+                                return Err(TypeCheckerError::TypeNotFound(variant_name.clone()));
+                            };
+                            if !variants.contains_key(&variant_name[variant_name.len() - 1]) {
+                                return Err(TypeCheckerError::InvalidMatchVariant(
+                                    variant_name.join("::"),
+                                    position.clone(),
+                                ));
+                            }
+                            let fields_with_types = variants
+                                .remove(&variant_name[variant_name.len() - 1])
+                                .expect("We checked that the variant exists")
+                                .into_iter()
+                                .map(|field| {
+                                    (
+                                        field.0,
+                                        match field.1 {
+                                            UnitType::Var(v) => generics_map
+                                                .get(&v)
+                                                .cloned()
+                                                .unwrap_or(UnitType::Var(v)),
+                                            other => other,
+                                        },
+                                    )
+                                })
+                                .collect::<HashMap<_, _>>();
+                            let mut scope = TypeScope::with_parent(scope.clone());
+                            for field in fields {
+                                let field_ty = fields_with_types.get(&field.name).ok_or(
+                                    TypeCheckerError::FieldNotFoundInVariant(
+                                        field.name.clone(),
+                                        variant_name.join("::"),
+                                    ),
+                                )?;
+                                scope.insert_definition(
+                                    field.alias.clone(),
+                                    Type::new(vec![], vec![field_ty.clone()]),
+                                    false,
+                                );
+                            }
+                            let mut body_type = self.infer_type_definition(
+                                &mut scope,
+                                type_stack_without_last_element.clone(),
+                                *case.body,
+                                module_path.clone(),
+                            )?;
+                            body_type.type_definition = substitute_types(
+                                type_stack_without_last_element,
+                                body_type.type_definition,
+                                position.clone(),
+                            )?;
+                            match pattern_body_type {
+                                Some(existing) => {
+                                    if existing != body_type.type_definition {
+                                        return Err(TypeCheckerError::InvalidMatchBody(
+                                            existing,
+                                            body_type.type_definition,
+                                            position.clone(),
+                                        ));
+                                    }
+                                }
+                                None => {}
+                            }
+                            result_cases.push(Case {
+                                pattern: case.pattern,
+                                body: Box::new(body_type.clone()),
+                            });
+                            pattern_body_type = Some(body_type.type_definition);
+                        }
+                        Pattern::Wildcard(alias) => {
+                            let mut scope = TypeScope::with_parent(scope.clone());
+                            if let Some(alias) = alias {
+                                scope.insert_definition(
+                                    alias.clone(),
+                                    Type::new(vec![], vec![match_type.clone()]),
+                                    false,
+                                );
+                            }
+                            let mut body_type = self.infer_type_definition(
+                                &mut scope,
+                                type_stack_without_last_element.clone(),
+                                *case.body,
+                                module_path.clone(),
+                            )?;
+                            body_type.type_definition = substitute_types(
+                                type_stack_without_last_element,
+                                body_type.type_definition,
+                                position.clone(),
+                            )?;
+                            variants.clear();
+                            match pattern_body_type {
+                                Some(existing) => {
+                                    if existing != body_type.type_definition {
+                                        return Err(TypeCheckerError::InvalidMatchBody(
+                                            existing,
+                                            body_type.type_definition,
+                                            position.clone(),
+                                        ));
+                                    }
+                                }
+                                None => {}
+                            }
+                            result_cases.push(Case {
+                                pattern: case.pattern,
+                                body: Box::new(body_type.clone()),
+                            });
+                            pattern_body_type = Some(body_type.type_definition);
+                        }
+                        other => {
+                            return Err(TypeCheckerError::InvalidPatternForType(
+                                match_type.clone(),
+                                other.clone(),
+                                position.clone(),
+                            ));
+                        }
+                    }
+                }
+                if variants.len() != 0 {
+                    return Err(TypeCheckerError::NonExhaustiveMatch(position.clone()));
+                }
+                Ok(AstNodeWithType {
+                    node_type: AstNodeType::Match(result_cases),
+                    position: position.clone(),
+                    type_definition: Type::new(
+                        pattern_body_type
+                            .clone()
+                            .map(|mut t| {
+                                t.pop_types.extend_from_slice(&[match_type.clone()]);
+                                t.pop_types
+                            })
+                            .unwrap_or(vec![match_type]),
+                        pattern_body_type.map(|t| t.push_types).unwrap_or(vec![]),
+                    ),
+                })
+            }
+            other => Err(TypeCheckerError::InvalidMatchType(other.clone(), position)),
+        }
     }
 }
 
@@ -612,11 +920,9 @@ fn apply_substitution(
                     .cloned()
                     .unwrap_or(UnitType::Var(var)),
                 UnitType::Custom {
-                    id,
                     name,
                     generic_types,
                 } => UnitType::Custom {
-                    id,
                     name,
                     generic_types: generic_types
                         .into_iter()
@@ -641,11 +947,9 @@ fn apply_substitution(
                     .cloned()
                     .unwrap_or(UnitType::Var(var)),
                 UnitType::Custom {
-                    id,
                     name,
                     generic_types,
                 } => UnitType::Custom {
-                    id,
                     name,
                     generic_types: generic_types
                         .into_iter()
@@ -691,14 +995,12 @@ pub fn validate_types_and_return_variable_substitution(
             (
                 UnitType::Custom {
                     name,
-                    id,
                     generic_types,
                 },
                 UnitType::Var(var),
             ) => {
                 let ty = UnitType::Custom {
                     name: name.clone(),
-                    id: id.clone(),
                     generic_types: generic_types.clone(),
                 };
                 let existent = variable_substitution.insert(var.clone(), ty.clone());
@@ -715,26 +1017,22 @@ pub fn validate_types_and_return_variable_substitution(
             (
                 UnitType::Custom {
                     name: name1,
-                    id: id1,
                     generic_types: generic_types1,
                 },
                 UnitType::Custom {
                     name: name2,
-                    id: id2,
                     generic_types: generic_types2,
                 },
             ) => {
-                if id1 != id2 {
+                if name1 != name2 {
                     return Err(TypeCheckerError::TypeConflict(
                         position,
                         Box::new(UnitType::Custom {
                             name: name1.clone(),
-                            id: id1.clone(),
                             generic_types: generic_types1.clone(),
                         }),
                         Box::new(UnitType::Custom {
                             name: name2.clone(),
-                            id: id2.clone(),
                             generic_types: generic_types2.clone(),
                         }),
                     ));
@@ -744,12 +1042,10 @@ pub fn validate_types_and_return_variable_substitution(
                         position,
                         Box::new(UnitType::Custom {
                             name: name1.clone(),
-                            id: id1.clone(),
                             generic_types: generic_types1.clone(),
                         }),
                         Box::new(UnitType::Custom {
                             name: name2.clone(),
-                            id: id2.clone(),
                             generic_types: generic_types2.clone(),
                         }),
                     ));
@@ -833,6 +1129,24 @@ pub enum TypeCheckerError {
     MissingImport(String),
     #[error("Type not found {0:?}")]
     TypeNotFound(Vec<String>),
+    #[error("Match cannot infer type at {0}")]
+    MatchCannotInferType(Position),
+    #[error("Invalid match type {0} at {1}")]
+    InvalidMatchType(UnitType, Position),
+    #[error("Match wildcard not at the end at {0}")]
+    MatchWildcardNotAtTheEnd(Position),
+    #[error("Invalid pattern {1} for type {0} at {2}")]
+    InvalidPatternForType(UnitType, Pattern, Position),
+    #[error("Missing wildcard match at {0}")]
+    MissingWildcardMatch(Position),
+    #[error("Invalid match body at {2}. Expected {0} but got {1}")]
+    InvalidMatchBody(Type, Type, Position),
+    #[error("Invalid match variant {0} at {1}")]
+    InvalidMatchVariant(String, Position),
+    #[error("Field {0} not found in variant {1}")]
+    FieldNotFoundInVariant(String, String),
+    #[error("Non-exhaustive match at {0}")]
+    NonExhaustiveMatch(Position),
 }
 
 #[derive(Debug, Clone)]
@@ -846,14 +1160,14 @@ struct InnerTypeScope {
     imported: HashMap<String, TypeScope>,
     imported_functions: HashMap<String, (String, String)>,
     definitions: HashMap<String, (Type, bool)>,
-    type_definitions: HashMap<
-        String,
-        (
-            u64,
-            Vec<(String, VarType)>,
-            Vec<(String, Vec<(String, UnitType)>)>,
-        ),
-    >,
+    type_definitions: HashMap<String, CustomType>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CustomType {
+    pub name: Vec<String>,
+    pub generics: Vec<(String, VarType)>,
+    pub variants: Vec<(String, Vec<(String, UnitType)>)>,
 }
 
 impl TypeScope {
@@ -899,6 +1213,7 @@ impl TypeScope {
                     .last()
                     .expect("We checked for the symbol size")
                     .clone();
+
                 if let Some(from_definitions) =
                     inner
                         .definitions
@@ -957,62 +1272,77 @@ impl TypeScope {
 
     fn insert_type_definition(
         &self,
-        name: String,
-        id: u64,
+        name: Vec<String>,
         generics: Vec<(String, VarType)>,
         variants: Vec<(String, Vec<(String, UnitType)>)>,
     ) {
         let mut inner = self.inner.borrow_mut();
-        inner
-            .type_definitions
-            .insert(name, (id, generics, variants));
+        inner.type_definitions.insert(
+            name.last()
+                .expect("A type should always have a name")
+                .clone(),
+            CustomType {
+                name,
+                generics,
+                variants,
+            },
+        );
     }
 
-    fn get_type(&self, mut name: Vec<String>, generic_types: Vec<UnitType>) -> Option<UnitType> {
+    fn get_type(&self, mut name: Vec<String>) -> Option<CustomType> {
         match name.len() {
             0 => None,
             1 => {
                 let inner = self.inner.borrow();
                 let last = name.last().expect("We checked for the name size").clone();
-                if let Some(from_definitions) =
-                    inner
-                        .type_definitions
-                        .get(&last)
-                        .cloned()
-                        .and_then(|type_definition| {
-                            let (id, generics, _) = type_definition;
-                            if generic_types.len() != generics.len() {
-                                return None;
-                            }
-                            Some(UnitType::Custom {
-                                id: Some(id),
-                                name: name.clone(),
-                                generic_types: generic_types.clone(),
-                            })
-                        })
+                if let Some(from_definitions) = inner
+                    .type_definitions
+                    .get(&last)
+                    .cloned()
+                    .and_then(|type_definition| Some(type_definition))
                 {
                     return Some(from_definitions);
                 }
                 if let Some(imported_functions) = inner.imported_functions.get(&last) {
-                    return self.get_type(
-                        vec![imported_functions.1.clone(), imported_functions.0.clone()],
-                        generic_types,
-                    );
+                    return self.get_type(vec![
+                        imported_functions.1.clone(),
+                        imported_functions.0.clone(),
+                    ]);
                 }
                 if let Some(parent) = inner.parent.as_ref() {
-                    return parent.get_type(name, generic_types);
+                    return parent.get_type(name);
                 }
+                None
+            }
+            2 => {
+                let inner = self.inner.borrow();
+                let first = name.remove(0);
+                if let Some(from_imports) = inner.imported.get(&first) {
+                    return from_imports.get_type(name);
+                }
+                if let Some(parent) = inner.parent.as_ref() {
+                    name.insert(0, first);
+                    return parent.get_type(name);
+                }
+
                 None
             }
             _ => {
                 let inner = self.inner.borrow();
-                let first = name.remove(0);
+                let mut partial_name = name[name.len() - 2..].to_vec();
+                let first = partial_name.remove(0);
                 if let Some(from_imports) = inner.imported.get(&first) {
-                    return from_imports.get_type(name, generic_types);
+                    return from_imports.get_type(partial_name);
+                }
+                if let Some(from_imports) = inner.imported.get(&first) {
+                    return from_imports.get_type(name);
                 }
                 if let Some(parent) = inner.parent.as_ref() {
-                    name.insert(0, first);
-                    return parent.get_type(name, generic_types);
+                    partial_name.insert(0, first);
+                    return match parent.get_type(partial_name) {
+                        Some(ty) => Some(ty),
+                        None => parent.get_type(name),
+                    };
                 }
 
                 None
@@ -1046,6 +1376,7 @@ mod test {
                     type_definition: None,
                 },
                 check_for_main,
+                vec![],
             )
             .map(|ast_node| ast_node.0.to_string())
     }
@@ -1346,6 +1677,349 @@ def main {
         assert_eq!(
             result,
             "( -> ) {( -> ) type Option<a> {Some(val a) None} ( -> ) def test ( -> Option<I64> Option<I64>) {( -> I64) 42i64 (I64 -> Option<I64>) Some ( -> Option<a>) None}\n}"
+        );
+    }
+
+    #[test]
+    fn empty_match() {
+        let contents = r#"
+            def main {
+                10 match {}
+            }
+        "#;
+        let result = parse_and_type_check(contents, true).unwrap();
+
+        assert_eq!(
+            result,
+            "( -> ) {( -> ) def main ( -> ) {( -> I64) 10i64 (I64 -> ) match {}}\n}"
+        );
+    }
+
+    #[test]
+    fn match_number() {
+        let contents = r#"
+            def test {
+                10 match { 0 -> "zero" 1 -> "one" * -> "big number" }
+            }
+        "#;
+        let result = parse_and_type_check(contents, true).unwrap();
+
+        assert_eq!(
+            result,
+            "( -> ) {( -> ) def test ( -> String) {( -> I64) 10i64 (I64 -> String) match {0i64 => ( -> String) \"zero\" 1i64 => ( -> String) \"one\" * => ( -> String) \"big number\"}}\n}"
+        );
+    }
+
+    #[test]
+    fn match_without_stack_value() {
+        let contents = r#"
+            def test {
+                match { }
+            }
+        "#;
+        let result = parse_and_type_check(contents, true)
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(result, "Match cannot infer type at 3:17");
+    }
+
+    #[test]
+    fn match_number_wildcard_not_last() {
+        let contents = r#"
+            def test {
+                10 match { * -> "wildcard" 1 -> "one" }
+            }
+        "#;
+        let result = parse_and_type_check(contents, true)
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(result, "Match wildcard not at the end at 3:20");
+    }
+
+    #[test]
+    fn match_number_with_no_wildcard() {
+        let contents = r#"
+            def test {
+                10 match { 1 -> "one" }
+            }
+        "#;
+        let result = parse_and_type_check(contents, true)
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(result, "Missing wildcard match at 3:20");
+    }
+
+    #[test]
+    fn match_with_different_bodies() {
+        let contents = r#"
+            def test {
+                10 match { 1 -> "one" * -> 10 }
+            }
+        "#;
+        let result = parse_and_type_check(contents, true)
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            result,
+            "Invalid match body at 3:20. Expected ( -> String) but got ( -> I64)"
+        );
+    }
+
+    #[test]
+    fn match_with_correct_bodies_with_var() {
+        let contents = r#"
+            import std::stack
+
+            def test {
+                5 10 match { 1 -> stack::dup * -> stack::dup }
+            }
+        "#;
+        let result = parse_and_type_check(contents, true).unwrap();
+
+        assert_eq!(
+            result,
+            "( -> ) {( -> ) import std::stack ( -> ) def test ( -> I64 I64) {( -> I64) 5i64 ( -> I64) 10i64 (I64 I64 -> I64 I64) match {1i64 => (I64 -> I64 I64) stack::dup * => (I64 -> I64 I64) stack::dup}}\n}"
+        );
+    }
+
+    #[test]
+    fn match_with_boolean() {
+        let contents = r#"
+            type Boolean {
+                True False
+            }
+
+            def test {
+                True match { True -> "True" False -> "False" }
+            }
+        "#;
+        let result = parse_and_type_check(contents, true).unwrap();
+
+        assert_eq!(
+            result,
+            "( -> ) {( -> ) type Boolean {True False} ( -> ) def test ( -> String) {( -> Boolean) True (Boolean -> String) match {True => ( -> String) \"True\" False => ( -> String) \"False\"}}\n}"
+        );
+    }
+
+    #[test]
+    fn match_option() {
+        let contents = r#"
+            type Option<a> {
+                Some(val a) None
+            }
+
+            def test {
+                "Hi" Some match { Some(val) -> val None -> "None" }
+            }
+        "#;
+        let result = parse_and_type_check(contents, true).unwrap();
+
+        assert_eq!(
+            result,
+            "( -> ) {( -> ) type Option<a> {Some(val a) None} ( -> ) def test ( -> String) {( -> String) \"Hi\" (String -> Option<String>) Some (Option<String> -> String) match {(val) => ( -> String) val None => ( -> String) \"None\"}}\n}"
+        );
+    }
+
+    #[test]
+    fn match_option_with_wildcard() {
+        let contents = r#"
+            type Option<a> {
+                Some(val a) None
+            }
+
+            def test {
+                "Hi" Some match { * -> "Option" }
+            }
+        "#;
+        let result = parse_and_type_check(contents, true).unwrap();
+
+        assert_eq!(
+            result,
+            "( -> ) {( -> ) type Option<a> {Some(val a) None} ( -> ) def test ( -> String) {( -> String) \"Hi\" (String -> Option<String>) Some (Option<String> -> String) match {* => ( -> String) \"Option\"}}\n}"
+        );
+    }
+
+    #[test]
+    fn match_option_with_wildcard_2() {
+        let contents = r#"
+            type Option<a> {
+                Some(val a) None
+            }
+
+            def test {
+                "Hi" Some match { Some -> "Some"  * -> "Option" }
+            }
+        "#;
+        let result = parse_and_type_check(contents, true).unwrap();
+
+        assert_eq!(
+            result,
+            "( -> ) {( -> ) type Option<a> {Some(val a) None} ( -> ) def test ( -> String) {( -> String) \"Hi\" (String -> Option<String>) Some (Option<String> -> String) match {Some => ( -> String) \"Some\" * => ( -> String) \"Option\"}}\n}"
+        );
+    }
+
+    #[test]
+    fn match_option_with_wildcard_with_alias() {
+        let contents = r#"
+            type Option<a> {
+                Some(val a) None
+            }
+
+            def test {
+                "Hi" Some match { Some -> { "Some" Some }  * as rest -> rest }
+            }
+        "#;
+        let result = parse_and_type_check(contents, true).unwrap();
+
+        assert_eq!(
+            result,
+            "( -> ) {( -> ) type Option<a> {Some(val a) None} ( -> ) def test ( -> Option<String>) {( -> String) \"Hi\" (String -> Option<String>) Some (Option<String> -> Option<String>) match {Some => ( -> Option<String>) {( -> String) \"Some\" (String -> Option<String>) Some} * as rest => ( -> Option<String>) rest}}\n}"
+        );
+    }
+
+    #[test]
+    fn non_exhaustive_match() {
+        let contents = r#"
+            type Option<a> {
+                Some(val a) None
+            }
+
+            def test {
+                "Hi" Some match { Some -> "Some" }
+            }
+        "#;
+        let result = parse_and_type_check(contents, true)
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(result, "Non-exhaustive match at 7:27");
+    }
+
+    #[test]
+    fn match_result() {
+        let contents = r#"
+            type Result<a b> {
+                Ok(val a) Err(val b)
+            }
+
+            def test {
+                "Hi" (String -> Result<String String>) Ok match { Ok(val as value) -> value Err(val as error) -> error }
+            }
+        "#;
+        let result = parse_and_type_check(contents, true).unwrap();
+
+        assert_eq!(
+            result,
+            "( -> ) {( -> ) type Result<a b> {Ok(val a) Err(val a)} ( -> ) def test ( -> String) {( -> String) \"Hi\" (String -> Result<String String>) Ok (Result<String String> -> String) match {(val as value) => ( -> String) value (val as error) => ( -> String) error}}\n}"
+        );
+    }
+
+    #[test]
+    fn match_result_without_value() {
+        let contents = r#"
+            type Result<a b> {
+                Ok(val a) Err(val b)
+            }
+
+            def test {
+                "Hi" (String -> Result<String String>) Ok match { Ok -> "Ok" Err -> "Err" }
+            }
+        "#;
+        let result = parse_and_type_check(contents, true).unwrap();
+
+        assert_eq!(
+            result,
+            "( -> ) {( -> ) type Result<a b> {Ok(val a) Err(val a)} ( -> ) def test ( -> String) {( -> String) \"Hi\" (String -> Result<String String>) Ok (Result<String String> -> String) match {Ok => ( -> String) \"Ok\" Err => ( -> String) \"Err\"}}\n}"
+        );
+    }
+
+    #[test]
+    fn different_types_with_same_name() {
+        let contents = r#"
+            import std::option
+            import std::stack(drop)
+
+            type Option<a> {
+                Some(val a) None
+            }
+
+            def test1 (option::Option<I64> -> ) {
+                drop
+            }
+
+            def test2 (Option<I64> -> ) {
+                drop
+            }
+
+            def test {
+                42 option::Some test1 42 Some test2
+            }
+        "#;
+        let result = parse_and_type_check(contents, true).unwrap();
+
+        assert_eq!(
+            result,
+            "( -> ) {( -> ) import std::option ( -> ) import std::stack(drop) ( -> ) type Option<a> {Some(val a) None} ( -> ) def test1 (std::option::Option<I64> -> ) {(std::option::Option<I64> -> ) drop}\n ( -> ) def test2 (Option<I64> -> ) {(Option<I64> -> ) drop}\n ( -> ) def test ( -> ) {( -> I64) 42i64 (I64 -> std::option::Option<I64>) option::Some (std::option::Option<I64> -> ) test1 ( -> I64) 42i64 (I64 -> Option<I64>) Some (Option<I64> -> ) test2}\n}"
+        );
+    }
+
+    #[test]
+    fn different_types_with_same_name_should_fail_1() {
+        let contents = r#"
+            import std::option
+            import std::stack(drop)
+
+            type Option<a> {
+                Some(val a) None
+            }
+
+            def test_option (option::Option<I64> -> ) {
+                drop
+            }
+
+            def test {
+                42 Some test_option
+            }
+        "#;
+        let result = parse_and_type_check(contents, true)
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            result,
+            "Type conflict at 14:25: expected Option<I64>, got std::option::Option<I64>"
+        );
+    }
+
+    #[test]
+    fn different_types_with_same_name_should_fail_2() {
+        let contents = r#"
+            import std::option
+            import std::stack(drop)
+
+            type Option<a> {
+                Some(val a) None
+            }
+
+            def test_option (Option<I64> -> ) {
+                drop
+            }
+
+            def test {
+                42 option::Some test_option
+            }
+        "#;
+        let result = parse_and_type_check(contents, true)
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            result,
+            "Type conflict at 14:33: expected std::option::Option<I64>, got Option<I64>"
         );
     }
 }

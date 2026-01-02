@@ -20,6 +20,7 @@ pub fn print_type(file: impl AsRef<Path>) -> Result<(), TypePrinterError> {
             type_definition: None,
         },
         true,
+        vec![],
     )?;
     println!("{}", program.0);
     Ok(())
