@@ -1,6 +1,7 @@
 import std::number::u8
 import std::stack(swap rot swap dup drop touch)
 import std::string(concat)
+import std::boolean(Boolean)
 
 defx + (U128 U128 -> U128)
 defx - (U128 U128 -> U128)
@@ -19,7 +20,7 @@ defx != (U128 U128 -> Boolean)
 
 def to_string (U128 -> String) {
     defp inner_to_string (String U128 -> String) {
-        dup 10u128 / swap 10u8 %u8 u8::to_string rot concat swap dup 0u128 = if { drop touch } else { inner_to_string }
+        dup 10u128 / swap 10u8 %u8 u8::to_string rot concat swap dup 0u128 = match { boolean::True -> { drop touch } boolean::False -> { inner_to_string } }
     }
     "" swap inner_to_string
 }

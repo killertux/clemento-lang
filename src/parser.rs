@@ -61,17 +61,11 @@ impl<'a> Parser<'a> {
                     position: token.position,
                     type_definition: Some(Type::string()),
                 })),
-                TokenType::Boolean(boolean) => Ok(Some(AstNode {
-                    node_type: AstNodeType::Boolean(boolean),
-                    position: token.position,
-                    type_definition: Some(Type::boolean()),
-                })),
                 TokenType::LeftBrace => self.parse_block(token.position),
                 TokenType::Symbol(symbol) => match symbol.as_str() {
                     "def" => self.parse_definition(token.position, false),
                     "defp" => self.parse_definition(token.position, true),
                     "defx" => self.parse_external_definition(token.position),
-                    "if" => self.parse_if(token.position),
                     "import" => self.parse_import(token.position),
                     "type" => self.parse_custom_type(token.position),
                     "match" => self.parse_match(token.position),
@@ -233,29 +227,6 @@ impl<'a> Parser<'a> {
         };
         let ty = Type::new(pop_types, push_types);
         Ok(ty)
-    }
-
-    fn parse_if(&mut self, position: Position) -> Result<Option<AstNode>, ParserError> {
-        let true_body = self
-            .parse()?
-            .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
-        let mut false_body = None;
-        if self.tokens.peek().is_some_and(|t| {
-            t.as_ref()
-                .is_ok_and(|t| t.token_type == TokenType::Symbol("else".into()))
-        }) {
-            self.parse()?;
-            false_body = Some(Box::new(
-                self.parse()?
-                    .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?,
-            ));
-        }
-
-        Ok(Some(AstNode {
-            node_type: AstNodeType::If(Box::new(true_body), false_body),
-            position,
-            type_definition: None,
-        }))
     }
 
     fn parse_external_definition(
@@ -598,7 +569,6 @@ impl<'a> Parser<'a> {
                 "I64" => Ok(UnitType::Literal(LiteralType::Number(NumberType::I64))),
                 "I128" => Ok(UnitType::Literal(LiteralType::Number(NumberType::I128))),
                 "F64" => Ok(UnitType::Literal(LiteralType::Number(NumberType::F64))),
-                "Boolean" => Ok(UnitType::Literal(LiteralType::Boolean)),
                 string => {
                     if string == string.to_lowercase() {
                         if let Some(var) = var_type_map.get(string) {
@@ -829,7 +799,6 @@ fn assert_token_type(token: &Token, expected_type: TokenType) -> Result<(), Pars
 pub enum AstNodeType<T> {
     Number(Number),
     String(String),
-    Boolean(bool),
     Symbol(String),
     SymbolWithPath(Vec<String>),
     Import(Vec<String>, Box<Import<T>>),
@@ -840,7 +809,6 @@ pub enum AstNodeType<T> {
     },
     ExternalDefinition(String, Type),
     Block(Vec<T>),
-    If(Box<T>, Option<Box<T>>),
     CustomType {
         name: String,
         generics: Vec<(String, VarType)>,
@@ -921,7 +889,6 @@ where
         match self {
             AstNodeType::Number(number) => write!(f, "{}", number),
             AstNodeType::String(string) => write!(f, "\"{}\"", string),
-            AstNodeType::Boolean(boolean) => write!(f, "{}", boolean),
             AstNodeType::Symbol(symbol) => write!(f, "{}", symbol),
             AstNodeType::SymbolWithPath(symbol) => write!(f, "{}", symbol.join("::")),
             AstNodeType::Definition {
@@ -960,12 +927,6 @@ where
                     write!(f, " as {}", import.name.alias)?;
                 }
                 Ok(())
-            }
-            AstNodeType::If(true_body, Some(false_body)) => {
-                write!(f, "if {} else {}", true_body, false_body)
-            }
-            AstNodeType::If(true_body, None) => {
-                write!(f, "if {}", true_body)
             }
             AstNodeType::Block(nodes) => write!(
                 f,
@@ -1091,7 +1052,6 @@ pub enum UnitType {
 pub enum LiteralType {
     Number(NumberType),
     String,
-    Boolean,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -1162,7 +1122,6 @@ impl UnitType {
             UnitType::Literal(LiteralType::Number(NumberType::I128)) => "I128".into(),
             UnitType::Literal(LiteralType::Number(NumberType::F64)) => "F64".into(),
             UnitType::Literal(LiteralType::String) => "String".into(),
-            UnitType::Literal(LiteralType::Boolean) => "Boolean".into(),
             UnitType::Var(var_type) => var_t.get_string(var_type),
             UnitType::Custom {
                 name,
@@ -1288,13 +1247,6 @@ impl Type {
         Self {
             pop_types: vec![],
             push_types: vec![UnitType::Literal(LiteralType::String)],
-        }
-    }
-
-    pub fn boolean() -> Self {
-        Self {
-            pop_types: vec![],
-            push_types: vec![UnitType::Literal(LiteralType::Boolean)],
         }
     }
 
@@ -1476,258 +1428,6 @@ mod tests {
                     position: Position::new(1, 3, None),
                     type_definition: None,
                 }]),
-                position: Position::new(1, 1, None),
-                type_definition: None,
-            }))
-        );
-    }
-
-    #[test]
-    fn test_parse_if_simple() {
-        let input = "if true";
-        let mut parser = Parser::new_from_str(input);
-        assert_eq!(
-            parser.next(),
-            Some(Ok(AstNode {
-                node_type: AstNodeType::If(
-                    Box::new(AstNode {
-                        node_type: AstNodeType::Boolean(true),
-                        position: Position::new(1, 4, None),
-                        type_definition: Some(Type::boolean()),
-                    }),
-                    None
-                ),
-                position: Position::new(1, 1, None),
-                type_definition: None,
-            }))
-        );
-    }
-
-    #[test]
-    fn test_parse_if_with_number() {
-        let input = "if 42";
-        let mut parser = Parser::new_from_str(input);
-        assert_eq!(
-            parser.next(),
-            Some(Ok(AstNode {
-                node_type: AstNodeType::If(
-                    Box::new(AstNode {
-                        node_type: AstNodeType::Number(Number::Integer(IntegerNumber::I64(42))),
-                        position: Position::new(1, 4, None),
-                        type_definition: Some(Type::i64()),
-                    }),
-                    None
-                ),
-                position: Position::new(1, 1, None),
-                type_definition: None,
-            }))
-        );
-    }
-
-    #[test]
-    fn test_parse_if_with_block() {
-        let input = "if { hello world }";
-        let mut parser = Parser::new_from_str(input);
-        assert_eq!(
-            parser.next(),
-            Some(Ok(AstNode {
-                node_type: AstNodeType::If(
-                    Box::new(AstNode {
-                        node_type: AstNodeType::Block(vec![
-                            AstNode {
-                                node_type: AstNodeType::Symbol(String::from("hello")),
-                                position: Position::new(1, 6, None),
-                                type_definition: None,
-                            },
-                            AstNode {
-                                node_type: AstNodeType::Symbol(String::from("world")),
-                                position: Position::new(1, 12, None),
-                                type_definition: None,
-                            }
-                        ]),
-                        position: Position::new(1, 4, None),
-                        type_definition: None,
-                    }),
-                    None
-                ),
-                position: Position::new(1, 1, None),
-                type_definition: None,
-            }))
-        );
-    }
-
-    #[test]
-    fn test_parse_if_else_simple() {
-        let input = "if true else false";
-        let mut parser = Parser::new_from_str(input);
-        assert_eq!(
-            parser.next(),
-            Some(Ok(AstNode {
-                node_type: AstNodeType::If(
-                    Box::new(AstNode {
-                        node_type: AstNodeType::Boolean(true),
-                        position: Position::new(1, 4, None),
-                        type_definition: Some(Type::boolean()),
-                    }),
-                    Some(Box::new(AstNode {
-                        node_type: AstNodeType::Boolean(false),
-                        position: Position::new(1, 14, None),
-                        type_definition: Some(Type::boolean()),
-                    }))
-                ),
-                position: Position::new(1, 1, None),
-                type_definition: None,
-            }))
-        );
-    }
-
-    #[test]
-    fn test_parse_if_else_with_numbers() {
-        let input = "if 1 else 0";
-        let mut parser = Parser::new_from_str(input);
-        assert_eq!(
-            parser.next(),
-            Some(Ok(AstNode {
-                node_type: AstNodeType::If(
-                    Box::new(AstNode {
-                        node_type: AstNodeType::Number(Number::Integer(IntegerNumber::I64(1))),
-                        position: Position::new(1, 4, None),
-                        type_definition: Some(Type::i64()),
-                    }),
-                    Some(Box::new(AstNode {
-                        node_type: AstNodeType::Number(Number::Integer(IntegerNumber::I64(0))),
-                        position: Position::new(1, 11, None),
-                        type_definition: Some(Type::i64()),
-                    }))
-                ),
-                position: Position::new(1, 1, None),
-                type_definition: None,
-            }))
-        );
-    }
-
-    #[test]
-    fn test_parse_if_else_with_blocks() {
-        let input = "if { print \"true\" } else { print \"false\" }";
-        let mut parser = Parser::new_from_str(input);
-        assert_eq!(
-            parser.next(),
-            Some(Ok(AstNode {
-                node_type: AstNodeType::If(
-                    Box::new(AstNode {
-                        node_type: AstNodeType::Block(vec![
-                            AstNode {
-                                node_type: AstNodeType::Symbol(String::from("print")),
-                                position: Position::new(1, 6, None),
-                                type_definition: None,
-                            },
-                            AstNode {
-                                node_type: AstNodeType::String(String::from("true")),
-                                position: Position::new(1, 12, None),
-                                type_definition: Some(Type::string()),
-                            }
-                        ]),
-                        position: Position::new(1, 4, None),
-                        type_definition: None,
-                    }),
-                    Some(Box::new(AstNode {
-                        node_type: AstNodeType::Block(vec![
-                            AstNode {
-                                node_type: AstNodeType::Symbol(String::from("print")),
-                                position: Position::new(1, 28, None),
-                                type_definition: None,
-                            },
-                            AstNode {
-                                node_type: AstNodeType::String(String::from("false")),
-                                position: Position::new(1, 34, None),
-                                type_definition: Some(Type::string()),
-                            }
-                        ]),
-                        position: Position::new(1, 26, None),
-                        type_definition: None,
-                    }))
-                ),
-                position: Position::new(1, 1, None),
-                type_definition: None,
-            }))
-        );
-    }
-
-    #[test]
-    fn test_parse_nested_if() {
-        let input = "if if true else false else false";
-        let mut parser = Parser::new_from_str(input);
-        assert_eq!(
-            parser.next(),
-            Some(Ok(AstNode {
-                node_type: AstNodeType::If(
-                    Box::new(AstNode {
-                        node_type: AstNodeType::If(
-                            Box::new(AstNode {
-                                node_type: AstNodeType::Boolean(true),
-                                position: Position::new(1, 7, None),
-                                type_definition: Some(Type::boolean()),
-                            }),
-                            Some(Box::new(AstNode {
-                                node_type: AstNodeType::Boolean(false),
-                                position: Position::new(1, 17, None),
-                                type_definition: Some(Type::boolean()),
-                            }))
-                        ),
-                        position: Position::new(1, 4, None),
-                        type_definition: None,
-                    }),
-                    Some(Box::new(AstNode {
-                        node_type: AstNodeType::Boolean(false),
-                        position: Position::new(1, 28, None),
-                        type_definition: Some(Type::boolean()),
-                    }))
-                ),
-                position: Position::new(1, 1, None),
-                type_definition: None,
-            }))
-        );
-    }
-
-    #[test]
-    fn test_parse_if_incomplete() {
-        let input = "if";
-        let mut parser = Parser::new_from_str(input);
-        assert_eq!(
-            parser.next(),
-            Some(Err(ParserError::UnexpectedEndOfInput(Position::new(
-                1, 1, None
-            ))))
-        );
-    }
-
-    #[test]
-    fn test_parse_if_else_incomplete() {
-        let input = "if true else";
-        let mut parser = Parser::new_from_str(input);
-        assert_eq!(
-            parser.next(),
-            Some(Err(ParserError::UnexpectedEndOfInput(Position::new(
-                1, 1, None
-            ))))
-        );
-    }
-
-    #[test]
-    fn test_parse_if_with_string_body() {
-        let input = "if \"hello\"";
-        let mut parser = Parser::new_from_str(input);
-        assert_eq!(
-            parser.next(),
-            Some(Ok(AstNode {
-                node_type: AstNodeType::If(
-                    Box::new(AstNode {
-                        node_type: AstNodeType::String(String::from("hello")),
-                        position: Position::new(1, 4, None),
-                        type_definition: Some(Type::string()),
-                    }),
-                    None
-                ),
                 position: Position::new(1, 1, None),
                 type_definition: None,
             }))

@@ -1,3 +1,4 @@
+import std::boolean(Boolean)
 import std::stack(dup touch)
 
 defx + (I8 I8 -> I8)
@@ -12,5 +13,5 @@ defx = (I8 I8 -> Boolean)
 defx != (I8 I8 -> Boolean)
 
 def abs (I8 -> I8) {
-    dup 0i8 lt if { -1i8 * } else { touch }
+    dup 0i8 lt match { boolean::True -> { -1i8 * } boolean::False -> touch }
 }

@@ -1,9 +1,10 @@
 import std::io(println)
 import std::stack(dup drop)
 import std::number::i64(= - * to_string)
+import std::boolean(True False)
 
 def factorial (I64 -> I64) {
-    dup 0 = if { drop 1 } else { dup 1 - factorial * }
+    dup 0 = match { True -> { drop 1 } False -> { dup 1 - factorial * } }
 }
 
 def main {

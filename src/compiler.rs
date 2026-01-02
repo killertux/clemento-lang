@@ -31,7 +31,8 @@ pub struct CompilerContext<'ctx> {
     pub context: &'ctx Context,
     pub module: Module<'ctx>,
     pub builder: Builder<'ctx>,
-    pub internal_functions: Vec<InternalFunction<'ctx>>,
+    pub internal_functions:
+        Box<dyn Fn(&Module<'ctx>, &CompilerContext<'ctx>) -> Vec<InternalFunction<'ctx>> + 'ctx>,
     pub imports: HashMap<String, Scope<'ctx>>,
     pub ref_count: RefCount<'ctx>,
     pub type_definitions: HashMap<Vec<String>, CustomType>,
@@ -166,7 +167,11 @@ impl<'ctx> CompilerContext<'ctx> {
     pub fn new(context: &'ctx Context) -> Self {
         let module = context.create_module("std");
         let builder = context.create_builder();
-        let internal_functions = builtins_functions(context, &module);
+        let internal_functions = Box::new(
+            move |module: &Module<'ctx>, context: &CompilerContext<'ctx>| {
+                builtins_functions(context, &module)
+            },
+        );
 
         Self {
             context,
@@ -318,7 +323,6 @@ impl<'ctx> CompilerContext<'ctx> {
         match program.node_type {
             AstNodeType::Number(number) => self.compile_number(stack, number),
             AstNodeType::String(string) => self.compile_string(stack, string),
-            AstNodeType::Boolean(boolean) => self.compile_boolean(stack, boolean),
             AstNodeType::Symbol(symbol) => {
                 scope.call_symbol(vec![symbol], self, program.type_definition, stack)?;
                 Ok(())
@@ -339,7 +343,8 @@ impl<'ctx> CompilerContext<'ctx> {
                 name: symbol, body, ..
             } => self.compile_definition(scope, &symbol, *body, module_path),
             AstNodeType::ExternalDefinition(symbol, ty) => {
-                for function in &self.internal_functions {
+                let internal_functions = &self.internal_functions;
+                for function in &internal_functions(&self.module, &self) {
                     if function.name == symbol && match_types(&ty.pop_types, &function.ty.pop_types)
                     {
                         let fun = function.function.clone();
@@ -366,19 +371,16 @@ impl<'ctx> CompilerContext<'ctx> {
                 scope.add_external_definition(symbol, ty);
                 Ok(())
             }
-            AstNodeType::If(true_body, false_body) => {
-                self.compile_if(scope, *true_body, false_body, stack, module_path)
-            }
             AstNodeType::Import(path, import_node) => {
                 let import_scope = if let Some(nodes) = import_node.node {
                     let AstNodeType::Block(nodes) = nodes.node_type else {
                         return Err(CompilerError::InvalidImportType(program.position));
                     };
                     let import_scope = Scope::empty();
-                    let mut module_path = module_path.clone();
-                    module_path.extend(path);
+                    // let mut module_path = module_path.clone();
+                    // module_path.extend(path);
                     for node in nodes {
-                        self.compile_ast(import_scope.clone(), stack, node, module_path.clone())?;
+                        self.compile_ast(import_scope.clone(), stack, node, path.clone())?;
                     }
 
                     self.imports
@@ -435,7 +437,7 @@ impl<'ctx> CompilerContext<'ctx> {
                                 definitions.push((ty.clone(), Rc::new(Box::new(move |compiler_context: &CompilerContext<'ctx>,
                                       stack: &mut Stack<'ctx>|
                                       -> Result<(), CompilerError> {
-                                         let variant_struct = custom_type_variant_struct(variant.clone(), generics_map.clone(), compiler_context)?;
+                                        let variant_struct = custom_type_variant_struct(variant.clone(), generics_map.clone(), compiler_context)?;
                                         let values = stack.pop_n(ty.pop_types.len());
 
                                         let struct_val = compiler_context.builder.build_malloc(variant_struct, "struct_value")?;
@@ -458,7 +460,9 @@ impl<'ctx> CompilerContext<'ctx> {
 
                 Ok(())
             }
-            AstNodeType::Match(cases) => self.compile_match(scope, cases, stack, module_path),
+            AstNodeType::Match(cases) => {
+                self.compile_match(scope, cases, stack, module_path, program.type_definition)
+            }
         }
     }
 
@@ -797,7 +801,6 @@ impl<'ctx> CompilerContext<'ctx> {
                     NumberType::F64 => Ok(self.context.f64_type().into()),
                 },
                 LiteralType::String => Ok(self.context.ptr_type(AddressSpace::default()).into()),
-                LiteralType::Boolean => Ok(self.context.bool_type().into()),
             },
             UnitType::Var(_) => todo!("Handle variatic types"),
             UnitType::Type(_) => todo!("Handle function types"),
@@ -821,107 +824,13 @@ impl<'ctx> CompilerContext<'ctx> {
         Ok(())
     }
 
-    fn compile_boolean(&self, stack: &mut Stack<'ctx>, boolean: bool) -> Result<(), CompilerError> {
-        let value = self.context.bool_type().const_int(boolean as u64, false);
-        stack.push((UnitType::Literal(LiteralType::Boolean), value.into()));
-        Ok(())
-    }
-
-    fn compile_if(
-        &mut self,
-        scope: Scope<'ctx>,
-        true_body: AstNodeWithType,
-        false_body: Option<Box<AstNodeWithType>>,
-        stack: &mut Stack<'ctx>,
-        module_path: Vec<String>,
-    ) -> Result<(), CompilerError> {
-        let (condition_type, condition_value) = stack.pop().unwrap();
-        let condition = match condition_type {
-            UnitType::Literal(LiteralType::Boolean) => {
-                let int_value = condition_value.into_int_value();
-                self.builder.build_int_compare(
-                    inkwell::IntPredicate::NE,
-                    int_value,
-                    int_value.get_type().const_zero(),
-                    "if_cond",
-                )?
-            }
-            _ => return Err(CompilerError::UnexpectedType),
-        };
-
-        let current_function = self
-            .builder
-            .get_insert_block()
-            .ok_or(CompilerError::IfWithoutFunction)?
-            .get_parent()
-            .ok_or(CompilerError::IfWithoutFunction)?;
-
-        let true_block = self.context.append_basic_block(current_function, "true");
-        let merge_block = self.context.append_basic_block(current_function, "merge");
-        match false_body {
-            Some(false_body) => {
-                let false_block = self.context.append_basic_block(current_function, "false");
-                self.builder
-                    .build_conditional_branch(condition, true_block, false_block)?;
-
-                self.builder.position_at_end(true_block);
-                let mut true_stack = stack.clone();
-                let push_types_len = true_body.type_definition.push_types.len();
-                self.compile_ast(
-                    scope.clone(),
-                    &mut true_stack,
-                    true_body,
-                    module_path.clone(),
-                )?;
-                let true_values = true_stack.pop_n(push_types_len);
-                self.builder.build_unconditional_branch(merge_block)?;
-                let true_end_bb = self
-                    .builder
-                    .get_insert_block()
-                    .ok_or(CompilerError::IfWithoutFunction)?;
-
-                self.builder.position_at_end(false_block);
-                self.compile_ast(scope, stack, *false_body, module_path)?;
-                let false_values = stack.pop_n(push_types_len);
-                self.builder.build_unconditional_branch(merge_block)?;
-                let false_end_bb = self
-                    .builder
-                    .get_insert_block()
-                    .ok_or(CompilerError::IfWithoutFunction)?;
-
-                self.builder.position_at_end(merge_block);
-                for ((tr_ty, true_value), (fl_ty, false_value)) in
-                    true_values.into_iter().zip(false_values.into_iter())
-                {
-                    let phi = self
-                        .builder
-                        .build_phi(true_value.get_type(), "phi")
-                        .unwrap();
-                    phi.add_incoming(&[(&true_value, true_end_bb), (&false_value, false_end_bb)]);
-                    assert_eq!(tr_ty, fl_ty);
-                    stack.push((tr_ty, phi.as_basic_value()));
-                }
-            }
-            None => {
-                self.builder
-                    .build_conditional_branch(condition, true_block, merge_block)?;
-
-                self.builder.position_at_end(true_block);
-                self.compile_ast(scope, stack, true_body, module_path)?;
-                self.builder.build_unconditional_branch(merge_block)?;
-
-                self.builder.position_at_end(merge_block);
-            }
-        };
-        Ok(())
-    }
-
     fn compile_match(
         &mut self,
         scope: Scope<'ctx>,
         cases: Vec<crate::parser::Case<AstNodeWithType>>,
         stack: &mut Stack<'ctx>,
         module_path: Vec<String>,
+        match_type: Type,
     ) -> Result<(), CompilerError> {
         let Some(match_value) = stack.pop() else {
             return Err(CompilerError::StackUnderflow);
@@ -1000,6 +909,7 @@ impl<'ctx> CompilerContext<'ctx> {
                         _ => panic!("This is not a valid pattern for this type"),
                     }
                 }
+                stack.pop_n(match_type.pop_types.len());
                 self.builder.position_at_end(merge_block);
                 let mut values_for_phi = Vec::new();
                 for (values, block) in values_and_blocks.iter() {
@@ -1029,7 +939,6 @@ impl<'ctx> CompilerContext<'ctx> {
                     panic!("We should always find the custom type in the scope")
                 };
                 let mut case_blocks = Vec::new();
-                let else_block = self.context.append_basic_block(current_function, "else");
                 let mut values_and_blocks = Vec::new();
                 let mut index_to_variant_index = HashMap::new();
                 for (index, case) in cases.iter().enumerate() {
@@ -1050,6 +959,7 @@ impl<'ctx> CompilerContext<'ctx> {
                         _ => panic!("Unsupported pattern type"),
                     }
                 }
+
                 let match_ptr = self.get_ptr_ptr(match_value.clone().1.into_pointer_value())?;
 
                 let struct_type = self
@@ -1063,6 +973,8 @@ impl<'ctx> CompilerContext<'ctx> {
                     ptr_field_ptr,
                     "variant_value_load",
                 )?;
+                let else_block = self.context.append_basic_block(current_function, "else");
+
                 self.builder.build_switch(
                     variant_value.into_int_value(),
                     else_block,
@@ -1092,6 +1004,7 @@ impl<'ctx> CompilerContext<'ctx> {
                     .map(|generic| generic.1.clone())
                     .zip(generic_types.iter().cloned())
                     .collect::<HashMap<_, _>>();
+
                 let mut has_wild_card = false;
                 for (index, case) in cases.into_iter().enumerate() {
                     let mut temp_stack = stack.clone();
@@ -1121,8 +1034,7 @@ impl<'ctx> CompilerContext<'ctx> {
                             variant_name,
                             fields,
                         } => {
-                            self.builder
-                                .position_at_end(case_blocks[index_to_variant_index[&index]]);
+                            self.builder.position_at_end(case_blocks[index]);
                             let n_push_types = case.body.type_definition.push_types.len();
                             let variant = custom_type
                                 .variants
@@ -1179,12 +1091,22 @@ impl<'ctx> CompilerContext<'ctx> {
                         _ => panic!("Unsupported variant type"),
                     }
                 }
-
+                stack.pop_n(match_type.pop_types.len() - 1);
                 if !has_wild_card {
                     self.builder.position_at_end(else_block);
+                    let bb = self
+                        .builder
+                        .get_insert_block()
+                        .ok_or(CompilerError::IfWithoutFunction)?;
+                    values_and_blocks.push((
+                        values_and_blocks
+                            .last()
+                            .map(|d| d.0.clone())
+                            .unwrap_or(Vec::new()),
+                        bb,
+                    ));
                     self.builder.build_unconditional_branch(merge_block)?;
                 }
-
                 self.builder.position_at_end(merge_block);
                 let mut values_for_phi = Vec::new();
                 for (values, block) in values_and_blocks.iter() {
@@ -1209,7 +1131,7 @@ impl<'ctx> CompilerContext<'ctx> {
         }
     }
 
-    fn get_type(&self, name: Vec<String>) -> Option<CustomType> {
+    pub fn get_type(&self, name: Vec<String>) -> Option<CustomType> {
         self.type_definitions.get(&name).cloned()
     }
 }
@@ -1511,7 +1433,7 @@ fn call_function<'ctx>(
 
     let value = call.try_as_basic_value();
     if value.is_right() {
-        return Ok(());
+        return Err(CompilerError::FunctionCallError);
     }
     // params.into_iter().try_for_each(|param| {
     //     compiler_context.drop_value(
@@ -1552,6 +1474,16 @@ fn match_types(left: &[UnitType], right: &[UnitType]) -> bool {
             (UnitType::Var(a), UnitType::Var(b)) => var_type_map
                 .insert(a.clone(), UnitType::Var(b.clone()))
                 .is_none_or(|previous| previous == UnitType::Var(b.clone())),
+            (
+                UnitType::Custom {
+                    name: name1,
+                    generic_types: generic_types1,
+                },
+                UnitType::Custom {
+                    name: name2,
+                    generic_types: generic_types2,
+                },
+            ) => name1 == name2 && match_types(generic_types1, generic_types2),
             (type_left, UnitType::Var(a)) => {
                 let previous = var_type_map.insert(a.clone(), type_left.clone());
                 previous.map(|p| p == *type_left).unwrap_or(true)
@@ -1597,4 +1529,6 @@ pub enum CompilerError {
     ImportNotFound,
     #[error("Unsupported type")]
     UnsupportedType(UnitType),
+    #[error("Missing else block")]
+    MissingElseBlock,
 }

@@ -1,3 +1,5 @@
+import std::boolean(Boolean)
+
 defx + (U32 U32 -> U32)
 defx - (U32 U32 -> U32)
 defx * (U32 U32 -> U32)

@@ -1,13 +1,13 @@
 import std::io
 import std::stack
 import std::number::i64
-import std::boolean
+import std::boolean(True False)
 
 def fizz_buzz (I64 ->) {
-    stack::dup 3 i64::% 0 i64::= if { "Fizz" io::print }
-    stack::dup 5 i64::% 0 i64::= if { "Buzz" io::print }
-    stack::dup 3 i64::% 0 i64::!= stack::swap stack::dup 5 i64::% 0 i64::!= stack::rot boolean::&& if { stack::dup i64::to_string io::print }
-    1 i64::+ stack::dup 30 i64::gt if { stack::drop "\nDone!!" io::println } else { "\n" io::print fizz_buzz }
+    stack::dup 3 i64::% 0 i64::= match { True -> { "Fizz" io::print } * -> {} }
+    stack::dup 5 i64::% 0 i64::= match { True -> { "Buzz" io::print } * -> {} }
+    stack::dup 3 i64::% 0 i64::!= stack::swap stack::dup 5 i64::% 0 i64::!= stack::rot boolean::&& match { True -> { stack::dup i64::to_string io::print } * -> { stack::touch } }
+    1 i64::+ stack::dup 30 i64::gt match { True -> { stack::drop "\nDone!!" io::println } False -> { "\n" io::print fizz_buzz } }
 }
 
 def main {

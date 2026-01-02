@@ -57,7 +57,6 @@ pub enum TokenType {
     RightChevron,
     Number(Number),
     String(String),
-    Boolean(bool),
     Symbol(String),
     SymbolWithPath(Vec<String>),
 }
@@ -281,12 +280,6 @@ impl<'a> Lexer<'a> {
             }
         }
 
-        if symbol == "true" || symbol == "false" {
-            return Ok(Some(Token {
-                token_type: TokenType::Boolean(symbol == "true"),
-                position,
-            }));
-        }
         if symbol.contains("::") {
             let parts: Vec<&str> = symbol.split("::").collect();
             let parts = parts.iter().map(|s| s.to_string()).collect();
@@ -1159,32 +1152,6 @@ mod tests {
             .collect::<Result<Vec<Token>, LexerError>>()
             .expect("Failed to collect tokens");
         assert_eq!(tokens, vec![]);
-    }
-
-    #[test]
-    fn lex_boolean_true() {
-        let input = "true";
-        let mut lexer = Lexer::new(input, None);
-        assert_eq!(
-            lexer.next(),
-            Some(Ok(Token {
-                token_type: TokenType::Boolean(true),
-                position: Position::new(1, 1, None),
-            }))
-        );
-    }
-
-    #[test]
-    fn lex_boolean_false() {
-        let input = "false";
-        let mut lexer = Lexer::new(input, None);
-        assert_eq!(
-            lexer.next(),
-            Some(Ok(Token {
-                token_type: TokenType::Boolean(false),
-                position: Position::new(1, 1, None),
-            }))
-        );
     }
 
     #[test]

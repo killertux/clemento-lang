@@ -39,12 +39,14 @@ impl AstNodeWithType {
 
 pub struct TypeChecker {
     imports: HashMap<String, TypeScope>,
+    type_definitions: HashMap<Vec<String>, CustomType>,
 }
 
 impl TypeChecker {
     pub fn new() -> Self {
         Self {
             imports: HashMap::new(),
+            type_definitions: HashMap::new(),
         }
     }
 
@@ -222,11 +224,6 @@ impl TypeChecker {
                 node.position.clone(),
                 Type::string(),
             )),
-            AstNodeType::Boolean(bool) => Ok(AstNodeWithType::new(
-                AstNodeType::Boolean(bool),
-                node.position.clone(),
-                Type::boolean(),
-            )),
             AstNodeType::SymbolWithPath(symbol) => {
                 let type_definition = scope.get_definition(symbol.clone(), false).ok_or(
                     TypeCheckerError::SymbolNotFound(symbol.join("::"), node.position.clone(), {
@@ -323,6 +320,7 @@ impl TypeChecker {
                 ))
             }
             AstNodeType::ExternalDefinition(symbol, ty) => {
+                let ty = self.replace_custom_type(scope, ty.clone())?;
                 scope.insert_definition(symbol.clone(), ty.clone(), false);
                 Ok(AstNodeWithType::new(
                     AstNodeType::ExternalDefinition(symbol, ty),
@@ -332,9 +330,9 @@ impl TypeChecker {
             }
             AstNodeType::Import(path, import_node) => {
                 let result_node = if let Some(nodes) = import_node.node {
-                    let mut module_path = module_path.clone();
-                    module_path.extend(path.clone());
-                    let result = self.type_check(nodes, false, module_path)?;
+                    // let mut module_path = module_path.clone();
+                    // module_path.extend(path.clone());
+                    let result = self.type_check(nodes, false, path.clone())?;
                     scope.insert_import(import_node.name.alias.clone(), result.1);
                     for function in &import_node.functions {
                         scope.insert_function_import(
@@ -374,96 +372,7 @@ impl TypeChecker {
                     Type::empty(),
                 ))
             }
-            AstNodeType::If(true_body, false_body) => {
-                let type_stack_without_last_element =
-                    &type_stack[..type_stack.len().saturating_sub(1)].to_vec();
-                let mut true_body = self.infer_type_definition(
-                    scope,
-                    type_stack_without_last_element.clone(),
-                    *true_body,
-                    module_path.clone(),
-                )?;
-                true_body.type_definition = substitute_types(
-                    type_stack_without_last_element,
-                    true_body.type_definition,
-                    node.position.clone(),
-                )?;
-                if let Some(false_body) = false_body {
-                    let mut false_body = self.infer_type_definition(
-                        scope,
-                        type_stack_without_last_element.clone(),
-                        *false_body,
-                        module_path,
-                    )?;
-                    false_body.type_definition = substitute_types(
-                        type_stack_without_last_element,
-                        false_body.type_definition,
-                        node.position.clone(),
-                    )?;
 
-                    let true_push_types = substitute_types(
-                        type_stack_without_last_element,
-                        true_body.type_definition.clone(),
-                        true_body.position.clone(),
-                    )?
-                    .push_types;
-                    let false_push_types = substitute_types(
-                        type_stack_without_last_element,
-                        false_body.type_definition.clone(),
-                        false_body.position.clone(),
-                    )?
-                    .push_types;
-
-                    let true_type =
-                        Type::new(true_body.type_definition.pop_types.clone(), true_push_types);
-                    let false_type = Type::new(
-                        false_body.type_definition.pop_types.clone(),
-                        false_push_types,
-                    );
-
-                    if true_type.pop_types.len() != false_type.pop_types.len()
-                        || true_type.push_types != false_type.push_types
-                    {
-                        return Err(TypeCheckerError::InvalidIfElseBody(
-                            node.position.clone(),
-                            Box::new(true_type),
-                            Box::new(false_type),
-                        ));
-                    }
-
-                    let mut pop_type = true_type.pop_types;
-                    pop_type.push(UnitType::Literal(LiteralType::Boolean));
-
-                    Ok(AstNodeWithType::new(
-                        AstNodeType::If(Box::new(true_body), Some(Box::new(false_body))),
-                        node.position.clone(),
-                        Type::new(pop_type, true_type.push_types),
-                    ))
-                } else {
-                    if true_body.type_definition.pop_types
-                        != true_body
-                            .type_definition
-                            .push_types
-                            .iter()
-                            .rev()
-                            .cloned()
-                            .collect::<Vec<_>>()
-                    {
-                        return Err(TypeCheckerError::InvalidIfBody(
-                            node.position.clone(),
-                            Box::new(true_body.type_definition),
-                        ));
-                    }
-                    let mut pop_types = true_body.type_definition.pop_types.clone();
-                    pop_types.push(UnitType::Literal(LiteralType::Boolean));
-                    let push_types = true_body.type_definition.push_types.clone();
-                    Ok(AstNodeWithType::new(
-                        AstNodeType::If(Box::new(true_body), None),
-                        node.position.clone(),
-                        Type::new(pop_types, push_types),
-                    ))
-                }
-            }
             AstNodeType::CustomType {
                 name,
                 generics,
@@ -475,6 +384,14 @@ impl TypeChecker {
                     name_with_path.clone(),
                     generics.clone(),
                     variants.clone(),
+                );
+                self.type_definitions.insert(
+                    name_with_path.clone(),
+                    CustomType {
+                        name: name_with_path.clone(),
+                        generics: generics.clone(),
+                        variants: variants.clone(),
+                    },
                 );
                 for variant in variants.iter() {
                     scope.insert_definition(
@@ -726,9 +643,8 @@ impl TypeChecker {
             UnitType::Custom {
                 name,
                 generic_types,
-                ..
             } => {
-                let Some(custom_type) = scope.get_type(name.clone()) else {
+                let Some(custom_type) = self.type_definitions.get(name) else {
                     return Err(TypeCheckerError::TypeNotFound(name.clone()));
                 };
                 let generics_map: HashMap<VarType, UnitType> = custom_type
@@ -841,6 +757,7 @@ impl TypeChecker {
                                 body_type.type_definition,
                                 position.clone(),
                             )?;
+
                             variants.clear();
                             match pattern_body_type {
                                 Some(existing) => {
@@ -1119,12 +1036,6 @@ pub enum TypeCheckerError {
     InvalidMainDefinition(Box<Type>),
     #[error("Invalid module definition {0}. It should always be (->)")]
     InvalidModuleDefinition(Box<Type>),
-    #[error("Invalid if body at {0}. If cannot change the type stack. It tried to change to {1}")]
-    InvalidIfBody(Position, Box<Type>),
-    #[error(
-        "Invalid if else body at {0}.If and else bodies need to pop and push the same types. {1} != {2}"
-    )]
-    InvalidIfElseBody(Position, Box<Type>, Box<Type>),
     #[error("Missing import {0}")]
     MissingImport(String),
     #[error("Type not found {0:?}")]
@@ -1314,7 +1225,7 @@ impl TypeScope {
                 }
                 None
             }
-            2 => {
+            _ => {
                 let inner = self.inner.borrow();
                 let first = name.remove(0);
                 if let Some(from_imports) = inner.imported.get(&first) {
@@ -1323,26 +1234,6 @@ impl TypeScope {
                 if let Some(parent) = inner.parent.as_ref() {
                     name.insert(0, first);
                     return parent.get_type(name);
-                }
-
-                None
-            }
-            _ => {
-                let inner = self.inner.borrow();
-                let mut partial_name = name[name.len() - 2..].to_vec();
-                let first = partial_name.remove(0);
-                if let Some(from_imports) = inner.imported.get(&first) {
-                    return from_imports.get_type(partial_name);
-                }
-                if let Some(from_imports) = inner.imported.get(&first) {
-                    return from_imports.get_type(name);
-                }
-                if let Some(parent) = inner.parent.as_ref() {
-                    partial_name.insert(0, first);
-                    return match parent.get_type(partial_name) {
-                        Some(ty) => Some(ty),
-                        None => parent.get_type(name),
-                    };
                 }
 
                 None
@@ -1437,38 +1328,6 @@ mod test {
     }
 
     #[test]
-    fn if_without_else() {
-        let contents = r#"
-            import std::stack
-
-            def main {
-                true if { 42u8 stack::drop }
-            }
-        "#;
-        let program = parse_and_type_check(contents, true).unwrap();
-        assert_eq!(
-            program,
-            "( -> ) {( -> ) import std::stack ( -> ) def main ( -> ) {( -> Boolean) true (Boolean -> ) if ( -> ) {( -> U8) 42u8 (U8 -> ) stack::drop}}\n}"
-        );
-    }
-
-    #[test]
-    fn if_with_else_same_types() {
-        let contents = r#"
-            import std::stack
-
-            def main {
-                true if { 42u8 } else { 24u8 } stack::drop
-            }
-        "#;
-        let program = parse_and_type_check(contents, true).unwrap();
-        assert_eq!(
-            program,
-            "( -> ) {( -> ) import std::stack ( -> ) def main ( -> ) {( -> Boolean) true (Boolean -> U8) if ( -> U8) {( -> U8) 42u8} else ( -> U8) {( -> U8) 24u8} (U8 -> ) stack::drop}\n}"
-        );
-    }
-
-    #[test]
     fn symbol_not_found_error() {
         let contents = "unknown_symbol";
         let error = parse_and_type_check(contents, false)
@@ -1478,36 +1337,6 @@ mod test {
         assert_eq!(
             error,
             "Symbol unknown_symbol not found at 1:1 with type stack <...>. Maybe it is defined after the current position"
-        );
-    }
-
-    #[test]
-    fn invalid_if_body_error() {
-        let contents = r#"true if { 42u8 }"#;
-        let error = parse_and_type_check(contents, false)
-            .unwrap_err()
-            .to_string();
-
-        assert_eq!(
-            error,
-            "Invalid if body at 1:6. If cannot change the type stack. It tried to change to ( -> U8)"
-        );
-    }
-
-    #[test]
-    fn invalid_if_else_body_different_types() {
-        let contents = r#"
-            def main {
-                true if { 42u8 } else { "hello" } print
-            }
-        "#;
-        let error = parse_and_type_check(contents, true)
-            .unwrap_err()
-            .to_string();
-
-        assert_eq!(
-            error,
-            "Invalid if else body at 3:22.If and else bodies need to pop and push the same types. ( -> U8) != ( -> String)"
         );
     }
 

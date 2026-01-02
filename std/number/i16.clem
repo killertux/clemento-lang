@@ -1,3 +1,5 @@
+import std::boolean(Boolean)
+
 defx + (I16 I16 -> I16)
 defx - (I16 I16 -> I16)
 defx * (I16 I16 -> I16)
