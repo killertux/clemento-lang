@@ -1,0 +1,34 @@
+import std::number::i8
+import std::stack(swap rot swap dup drop touch)
+import std::string(concat)
+import std::boolean(Boolean)
+
+defx + (I128 I128 -> I128)
+defx - (I128 I128 -> I128)
+defx * (I128 I128 -> I128)
+defx / (I128 I128 -> I128)
+defx % (I128 I128 -> I128)
+defx %i8 (I128 I8 -> I8)
+defx %i16 (I128 I16 -> I16)
+defx %i32 (I128 I32 -> I32)
+defx %i64 (I128 I64 -> I64)
+defx gt (I128 I128 -> Boolean)
+defx lt (I128 I128 -> Boolean)
+defx = (I128 I128 -> Boolean)
+defx != (I128 I128 -> Boolean)
+
+def abs (I128 -> I128) {
+    dup 0i128 lt match { boolean::True -> { -1i128 * } boolean::False -> { touch } }
+}
+
+def to_string (I128 -> String) {
+    defp inner_to_string (String I128 -> String) {
+        dup
+        10i128 /
+        swap 10i8 %i8 i8::abs i8::to_string
+        rot concat swap dup 0i128 = match { boolean::True -> { drop touch } boolean::False -> { inner_to_string } }
+    }
+    dup 0i128 lt swap
+    "" swap inner_to_string
+    swap match { boolean::True -> "-" boolean::False -> "" } swap concat
+}

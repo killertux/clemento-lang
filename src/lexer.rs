@@ -7,6 +7,8 @@ use std::{
 
 use thiserror::Error;
 
+use crate::parser::{LiteralType, NumberType, UnitType};
+
 pub struct Lexer<'a> {
     input: Peekable<Chars<'a>>,
     line: usize,
@@ -51,9 +53,10 @@ pub enum TokenType {
     LeftBracket,
     RightBracket,
     RightArrow,
+    LeftChevron,
+    RightChevron,
     Number(Number),
     String(String),
-    Boolean(bool),
     Symbol(String),
     SymbolWithPath(Vec<String>),
 }
@@ -62,6 +65,44 @@ pub enum TokenType {
 pub enum Number {
     Integer(IntegerNumber),
     Float(String),
+}
+
+impl Number {
+    pub fn to_unit_type(&self) -> UnitType {
+        match self {
+            Number::Integer(IntegerNumber::U8(_)) => {
+                UnitType::Literal(LiteralType::Number(NumberType::U8))
+            }
+            Number::Integer(IntegerNumber::U16(_)) => {
+                UnitType::Literal(LiteralType::Number(NumberType::U16))
+            }
+            Number::Integer(IntegerNumber::U32(_)) => {
+                UnitType::Literal(LiteralType::Number(NumberType::U32))
+            }
+            Number::Integer(IntegerNumber::U64(_)) => {
+                UnitType::Literal(LiteralType::Number(NumberType::U64))
+            }
+            Number::Integer(IntegerNumber::U128(_)) => {
+                UnitType::Literal(LiteralType::Number(NumberType::U128))
+            }
+            Number::Integer(IntegerNumber::I8(_)) => {
+                UnitType::Literal(LiteralType::Number(NumberType::I8))
+            }
+            Number::Integer(IntegerNumber::I16(_)) => {
+                UnitType::Literal(LiteralType::Number(NumberType::I16))
+            }
+            Number::Integer(IntegerNumber::I32(_)) => {
+                UnitType::Literal(LiteralType::Number(NumberType::I32))
+            }
+            Number::Integer(IntegerNumber::I64(_)) => {
+                UnitType::Literal(LiteralType::Number(NumberType::I64))
+            }
+            Number::Integer(IntegerNumber::I128(_)) => {
+                UnitType::Literal(LiteralType::Number(NumberType::I128))
+            }
+            Number::Float(_) => UnitType::Literal(LiteralType::Number(NumberType::F64)),
+        }
+    }
 }
 
 impl Display for Number {
@@ -139,6 +180,8 @@ impl<'a> Lexer<'a> {
             Some('}') => Ok(Some(self.create_token_here(TokenType::RightBrace))),
             Some('[') => Ok(Some(self.create_token_here(TokenType::LeftBracket))),
             Some(']') => Ok(Some(self.create_token_here(TokenType::RightBracket))),
+            Some('<') => Ok(Some(self.create_token_here(TokenType::LeftChevron))),
+            Some('>') => Ok(Some(self.create_token_here(TokenType::RightChevron))),
             Some('/') if self.input.peek().is_some_and(|c| *c == '/') => {
                 self.lex_single_line_comment()
             }
@@ -237,12 +280,6 @@ impl<'a> Lexer<'a> {
             }
         }
 
-        if symbol == "true" || symbol == "false" {
-            return Ok(Some(Token {
-                token_type: TokenType::Boolean(symbol == "true"),
-                position,
-            }));
-        }
         if symbol.contains("::") {
             let parts: Vec<&str> = symbol.split("::").collect();
             let parts = parts.iter().map(|s| s.to_string()).collect();
@@ -449,7 +486,7 @@ impl NumberTypeHint {
 }
 
 fn is_separator(c: &char) -> bool {
-    c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '{' | '}')
+    c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>')
 }
 
 impl<'a> Iterator for Lexer<'a> {
@@ -1115,32 +1152,6 @@ mod tests {
             .collect::<Result<Vec<Token>, LexerError>>()
             .expect("Failed to collect tokens");
         assert_eq!(tokens, vec![]);
-    }
-
-    #[test]
-    fn lex_boolean_true() {
-        let input = "true";
-        let mut lexer = Lexer::new(input, None);
-        assert_eq!(
-            lexer.next(),
-            Some(Ok(Token {
-                token_type: TokenType::Boolean(true),
-                position: Position::new(1, 1, None),
-            }))
-        );
-    }
-
-    #[test]
-    fn lex_boolean_false() {
-        let input = "false";
-        let mut lexer = Lexer::new(input, None);
-        assert_eq!(
-            lexer.next(),
-            Some(Ok(Token {
-                token_type: TokenType::Boolean(false),
-                position: Position::new(1, 1, None),
-            }))
-        );
     }
 
     #[test]

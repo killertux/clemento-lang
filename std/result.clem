@@ -1,0 +1,3 @@
+type Result<a, b> {
+    Ok(val a) Err(val b)
+}

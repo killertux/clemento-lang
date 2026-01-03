@@ -1,7 +1,9 @@
 use std::rc::Rc;
 
 use inkwell::{
-    AddressSpace, IntPredicate, context::Context, module::Module, values::BasicValueEnum,
+    AddressSpace, IntPredicate,
+    module::Module,
+    values::{BasicValue, BasicValueEnum},
 };
 
 use crate::{
@@ -17,22 +19,34 @@ pub struct InternalFunction<'ctx> {
 }
 
 pub fn builtins_functions<'ctx>(
-    context: &'ctx Context,
+    context: &CompilerContext<'ctx>,
     module: &Module<'ctx>,
 ) -> Vec<InternalFunction<'ctx>> {
-    let ptr_type = context.ptr_type(AddressSpace::default());
-    let printf_type = context.i32_type().fn_type(&[ptr_type.into()], true);
+    let ptr_type = context.context.ptr_type(AddressSpace::default());
+    let printf_type = context.context.i32_type().fn_type(&[ptr_type.into()], true);
     module.add_function("printf", printf_type, None);
     let strcmp_type = context
+        .context
         .i32_type()
         .fn_type(&[ptr_type.into(), ptr_type.into()], false);
     module.add_function("strcmp", strcmp_type, None);
     let sprintf_type = context
+        .context
         .i32_type()
         .fn_type(&[ptr_type.into(), ptr_type.into()], true);
     module.add_function("sprintf", sprintf_type, None);
-    let strlen_type = context.i64_type().fn_type(&[ptr_type.into()], false);
+    let strlen_type = context
+        .context
+        .i64_type()
+        .fn_type(&[ptr_type.into()], false);
     module.add_function("strlen", strlen_type, None);
+    let boolean_type = context
+        .get_type(vec!["std".into(), "boolean".into(), "Boolean".into()])
+        .map(|t| UnitType::Custom {
+            name: t.name,
+            generic_types: vec![],
+        })
+        .unwrap_or(UnitType::Var(VarType::new()));
 
     let all_integer_types = vec![
         UnitType::Literal(LiteralType::Number(NumberType::U8)),
@@ -52,7 +66,6 @@ pub fn builtins_functions<'ctx>(
 
     let mut all_literal_types = all_number_types.clone();
     all_literal_types.push(UnitType::Literal(LiteralType::String));
-    all_literal_types.push(UnitType::Literal(LiteralType::Boolean));
 
     let all_literal_types_minus_128_bits = all_literal_types
         .iter()
@@ -82,7 +95,7 @@ pub fn builtins_functions<'ctx>(
                  -> Result<(), CompilerError> {
                     let value1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
                     let value2 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
-                    match (value2, value1) {
+                    match (&value2, &value1) {
                         (
                             (
                                 UnitType::Literal(LiteralType::String),
@@ -93,10 +106,29 @@ pub fn builtins_functions<'ctx>(
                                 BasicValueEnum::PointerValue(p2),
                             ),
                         ) => {
-                            let output_buffer = compiler_context.builder.build_malloc(
-                                compiler_context.context.i8_type().array_type(1024),
+                            let string1_size = compiler_context.get_ptr_len(*p1)?;
+                            let string2_size = compiler_context.get_ptr_len(*p2)?;
+                            let new_string_size = compiler_context.builder.build_int_add(
+                                string1_size,
+                                string2_size,
+                                "new_string_size",
+                            )?;
+                            let new_string_size = compiler_context.builder.build_int_sub(
+                                new_string_size,
+                                compiler_context.context.i64_type().const_int(1, false),
+                                "new_string_size_minus_one",
+                            )?;
+                            let output_buffer = compiler_context.builder.build_array_malloc(
+                                compiler_context.context.i8_type(),
+                                new_string_size,
                                 "output_buffer",
-                            )?; // TODO implement refcounting
+                            )?;
+                            let ref_count = compiler_context.ref_count.create(
+                                &compiler_context.builder,
+                                UnitType::Literal(LiteralType::String),
+                                output_buffer,
+                                new_string_size,
+                            )?;
                             let format_str = compiler_context
                                 .builder
                                 .build_global_string_ptr("%s%s", "concat_fmt")?
@@ -110,15 +142,18 @@ pub fn builtins_functions<'ctx>(
                                 &[
                                     output_buffer.into(),
                                     format_str.into(),
-                                    p1.into(),
-                                    p2.into(),
+                                    compiler_context
+                                        .deref_rc_if_necessary(p1.clone().as_basic_value_enum())?
+                                        .into(),
+                                    compiler_context
+                                        .deref_rc_if_necessary(p2.clone().as_basic_value_enum())?
+                                        .into(),
                                 ],
                                 "call_sprintf",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::String),
-                                output_buffer.into(),
-                            ));
+                            stack.push((UnitType::Literal(LiteralType::String), ref_count.into()));
+                            compiler_context.drop_value(value1.1)?;
+                            compiler_context.drop_value(value2.1)?;
                         }
                         _other => return Err(CompilerError::FunctionCallError),
                     }
@@ -129,31 +164,44 @@ pub fn builtins_functions<'ctx>(
         pop1_push1(
             &all_literal_types_minus_128_bits,
             Some(UnitType::Literal(LiteralType::String)),
-            "String".into(),
+            "to_string".into(),
             Rc::new(Box::new(
                 |compiler_context: &CompilerContext<'ctx>,
                  stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> {
                     let value = stack.pop().ok_or(CompilerError::StackUnderflow)?;
-                    let format_str = get_format_str(value.0)?;
-                    let output_buffer = compiler_context.builder.build_malloc(
-                        compiler_context.context.i8_type().array_type(40),
-                        "output_buffer",
-                    )?; // TODO implement refcounting
-                    let format_str = compiler_context
-                        .builder
-                        .build_global_string_ptr(format_str, "int_fmt")?
-                        .as_pointer_value();
-                    let sprintf = compiler_context
-                        .module
-                        .get_function("sprintf")
-                        .ok_or(CompilerError::GetFunctionError("sprintf".into()))?;
-                    compiler_context.builder.build_call(
-                        sprintf,
-                        &[output_buffer.into(), format_str.into(), value.1.into()],
-                        "call_sprintf",
-                    )?;
-                    stack.push((UnitType::Literal(LiteralType::String), output_buffer.into()));
+                    match value {
+                        (UnitType::Literal(LiteralType::String), value) => {
+                            stack.push((UnitType::Literal(LiteralType::String), value))
+                        }
+                        _ => {
+                            let format_str = get_format_str(value.0)?;
+                            let output_buffer = compiler_context.builder.build_malloc(
+                                compiler_context.context.i8_type().array_type(40),
+                                "output_buffer",
+                            )?;
+                            let ref_count = compiler_context.ref_count.create_with_const_len(
+                                &compiler_context.builder,
+                                UnitType::Literal(LiteralType::String),
+                                output_buffer,
+                                40,
+                            )?;
+                            let format_str = compiler_context
+                                .builder
+                                .build_global_string_ptr(format_str, "int_fmt")?
+                                .as_pointer_value();
+                            let sprintf = compiler_context
+                                .module
+                                .get_function("sprintf")
+                                .ok_or(CompilerError::GetFunctionError("sprintf".into()))?;
+                            compiler_context.builder.build_call(
+                                sprintf,
+                                &[output_buffer.into(), format_str.into(), value.1.into()],
+                                "call_sprintf",
+                            )?;
+                            stack.push((UnitType::Literal(LiteralType::String), ref_count.into()));
+                        }
+                    }
                     Ok(())
                 },
             ) as BoxDefinitionType<'ctx>),
@@ -175,11 +223,13 @@ pub fn builtins_functions<'ctx>(
                         .module
                         .get_function("printf")
                         .ok_or(CompilerError::GetFunctionError("printf".into()))?;
+                    let deref_value = compiler_context.deref_rc_if_necessary(value.1)?;
                     compiler_context.builder.build_call(
                         printf,
-                        &[format_str.into(), value.1.into()],
+                        &[format_str.into(), deref_value.into()],
                         "printf_call",
                     )?;
+                    compiler_context.drop_value(value.1)?;
                     Ok(())
                 },
             ) as BoxDefinitionType<'ctx>),
@@ -201,11 +251,13 @@ pub fn builtins_functions<'ctx>(
                         .module
                         .get_function("printf")
                         .ok_or(CompilerError::GetFunctionError("printf".into()))?;
+                    let deref_value = compiler_context.deref_rc_if_necessary(value.1)?;
                     compiler_context.builder.build_call(
                         printf,
-                        &[format_str.into(), value.1.into()],
+                        &[format_str.into(), deref_value.into()],
                         "printf_call",
                     )?;
+                    compiler_context.drop_value(value.1)?;
                     Ok(())
                 },
             ) as BoxDefinitionType<'ctx>),
@@ -220,12 +272,12 @@ pub fn builtins_functions<'ctx>(
                 )
             },
             function: Rc::new(Box::new(
-                |_compiler_context: &CompilerContext<'ctx>,
+                |compiler_context: &CompilerContext<'ctx>,
                  stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> {
                     let value = stack.pop().ok_or(CompilerError::StackUnderflow)?;
                     stack.push(value.clone());
-                    stack.push(value.clone());
+                    stack.push((value.0, compiler_context.clone_value(value.1)?));
                     Ok(())
                 },
             ) as BoxDefinitionType<'ctx>),
@@ -261,7 +313,7 @@ pub fn builtins_functions<'ctx>(
                 )
             },
             function: Rc::new(Box::new(
-                |_compiler_context: &CompilerContext<'ctx>,
+                |compiler_context: &CompilerContext<'ctx>,
                  stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> {
                     let value1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
@@ -269,8 +321,8 @@ pub fn builtins_functions<'ctx>(
 
                     stack.push(value2.clone());
                     stack.push(value1.clone());
-                    stack.push(value2.clone());
-                    stack.push(value1.clone());
+                    stack.push((value2.0, compiler_context.clone_value(value2.1)?));
+                    stack.push((value1.0, compiler_context.clone_value(value1.1)?));
                     Ok(())
                 },
             ) as BoxDefinitionType<'ctx>),
@@ -336,10 +388,11 @@ pub fn builtins_functions<'ctx>(
             name: "drop".into(),
             ty: Type::new(vec![UnitType::Var(VarType::new())], vec![]),
             function: Rc::new(Box::new(
-                |_compiler_context: &CompilerContext<'ctx>,
+                |compiler_context: &CompilerContext<'ctx>,
                  stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> {
-                    let _ = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    let value = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    compiler_context.drop_value(value.1)?;
                     Ok(())
                 },
             ) as BoxDefinitionType<'ctx>),
@@ -351,11 +404,13 @@ pub fn builtins_functions<'ctx>(
                 vec![],
             ),
             function: Rc::new(Box::new(
-                |_compiler_context: &CompilerContext<'ctx>,
+                |compiler_context: &CompilerContext<'ctx>,
                  stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> {
-                    let _ = stack.pop().ok_or(CompilerError::StackUnderflow)?;
-                    let _ = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    let value1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    compiler_context.drop_value(value1.1)?;
+                    let value2 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    compiler_context.drop_value(value2.1)?;
                     Ok(())
                 },
             ) as BoxDefinitionType<'ctx>),
@@ -364,11 +419,8 @@ pub fn builtins_functions<'ctx>(
             name: "&&".into(),
             ty: {
                 Type::new(
-                    vec![
-                        UnitType::Literal(LiteralType::Boolean),
-                        UnitType::Literal(LiteralType::Boolean),
-                    ],
-                    vec![UnitType::Literal(LiteralType::Boolean)],
+                    vec![boolean_type.clone(), boolean_type.clone()],
+                    vec![boolean_type.clone()],
                 )
             },
             function: Rc::new(Box::new(
@@ -379,15 +431,52 @@ pub fn builtins_functions<'ctx>(
                     let arg2 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
                     match (arg1, arg2) {
                         (
-                            (UnitType::Literal(LiteralType::Boolean), BasicValueEnum::IntValue(n1)),
-                            (UnitType::Literal(LiteralType::Boolean), BasicValueEnum::IntValue(n2)),
+                            (UnitType::Custom { .. }, BasicValueEnum::PointerValue(n1)),
+                            (UnitType::Custom { .. }, BasicValueEnum::PointerValue(n2)),
                         ) => {
-                            let result =
-                                compiler_context.builder.build_and(n1, n2, "and_result")?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            let boolean_struct_type = compiler_context
+                                .context
+                                .struct_type(&[compiler_context.context.i8_type().into()], true);
+                            let boolean_1 = compiler_context.get_ptr_ptr(n1)?;
+                            let boolean_2 = compiler_context.get_ptr_ptr(n2)?;
+
+                            let field_ptr = compiler_context.builder.build_struct_gep(
+                                boolean_struct_type,
+                                boolean_1,
+                                0,
+                                "field_ptr",
+                            )?;
+                            let boolean_1 = compiler_context.builder.build_load(
+                                compiler_context.context.i8_type(),
+                                field_ptr,
+                                "field_value",
+                            )?;
+
+                            let field_ptr = compiler_context.builder.build_struct_gep(
+                                boolean_struct_type,
+                                boolean_2,
+                                0,
+                                "field_ptr",
+                            )?;
+                            let boolean_2 = compiler_context.builder.build_load(
+                                compiler_context.context.i8_type(),
+                                field_ptr,
+                                "field_value",
+                            )?;
+
+                            let result = compiler_context.builder.build_and(
+                                boolean_1.into_int_value(),
+                                boolean_2.into_int_value(),
+                                "and_result",
+                            )?;
+
+                            compiler_context.drop_value(n1.as_basic_value_enum())?;
+                            compiler_context.drop_value(n2.as_basic_value_enum())?;
+
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         _ => return Err(CompilerError::FunctionCallError),
                     }
@@ -1312,8 +1401,8 @@ pub fn builtins_functions<'ctx>(
         rem(),
         pop2_push1(
             &all_literal_types,
-            Some(UnitType::Literal(LiteralType::Boolean)),
-            ">".into(),
+            Some(boolean_type.clone()),
+            "gt".into(),
             Rc::new(Box::new(
                 |compiler_context: &CompilerContext<'ctx>,
                  stack: &mut Stack<'ctx>|
@@ -1337,10 +1426,11 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -1358,10 +1448,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -1379,10 +1469,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -1400,10 +1490,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -1421,10 +1511,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -1442,10 +1532,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -1463,10 +1553,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -1484,10 +1574,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -1505,10 +1595,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -1526,10 +1616,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -1547,25 +1637,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
-                        }
-                        (
-                            (UnitType::Literal(LiteralType::Boolean), BasicValueEnum::IntValue(n1)),
-                            (UnitType::Literal(LiteralType::Boolean), BasicValueEnum::IntValue(n2)),
-                        ) => {
-                            let result = compiler_context.builder.build_int_compare(
-                                IntPredicate::UGT,
-                                n1,
-                                n2,
-                                "gt_result",
-                            )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -1584,7 +1659,18 @@ pub fn builtins_functions<'ctx>(
 
                             let strcmp_result = compiler_context
                                 .builder
-                                .build_call(strcmp_fn, &[n1.into(), n2.into()], "strcmp_call")?
+                                .build_call(
+                                    strcmp_fn,
+                                    &[
+                                        compiler_context
+                                            .deref_rc_if_necessary(n1.as_basic_value_enum())?
+                                            .into(),
+                                        compiler_context
+                                            .deref_rc_if_necessary(n2.as_basic_value_enum())?
+                                            .into(),
+                                    ],
+                                    "strcmp_call",
+                                )?
                                 .try_as_basic_value()
                                 .left()
                                 .unwrap()
@@ -1597,10 +1683,12 @@ pub fn builtins_functions<'ctx>(
                                 zero,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
+                            compiler_context.drop_value(n1.as_basic_value_enum())?;
+                            compiler_context.drop_value(n2.as_basic_value_enum())?;
                         }
                         _ => return Err(CompilerError::UnexpectedType),
                     }
@@ -1610,8 +1698,8 @@ pub fn builtins_functions<'ctx>(
         ),
         pop2_push1(
             &all_literal_types,
-            Some(UnitType::Literal(LiteralType::Boolean)),
-            "<".into(),
+            Some(boolean_type.clone()),
+            "lt".into(),
             Rc::new(Box::new(
                 |compiler_context: &CompilerContext<'ctx>,
                  stack: &mut Stack<'ctx>|
@@ -1635,10 +1723,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -1656,10 +1744,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -1677,10 +1765,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -1698,10 +1786,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -1719,10 +1807,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -1740,10 +1828,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -1761,10 +1849,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -1782,10 +1870,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -1803,10 +1891,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -1824,10 +1912,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -1845,25 +1933,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
-                        }
-                        (
-                            (UnitType::Literal(LiteralType::Boolean), BasicValueEnum::IntValue(n1)),
-                            (UnitType::Literal(LiteralType::Boolean), BasicValueEnum::IntValue(n2)),
-                        ) => {
-                            let result = compiler_context.builder.build_int_compare(
-                                IntPredicate::ULT,
-                                n1,
-                                n2,
-                                "gt_result",
-                            )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -1882,7 +1955,18 @@ pub fn builtins_functions<'ctx>(
 
                             let strcmp_result = compiler_context
                                 .builder
-                                .build_call(strcmp_fn, &[n1.into(), n2.into()], "strcmp_call")?
+                                .build_call(
+                                    strcmp_fn,
+                                    &[
+                                        compiler_context
+                                            .deref_rc_if_necessary(n1.as_basic_value_enum())?
+                                            .into(),
+                                        compiler_context
+                                            .deref_rc_if_necessary(n2.as_basic_value_enum())?
+                                            .into(),
+                                    ],
+                                    "strcmp_call",
+                                )?
                                 .try_as_basic_value()
                                 .left()
                                 .unwrap()
@@ -1895,10 +1979,12 @@ pub fn builtins_functions<'ctx>(
                                 zero,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
+                            compiler_context.drop_value(n1.as_basic_value_enum())?;
+                            compiler_context.drop_value(n2.as_basic_value_enum())?;
                         }
                         _ => return Err(CompilerError::UnexpectedType),
                     }
@@ -1908,7 +1994,7 @@ pub fn builtins_functions<'ctx>(
         ),
         pop2_push1(
             &all_literal_types,
-            Some(UnitType::Literal(LiteralType::Boolean)),
+            Some(boolean_type.clone()),
             "=".into(),
             Rc::new(Box::new(
                 |compiler_context: &CompilerContext<'ctx>,
@@ -1933,10 +2019,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -1954,10 +2040,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -1975,10 +2061,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -1996,10 +2082,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -2017,10 +2103,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -2038,10 +2124,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -2059,10 +2145,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -2080,10 +2166,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -2101,10 +2187,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "eq_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -2122,10 +2208,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -2143,25 +2229,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
-                        }
-                        (
-                            (UnitType::Literal(LiteralType::Boolean), BasicValueEnum::IntValue(n1)),
-                            (UnitType::Literal(LiteralType::Boolean), BasicValueEnum::IntValue(n2)),
-                        ) => {
-                            let result = compiler_context.builder.build_int_compare(
-                                IntPredicate::EQ,
-                                n1,
-                                n2,
-                                "gt_result",
-                            )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -2180,7 +2251,18 @@ pub fn builtins_functions<'ctx>(
 
                             let strcmp_result = compiler_context
                                 .builder
-                                .build_call(strcmp_fn, &[n1.into(), n2.into()], "strcmp_call")?
+                                .build_call(
+                                    strcmp_fn,
+                                    &[
+                                        compiler_context
+                                            .deref_rc_if_necessary(n1.as_basic_value_enum())?
+                                            .into(),
+                                        compiler_context
+                                            .deref_rc_if_necessary(n2.as_basic_value_enum())?
+                                            .into(),
+                                    ],
+                                    "strcmp_call",
+                                )?
                                 .try_as_basic_value()
                                 .left()
                                 .unwrap()
@@ -2193,10 +2275,12 @@ pub fn builtins_functions<'ctx>(
                                 zero,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
+                            compiler_context.drop_value(n1.as_basic_value_enum())?;
+                            compiler_context.drop_value(n2.as_basic_value_enum())?;
                         }
                         _ => return Err(CompilerError::UnexpectedType),
                     }
@@ -2206,7 +2290,7 @@ pub fn builtins_functions<'ctx>(
         ),
         pop2_push1(
             &all_literal_types,
-            Some(UnitType::Literal(LiteralType::Boolean)),
+            Some(boolean_type.clone()),
             "!=".into(),
             Rc::new(Box::new(
                 |compiler_context: &CompilerContext<'ctx>,
@@ -2231,10 +2315,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -2252,10 +2336,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -2273,10 +2357,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -2294,10 +2378,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -2315,10 +2399,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -2336,10 +2420,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -2357,10 +2441,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -2378,10 +2462,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -2399,10 +2483,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -2420,10 +2504,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -2441,25 +2525,10 @@ pub fn builtins_functions<'ctx>(
                                 n2,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
-                        }
-                        (
-                            (UnitType::Literal(LiteralType::Boolean), BasicValueEnum::IntValue(n1)),
-                            (UnitType::Literal(LiteralType::Boolean), BasicValueEnum::IntValue(n2)),
-                        ) => {
-                            let result = compiler_context.builder.build_int_compare(
-                                IntPredicate::NE,
-                                n1,
-                                n2,
-                                "gt_result",
-                            )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
                         }
                         (
                             (
@@ -2478,7 +2547,18 @@ pub fn builtins_functions<'ctx>(
 
                             let strcmp_result = compiler_context
                                 .builder
-                                .build_call(strcmp_fn, &[n1.into(), n2.into()], "strcmp_call")?
+                                .build_call(
+                                    strcmp_fn,
+                                    &[
+                                        compiler_context
+                                            .deref_rc_if_necessary(n1.as_basic_value_enum())?
+                                            .into(),
+                                        compiler_context
+                                            .deref_rc_if_necessary(n2.as_basic_value_enum())?
+                                            .into(),
+                                    ],
+                                    "strcmp_call",
+                                )?
                                 .try_as_basic_value()
                                 .left()
                                 .unwrap()
@@ -2491,10 +2571,12 @@ pub fn builtins_functions<'ctx>(
                                 zero,
                                 "gt_result",
                             )?;
-                            stack.push((
-                                UnitType::Literal(LiteralType::Boolean),
-                                BasicValueEnum::IntValue(result),
-                            ));
+                            stack.push(create_boolean_result(
+                                compiler_context,
+                                result.as_basic_value_enum(),
+                            )?);
+                            compiler_context.drop_value(n1.as_basic_value_enum())?;
+                            compiler_context.drop_value(n2.as_basic_value_enum())?;
                         }
                         _ => return Err(CompilerError::UnexpectedType),
                     }
@@ -2503,7 +2585,7 @@ pub fn builtins_functions<'ctx>(
             ) as BoxDefinitionType<'ctx>),
         ),
     ]
-    .concat()
+    .concat::<_>()
 }
 
 fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
@@ -3295,7 +3377,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%u8".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::U16)),
@@ -3317,7 +3399,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%u8".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::U32)),
@@ -3328,7 +3410,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%u16".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::U32)),
@@ -3350,7 +3432,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%u8".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::U64)),
@@ -3361,7 +3443,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%u16".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::U64)),
@@ -3372,7 +3454,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%u32".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::U64)),
@@ -3394,7 +3476,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%u8".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::U128)),
@@ -3405,7 +3487,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%u16".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::U128)),
@@ -3416,7 +3498,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%u32".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::U128)),
@@ -3427,7 +3509,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%u64".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::U128)),
@@ -3460,7 +3542,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%i8".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::I16)),
@@ -3482,7 +3564,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%i8".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::I32)),
@@ -3493,7 +3575,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%i16".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::I32)),
@@ -3515,7 +3597,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%i8".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::I64)),
@@ -3526,7 +3608,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%i16".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::I64)),
@@ -3537,7 +3619,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%i32".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::I64)),
@@ -3559,7 +3641,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%i8".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::I128)),
@@ -3570,7 +3652,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%i16".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::I128)),
@@ -3581,7 +3663,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%i32".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::I128)),
@@ -3592,7 +3674,7 @@ fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
             function: function.clone(),
         },
         InternalFunction {
-            name: "%".into(),
+            name: "%i64".into(),
             ty: Type::new(
                 vec![
                     UnitType::Literal(LiteralType::Number(NumberType::I128)),
@@ -3628,8 +3710,9 @@ fn get_format_str(value: UnitType) -> Result<&'static str, CompilerError> {
         UnitType::Literal(LiteralType::Number(NumberType::I64)) => "%lli",
         UnitType::Literal(LiteralType::Number(NumberType::F64)) => "%f",
         UnitType::Literal(LiteralType::String) => "%s",
-        UnitType::Literal(LiteralType::Boolean) => "%d",
-        _other => return Err(CompilerError::FunctionCallError),
+        _other => {
+            return Err(CompilerError::FunctionCallError);
+        }
     };
     Ok(format_str)
 }
@@ -3688,4 +3771,36 @@ fn pop2_push1<'ctx>(
         });
     }
     result
+}
+
+fn create_boolean_result<'ctx>(
+    compiler_context: &CompilerContext<'ctx>,
+    value: BasicValueEnum<'ctx>,
+) -> Result<(UnitType, BasicValueEnum<'ctx>), CompilerError> {
+    let boolean_struct_type = compiler_context
+        .context
+        .struct_type(&[compiler_context.context.i8_type().into()], true);
+    let struct_val = compiler_context
+        .builder
+        .build_malloc(boolean_struct_type, "struct_value")?;
+    let field_ptr =
+        compiler_context
+            .builder
+            .build_struct_gep(boolean_struct_type, struct_val, 0, "variant")?;
+    compiler_context.builder.build_store(field_ptr, value)?;
+
+    let ty = compiler_context
+        .get_type(vec!["std".into(), "boolean".into(), "Boolean".into()])
+        .ok_or(CompilerError::UnexpectedType)?;
+    let ty = UnitType::Custom {
+        name: ty.name.clone(),
+        generic_types: vec![],
+    };
+    let ref_count = compiler_context.ref_count.create_with_const_len(
+        &compiler_context.builder,
+        ty.clone(),
+        struct_val,
+        0,
+    )?;
+    Ok((ty, ref_count.as_basic_value_enum()))
 }

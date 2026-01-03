@@ -1,0 +1,5 @@
+type Boolean {
+    False True
+}
+
+defx && (Boolean Boolean -> Boolean)

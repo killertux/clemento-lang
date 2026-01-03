@@ -1,20 +1,29 @@
-import std::*
+import std::stack(dup drop swap dup2 drop2)
+import std::number::i64(lt = + - to_string)
+import std::io(println)
+import std::boolean(True False)
 
 def fibonacci (I64 -> I64) {
-    dup 2 < if {
-        drop 1
-    } else {
-        dup 1 - fibonacci
-        swap 2 - fibonacci
-        +
+    dup 2 lt match {
+        True ->  {
+            drop 1
+        }
+        False -> {
+            dup 1 - fibonacci
+            swap 2 - fibonacci
+            +
+        }
     }
 }
 
-def print_fibonacci (I64 I64 -> ) {
-    dup2 = if drop2 else { dup fibonacci println 1 +  print_fibonacci }
-}
 def print_fibonacci (I64 -> ) {
-    0 print_fibonacci
+    def inner_print_fibonacci (I64 I64 -> ) {
+        dup2 = match {
+            True -> drop2
+            False -> { dup fibonacci to_string println 1 +  inner_print_fibonacci }
+        }
+    }
+    0 inner_print_fibonacci
 }
 
 def main {

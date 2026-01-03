@@ -1,0 +1,12 @@
+import std::boolean(Boolean)
+
+defx + (F64 F64 -> F64)
+defx - (F64 F64 -> F64)
+defx * (F64 F64 -> F64)
+defx / (F64 F64 -> F64)
+defx % (F64 F64 -> F64)
+defx to_string (F64 -> String)
+defx gt (F64 F64 -> Boolean)
+defx lt (F64 F64 -> Boolean)
+defx = (F64 F64 -> Boolean)
+defx != (F64 F64 -> Boolean)

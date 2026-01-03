@@ -1,0 +1,13 @@
+import std::boolean(Boolean)
+
+defx + (U16 U16 -> U16)
+defx - (U16 U16 -> U16)
+defx * (U16 U16 -> U16)
+defx / (U16 U16 -> U16)
+defx % (U16 U16 -> U16)
+defx %u8 (U16 U8 -> U8)
+defx to_string (U16 -> String)
+defx gt (U16 U16 -> Boolean)
+defx lt (U16 U16 -> Boolean)
+defx = (U16 U16 -> Boolean)
+defx != (U16 U16 -> Boolean)
