@@ -13,7 +13,7 @@ use inkwell::{
     context::Context,
     module::Module,
     types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, IntType, PointerType, StructType},
-    values::{AggregateValue, BasicValue, BasicValueEnum, IntValue, PointerValue},
+    values::{AggregateValue, BasicValue, BasicValueEnum, PointerValue},
 };
 use thiserror::Error;
 
@@ -70,94 +70,36 @@ pub fn compile(file: impl AsRef<Path>) -> Result<PathBuf, CompilerError> {
 }
 
 pub struct RefCount<'ctx> {
-    type_marker: IntType<'ctx>,
-    ptr_type: PointerType<'ctx>,
-    len_type: IntType<'ctx>,
     ref_count_type: IntType<'ctx>,
+    ptr_type: PointerType<'ctx>,
     ref_count_struct: StructType<'ctx>,
 }
 
 impl<'ctx> RefCount<'ctx> {
     pub fn new(context: &'ctx Context) -> Self {
-        let type_marker = context.i8_type();
-        let ptr_type = context.ptr_type(AddressSpace::default());
-        let len_type = context.i64_type();
         let ref_count_type = context.i64_type();
-        let ref_count_struct = context.struct_type(
-            &[
-                type_marker.into(),
-                ptr_type.into(),
-                len_type.into(),
-                ref_count_type.into(),
-            ],
-            true,
-        );
+        let ptr_type = context.ptr_type(AddressSpace::default());
+        let ref_count_struct = context.struct_type(&[ref_count_type.into(), ptr_type.into()], true);
         Self {
-            type_marker,
-            ptr_type,
-            len_type,
             ref_count_type,
+            ptr_type,
             ref_count_struct,
         }
-    }
-
-    pub fn create_with_const_len(
-        &self,
-        builder: &Builder<'ctx>,
-        ty: UnitType,
-        ptr: PointerValue<'ctx>,
-        len: u64,
-    ) -> Result<PointerValue<'ctx>, CompilerError> {
-        let type_marker = self.type_marker;
-        let len_type = self.len_type;
-        let ref_count_type = self.ref_count_type;
-        let ref_count_struct = self.ref_count_struct;
-
-        let ty = match ty {
-            UnitType::Literal(LiteralType::String) => 0,
-            UnitType::Custom { .. } => 1,
-            _ => return Err(CompilerError::UnsupportedType(ty)),
-        };
-
-        let struct_val = builder.build_malloc(ref_count_struct, "struct_value")?;
-        let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 0, "type")?;
-        builder.build_store(field_ptr, type_marker.const_int(ty, false))?;
-        let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 1, "ptr")?;
-        builder.build_store(field_ptr, ptr)?;
-        let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 2, "len")?;
-        builder.build_store(field_ptr, len_type.const_int(len, false))?;
-        let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 3, "rc")?;
-        builder.build_store(field_ptr, ref_count_type.const_int(1, false))?;
-
-        Ok(struct_val)
     }
 
     pub fn create(
         &self,
         builder: &Builder<'ctx>,
-        ty: UnitType,
         ptr: PointerValue<'ctx>,
-        len: IntValue<'ctx>,
     ) -> Result<PointerValue<'ctx>, CompilerError> {
-        let type_marker = self.type_marker;
         let ref_count_type = self.ref_count_type;
         let ref_count_struct = self.ref_count_struct;
 
-        let ty = match ty {
-            UnitType::Literal(LiteralType::String) => 0,
-            UnitType::Custom { .. } => 1,
-            _ => return Err(CompilerError::UnsupportedType(ty)),
-        };
-
         let struct_val = builder.build_malloc(ref_count_struct, "struct_value")?;
-        let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 0, "type")?;
-        builder.build_store(field_ptr, type_marker.const_int(ty, false))?;
+        let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 0, "rc")?;
+        builder.build_store(field_ptr, ref_count_type.const_int(1, false))?;
         let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 1, "ptr")?;
         builder.build_store(field_ptr, ptr)?;
-        let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 2, "len")?;
-        builder.build_store(field_ptr, len)?;
-        let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 3, "rc")?;
-        builder.build_store(field_ptr, ref_count_type.const_int(1, false))?;
 
         Ok(struct_val)
     }
@@ -190,17 +132,17 @@ impl<'ctx> CompilerContext<'ctx> {
                 let rc_field_ptr = self.builder.build_struct_gep(
                     self.ref_count.ref_count_struct,
                     ptr,
-                    3,
+                    0,
                     "ref_count",
                 )?;
                 let rc = self
                     .builder
                     .build_load(self.ref_count.ref_count_type, rc_field_ptr, "get_ref_count")?
                     .into_int_value();
-                let result = self.builder.build_int_add(
+                let result = self.builder.build_int_sub(
                     rc,
                     self.ref_count.ref_count_type.const_int(1, false),
-                    "inc_ref_count",
+                    "dec_ref_count",
                 )?;
                 let condition = self.builder.build_int_compare(
                     inkwell::IntPredicate::NE,
@@ -232,7 +174,7 @@ impl<'ctx> CompilerContext<'ctx> {
                     self.ref_count.ref_count_struct,
                     ptr,
                     1,
-                    "ref_count",
+                    "ptr",
                 )?;
                 let ptr_field = self
                     .builder
@@ -257,14 +199,14 @@ impl<'ctx> CompilerContext<'ctx> {
                 let rc_field_ptr = self.builder.build_struct_gep(
                     self.ref_count.ref_count_struct,
                     ptr,
-                    3,
+                    0,
                     "ref_count",
                 )?;
                 let rc = self
                     .builder
                     .build_load(self.ref_count.ref_count_type, rc_field_ptr, "get_ref_count")?
                     .into_int_value();
-                let result = self.builder.build_int_sub(
+                let result = self.builder.build_int_add(
                     rc,
                     self.ref_count.ref_count_type.const_int(1, false),
                     "inc_ref_count",
@@ -274,20 +216,6 @@ impl<'ctx> CompilerContext<'ctx> {
             }
             other => Ok(other),
         }
-    }
-
-    pub fn get_ptr_len(&self, ptr: PointerValue<'ctx>) -> Result<IntValue<'ctx>, CompilerError> {
-        let len_field_ptr =
-            self.builder
-                .build_struct_gep(self.ref_count.ref_count_struct, ptr, 2, "ref_len")?;
-        Ok(self
-            .builder
-            .build_load(
-                self.ref_count.ref_count_type,
-                len_field_ptr,
-                "get_ref_count",
-            )?
-            .into_int_value())
     }
 
     pub fn get_ptr_ptr(
@@ -448,7 +376,7 @@ impl<'ctx> CompilerContext<'ctx> {
                                             compiler_context.builder.build_store(field_ptr, values[field_index - 1].1)?;
                                             Ok(())
                                         })?;
-                                        let ref_count = compiler_context.ref_count.create_with_const_len(&compiler_context.builder, ty.push_types[0].clone(), struct_val, 0)?;
+                                        let ref_count = compiler_context.ref_count.create(&compiler_context.builder, struct_val)?;
                                         stack.push((ty.push_types[0].clone(), ref_count.into()));
                                         Ok(())
                                 }))));
@@ -810,15 +738,19 @@ impl<'ctx> CompilerContext<'ctx> {
 
     fn compile_string(&self, stack: &mut Stack<'ctx>, string: String) -> Result<(), CompilerError> {
         let value = self.builder.build_global_string_ptr(&string, "str")?;
+        let size = self
+            .context
+            .i64_type()
+            .const_int((string.len() + 1) as u64, false);
+        let output_buffer =
+            self.builder
+                .build_array_malloc(self.context.i8_type(), size, "output_buffer")?;
+        self.builder
+            .build_memcpy(output_buffer, 1, value.as_pointer_value(), 1, size)?;
         stack.push((
             UnitType::Literal(LiteralType::String),
             self.ref_count
-                .create_with_const_len(
-                    &self.builder,
-                    UnitType::Literal(LiteralType::String),
-                    value.as_pointer_value(),
-                    (string.len() + 1) as u64,
-                )?
+                .create(&self.builder, output_buffer)?
                 .as_basic_value_enum(),
         ));
         Ok(())
@@ -1125,6 +1057,7 @@ impl<'ctx> CompilerContext<'ctx> {
                     phi.add_incoming(values.as_slice());
                     stack.push((ty.0, phi.as_basic_value()));
                 }
+                self.drop_value(match_value.clone().1)?;
                 Ok(())
             }
             other => return Err(CompilerError::UnsupportedType(other)),
@@ -1529,6 +1462,4 @@ pub enum CompilerError {
     ImportNotFound,
     #[error("Unsupported type")]
     UnsupportedType(UnitType),
-    #[error("Missing else block")]
-    MissingElseBlock,
 }

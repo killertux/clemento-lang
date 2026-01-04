@@ -22,24 +22,27 @@ pub fn builtins_functions<'ctx>(
     context: &CompilerContext<'ctx>,
     module: &Module<'ctx>,
 ) -> Vec<InternalFunction<'ctx>> {
-    let ptr_type = context.context.ptr_type(AddressSpace::default());
-    let printf_type = context.context.i32_type().fn_type(&[ptr_type.into()], true);
-    module.add_function("printf", printf_type, None);
-    let strcmp_type = context
-        .context
-        .i32_type()
-        .fn_type(&[ptr_type.into(), ptr_type.into()], false);
-    module.add_function("strcmp", strcmp_type, None);
-    let sprintf_type = context
-        .context
-        .i32_type()
-        .fn_type(&[ptr_type.into(), ptr_type.into()], true);
-    module.add_function("sprintf", sprintf_type, None);
-    let strlen_type = context
-        .context
-        .i64_type()
-        .fn_type(&[ptr_type.into()], false);
-    module.add_function("strlen", strlen_type, None);
+    if let None = module.get_function("printf") {
+        let ptr_type = context.context.ptr_type(AddressSpace::default());
+        let printf_type = context.context.i32_type().fn_type(&[ptr_type.into()], true);
+        module.add_function("printf", printf_type, None);
+        let strcmp_type = context
+            .context
+            .i32_type()
+            .fn_type(&[ptr_type.into(), ptr_type.into()], false);
+        module.add_function("strcmp", strcmp_type, None);
+        let sprintf_type = context
+            .context
+            .i32_type()
+            .fn_type(&[ptr_type.into(), ptr_type.into()], true);
+        module.add_function("sprintf", sprintf_type, None);
+        let strlen_type = context
+            .context
+            .i64_type()
+            .fn_type(&[ptr_type.into()], false);
+        module.add_function("strlen", strlen_type, None);
+    }
+
     let boolean_type = context
         .get_type(vec!["std".into(), "boolean".into(), "Boolean".into()])
         .map(|t| UnitType::Custom {
@@ -106,29 +109,40 @@ pub fn builtins_functions<'ctx>(
                                 BasicValueEnum::PointerValue(p2),
                             ),
                         ) => {
-                            let string1_size = compiler_context.get_ptr_len(*p1)?;
-                            let string2_size = compiler_context.get_ptr_len(*p2)?;
+                            let strlen = compiler_context
+                                .module
+                                .get_function("strlen")
+                                .ok_or(CompilerError::GetFunctionError("strlen".into()))?;
+                            let string1_size = compiler_context.builder.build_call(
+                                strlen,
+                                &[compiler_context.get_ptr_ptr(*p1)?.into()],
+                                "strlen_result_p1",
+                            )?;
+                            let string1_size = string1_size.try_as_basic_value().left().unwrap();
+                            let string2_size = compiler_context.builder.build_call(
+                                strlen,
+                                &[compiler_context.get_ptr_ptr(*p2)?.into()],
+                                "strlen_result_p1",
+                            )?;
+                            let string2_size = string2_size.try_as_basic_value().left().unwrap();
                             let new_string_size = compiler_context.builder.build_int_add(
-                                string1_size,
-                                string2_size,
+                                string1_size.into_int_value(),
+                                string2_size.into_int_value(),
                                 "new_string_size",
                             )?;
-                            let new_string_size = compiler_context.builder.build_int_sub(
+                            let new_string_size = compiler_context.builder.build_int_add(
                                 new_string_size,
                                 compiler_context.context.i64_type().const_int(1, false),
-                                "new_string_size_minus_one",
+                                "new_string_size_plus_one",
                             )?;
                             let output_buffer = compiler_context.builder.build_array_malloc(
                                 compiler_context.context.i8_type(),
                                 new_string_size,
                                 "output_buffer",
                             )?;
-                            let ref_count = compiler_context.ref_count.create(
-                                &compiler_context.builder,
-                                UnitType::Literal(LiteralType::String),
-                                output_buffer,
-                                new_string_size,
-                            )?;
+                            let ref_count = compiler_context
+                                .ref_count
+                                .create(&compiler_context.builder, output_buffer)?;
                             let format_str = compiler_context
                                 .builder
                                 .build_global_string_ptr("%s%s", "concat_fmt")?
@@ -180,12 +194,9 @@ pub fn builtins_functions<'ctx>(
                                 compiler_context.context.i8_type().array_type(40),
                                 "output_buffer",
                             )?;
-                            let ref_count = compiler_context.ref_count.create_with_const_len(
-                                &compiler_context.builder,
-                                UnitType::Literal(LiteralType::String),
-                                output_buffer,
-                                40,
-                            )?;
+                            let ref_count = compiler_context
+                                .ref_count
+                                .create(&compiler_context.builder, output_buffer)?;
                             let format_str = compiler_context
                                 .builder
                                 .build_global_string_ptr(format_str, "int_fmt")?
@@ -3796,11 +3807,8 @@ fn create_boolean_result<'ctx>(
         name: ty.name.clone(),
         generic_types: vec![],
     };
-    let ref_count = compiler_context.ref_count.create_with_const_len(
-        &compiler_context.builder,
-        ty.clone(),
-        struct_val,
-        0,
-    )?;
+    let ref_count = compiler_context
+        .ref_count
+        .create(&compiler_context.builder, struct_val)?;
     Ok((ty, ref_count.as_basic_value_enum()))
 }
