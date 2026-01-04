@@ -2,7 +2,6 @@ use std::rc::Rc;
 
 use inkwell::{
     AddressSpace, IntPredicate,
-    module::Module,
     values::{BasicValue, BasicValueEnum},
 };
 
@@ -19,28 +18,27 @@ pub struct InternalFunction<'ctx> {
 }
 
 pub fn builtins_functions<'ctx>(
-    context: &CompilerContext<'ctx>,
-    module: &Module<'ctx>,
+    context: &mut CompilerContext<'ctx>,
 ) -> Vec<InternalFunction<'ctx>> {
-    if let None = module.get_function("printf") {
+    if let None = context.module.get_function("printf") {
         let ptr_type = context.context.ptr_type(AddressSpace::default());
         let printf_type = context.context.i32_type().fn_type(&[ptr_type.into()], true);
-        module.add_function("printf", printf_type, None);
+        context.module.add_function("printf", printf_type, None);
         let strcmp_type = context
             .context
             .i32_type()
             .fn_type(&[ptr_type.into(), ptr_type.into()], false);
-        module.add_function("strcmp", strcmp_type, None);
+        context.module.add_function("strcmp", strcmp_type, None);
         let sprintf_type = context
             .context
             .i32_type()
             .fn_type(&[ptr_type.into(), ptr_type.into()], true);
-        module.add_function("sprintf", sprintf_type, None);
+        context.module.add_function("sprintf", sprintf_type, None);
         let strlen_type = context
             .context
             .i64_type()
             .fn_type(&[ptr_type.into()], false);
-        module.add_function("strlen", strlen_type, None);
+        context.module.add_function("strlen", strlen_type, None);
     }
 
     let boolean_type = context
@@ -93,7 +91,7 @@ pub fn builtins_functions<'ctx>(
                 vec![UnitType::Literal(LiteralType::String)],
             ),
             function: Rc::new(Box::new(
-                |compiler_context: &CompilerContext<'ctx>,
+                |compiler_context: &mut CompilerContext<'ctx>,
                  stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> {
                     let value1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
@@ -143,10 +141,7 @@ pub fn builtins_functions<'ctx>(
                             let ref_count = compiler_context
                                 .ref_count
                                 .create(&compiler_context.builder, output_buffer)?;
-                            let format_str = compiler_context
-                                .builder
-                                .build_global_string_ptr("%s%s", "concat_fmt")?
-                                .as_pointer_value();
+                            let format_str = compiler_context.build_global_string("%s%s".into())?;
                             let sprintf = compiler_context
                                 .module
                                 .get_function("sprintf")
@@ -180,7 +175,7 @@ pub fn builtins_functions<'ctx>(
             Some(UnitType::Literal(LiteralType::String)),
             "to_string".into(),
             Rc::new(Box::new(
-                |compiler_context: &CompilerContext<'ctx>,
+                |compiler_context: &mut CompilerContext<'ctx>,
                  stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> {
                     let value = stack.pop().ok_or(CompilerError::StackUnderflow)?;
@@ -197,10 +192,8 @@ pub fn builtins_functions<'ctx>(
                             let ref_count = compiler_context
                                 .ref_count
                                 .create(&compiler_context.builder, output_buffer)?;
-                            let format_str = compiler_context
-                                .builder
-                                .build_global_string_ptr(format_str, "int_fmt")?
-                                .as_pointer_value();
+                            let format_str =
+                                compiler_context.build_global_string(format_str.into())?;
                             let sprintf = compiler_context
                                 .module
                                 .get_function("sprintf")
@@ -221,15 +214,12 @@ pub fn builtins_functions<'ctx>(
             &all_literal_types_minus_128_bits,
             "print".into(),
             Rc::new(Box::new(
-                |compiler_context: &CompilerContext<'ctx>,
+                |compiler_context: &mut CompilerContext<'ctx>,
                  stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> {
                     let value = stack.pop().ok_or(CompilerError::StackUnderflow)?;
                     let format_str = get_format_str(value.0)?;
-                    let format_str = compiler_context
-                        .builder
-                        .build_global_string_ptr(format_str, "int_fmt")?
-                        .as_pointer_value();
+                    let format_str = compiler_context.build_global_string(format_str.into())?;
                     let printf = compiler_context
                         .module
                         .get_function("printf")
@@ -249,15 +239,12 @@ pub fn builtins_functions<'ctx>(
             &all_literal_types_minus_128_bits,
             "println".into(),
             Rc::new(Box::new(
-                |compiler_context: &CompilerContext<'ctx>,
+                |compiler_context: &mut CompilerContext<'ctx>,
                  stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> {
                     let value = stack.pop().ok_or(CompilerError::StackUnderflow)?;
                     let format_str = format!("{}\n", get_format_str(value.0)?);
-                    let format_str = compiler_context
-                        .builder
-                        .build_global_string_ptr(&format_str, "int_fmt")?
-                        .as_pointer_value();
+                    let format_str = compiler_context.build_global_string(format_str)?;
                     let printf = compiler_context
                         .module
                         .get_function("printf")
@@ -283,7 +270,7 @@ pub fn builtins_functions<'ctx>(
                 )
             },
             function: Rc::new(Box::new(
-                |compiler_context: &CompilerContext<'ctx>,
+                |compiler_context: &mut CompilerContext<'ctx>,
                  stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> {
                     let value = stack.pop().ok_or(CompilerError::StackUnderflow)?;
@@ -303,7 +290,7 @@ pub fn builtins_functions<'ctx>(
                 )
             },
             function: Rc::new(Box::new(
-                |_compiler_context: &CompilerContext<'ctx>,
+                |_compiler_context: &mut CompilerContext<'ctx>,
                  _stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> { Ok(()) },
             ) as BoxDefinitionType<'ctx>),
@@ -324,7 +311,7 @@ pub fn builtins_functions<'ctx>(
                 )
             },
             function: Rc::new(Box::new(
-                |compiler_context: &CompilerContext<'ctx>,
+                |compiler_context: &mut CompilerContext<'ctx>,
                  stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> {
                     let value1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
@@ -349,7 +336,7 @@ pub fn builtins_functions<'ctx>(
                 )
             },
             function: Rc::new(Box::new(
-                |_compiler_context: &CompilerContext<'ctx>,
+                |_compiler_context: &mut CompilerContext<'ctx>,
                  stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> {
                     let value1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
@@ -381,7 +368,7 @@ pub fn builtins_functions<'ctx>(
                 )
             },
             function: Rc::new(Box::new(
-                |_compiler_context: &CompilerContext<'ctx>,
+                |_compiler_context: &mut CompilerContext<'ctx>,
                  stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> {
                     let value1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
@@ -399,7 +386,7 @@ pub fn builtins_functions<'ctx>(
             name: "drop".into(),
             ty: Type::new(vec![UnitType::Var(VarType::new())], vec![]),
             function: Rc::new(Box::new(
-                |compiler_context: &CompilerContext<'ctx>,
+                |compiler_context: &mut CompilerContext<'ctx>,
                  stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> {
                     let value = stack.pop().ok_or(CompilerError::StackUnderflow)?;
@@ -415,7 +402,7 @@ pub fn builtins_functions<'ctx>(
                 vec![],
             ),
             function: Rc::new(Box::new(
-                |compiler_context: &CompilerContext<'ctx>,
+                |compiler_context: &mut CompilerContext<'ctx>,
                  stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> {
                     let value1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
@@ -435,7 +422,7 @@ pub fn builtins_functions<'ctx>(
                 )
             },
             function: Rc::new(Box::new(
-                |compiler_context: &CompilerContext<'ctx>,
+                |compiler_context: &mut CompilerContext<'ctx>,
                  stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> {
                     let arg1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
@@ -500,7 +487,7 @@ pub fn builtins_functions<'ctx>(
             None,
             "+".into(),
             Rc::new(Box::new(
-                |compiler_context: &CompilerContext<'ctx>,
+                |compiler_context: &mut CompilerContext<'ctx>,
                  stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> {
                     let arg1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
@@ -726,7 +713,7 @@ pub fn builtins_functions<'ctx>(
             None,
             "-".into(),
             Rc::new(Box::new(
-                |compiler_context: &CompilerContext<'ctx>,
+                |compiler_context: &mut CompilerContext<'ctx>,
                  stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> {
                     let arg1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
@@ -952,7 +939,7 @@ pub fn builtins_functions<'ctx>(
             None,
             "*".into(),
             Rc::new(Box::new(
-                |compiler_context: &CompilerContext<'ctx>,
+                |compiler_context: &mut CompilerContext<'ctx>,
                  stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> {
                     let arg1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
@@ -1178,7 +1165,7 @@ pub fn builtins_functions<'ctx>(
             None,
             "/".into(),
             Rc::new(Box::new(
-                |compiler_context: &CompilerContext<'ctx>,
+                |compiler_context: &mut CompilerContext<'ctx>,
                  stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> {
                     let arg1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
@@ -1415,7 +1402,7 @@ pub fn builtins_functions<'ctx>(
             Some(boolean_type.clone()),
             "gt".into(),
             Rc::new(Box::new(
-                |compiler_context: &CompilerContext<'ctx>,
+                |compiler_context: &mut CompilerContext<'ctx>,
                  stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> {
                     let arg1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
@@ -1712,7 +1699,7 @@ pub fn builtins_functions<'ctx>(
             Some(boolean_type.clone()),
             "lt".into(),
             Rc::new(Box::new(
-                |compiler_context: &CompilerContext<'ctx>,
+                |compiler_context: &mut CompilerContext<'ctx>,
                  stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> {
                     let arg1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
@@ -2008,7 +1995,7 @@ pub fn builtins_functions<'ctx>(
             Some(boolean_type.clone()),
             "=".into(),
             Rc::new(Box::new(
-                |compiler_context: &CompilerContext<'ctx>,
+                |compiler_context: &mut CompilerContext<'ctx>,
                  stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> {
                     let arg1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
@@ -2304,7 +2291,7 @@ pub fn builtins_functions<'ctx>(
             Some(boolean_type.clone()),
             "!=".into(),
             Rc::new(Box::new(
-                |compiler_context: &CompilerContext<'ctx>,
+                |compiler_context: &mut CompilerContext<'ctx>,
                  stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> {
                     let arg1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
@@ -2601,7 +2588,7 @@ pub fn builtins_functions<'ctx>(
 
 fn rem<'ctx>() -> Vec<InternalFunction<'ctx>> {
     let function = Rc::new(Box::new(
-        |compiler_context: &CompilerContext<'ctx>,
+        |compiler_context: &mut CompilerContext<'ctx>,
          stack: &mut Stack<'ctx>|
          -> Result<(), CompilerError> {
             let i8_type = compiler_context.context.i8_type();
@@ -3785,7 +3772,7 @@ fn pop2_push1<'ctx>(
 }
 
 fn create_boolean_result<'ctx>(
-    compiler_context: &CompilerContext<'ctx>,
+    compiler_context: &mut CompilerContext<'ctx>,
     value: BasicValueEnum<'ctx>,
 ) -> Result<(UnitType, BasicValueEnum<'ctx>), CompilerError> {
     let boolean_struct_type = compiler_context

@@ -18,7 +18,7 @@ use inkwell::{
 use thiserror::Error;
 
 use crate::{
-    internal_functions::{InternalFunction, builtins_functions},
+    internal_functions::builtins_functions,
     lexer::{IntegerNumber, Number, Position},
     parser::{
         AstNode, AstNodeType, LiteralType, NumberType, Parser, ParserError, Pattern, Type,
@@ -31,11 +31,10 @@ pub struct CompilerContext<'ctx> {
     pub context: &'ctx Context,
     pub module: Module<'ctx>,
     pub builder: Builder<'ctx>,
-    pub internal_functions:
-        Box<dyn Fn(&Module<'ctx>, &CompilerContext<'ctx>) -> Vec<InternalFunction<'ctx>> + 'ctx>,
     pub imports: HashMap<String, Scope<'ctx>>,
     pub ref_count: RefCount<'ctx>,
     pub type_definitions: HashMap<Vec<String>, CustomType>,
+    pub global_strings: HashMap<String, PointerValue<'ctx>>,
 }
 
 pub fn compile(file: impl AsRef<Path>) -> Result<PathBuf, CompilerError> {
@@ -109,20 +108,15 @@ impl<'ctx> CompilerContext<'ctx> {
     pub fn new(context: &'ctx Context) -> Self {
         let module = context.create_module("std");
         let builder = context.create_builder();
-        let internal_functions = Box::new(
-            move |module: &Module<'ctx>, context: &CompilerContext<'ctx>| {
-                builtins_functions(context, &module)
-            },
-        );
 
         Self {
             context,
             module,
             builder,
-            internal_functions,
             imports: HashMap::new(),
             ref_count: RefCount::new(context),
             type_definitions: HashMap::new(),
+            global_strings: HashMap::new(),
         }
     }
 
@@ -271,8 +265,7 @@ impl<'ctx> CompilerContext<'ctx> {
                 name: symbol, body, ..
             } => self.compile_definition(scope, &symbol, *body, module_path),
             AstNodeType::ExternalDefinition(symbol, ty) => {
-                let internal_functions = &self.internal_functions;
-                for function in &internal_functions(&self.module, &self) {
+                for function in builtins_functions(self) {
                     if function.name == symbol && match_types(&ty.pop_types, &function.ty.pop_types)
                     {
                         let fun = function.function.clone();
@@ -362,7 +355,7 @@ impl<'ctx> CompilerContext<'ctx> {
                                     return Err(CompilerError::UnexpectedType);
                                 };
                                 let generics_map = generics.iter().map(|generic| generic.1.clone()).zip(generic_types.iter().cloned()).collect::<HashMap<_, _>>();
-                                definitions.push((ty.clone(), Rc::new(Box::new(move |compiler_context: &CompilerContext<'ctx>,
+                                definitions.push((ty.clone(), Rc::new(Box::new(move |compiler_context: &mut CompilerContext<'ctx>,
                                       stack: &mut Stack<'ctx>|
                                       -> Result<(), CompilerError> {
                                         let variant_struct = custom_type_variant_struct(variant.clone(), generics_map.clone(), compiler_context)?;
@@ -594,7 +587,7 @@ impl<'ctx> CompilerContext<'ctx> {
                         definitions.push((
                             ty.clone(),
                             Rc::new(Box::new(
-                                move |compiler_context: &CompilerContext<'ctx>,
+                                move |compiler_context: &mut CompilerContext<'ctx>,
                                       stack: &mut Stack<'ctx>|
                                       -> Result<(), CompilerError> {
                                     call_function(
@@ -736,17 +729,34 @@ impl<'ctx> CompilerContext<'ctx> {
         }
     }
 
-    fn compile_string(&self, stack: &mut Stack<'ctx>, string: String) -> Result<(), CompilerError> {
-        let value = self.builder.build_global_string_ptr(&string, "str")?;
-        let size = self
-            .context
-            .i64_type()
-            .const_int((string.len() + 1) as u64, false);
+    pub fn build_global_string(
+        &mut self,
+        string: String,
+    ) -> Result<PointerValue<'ctx>, CompilerError> {
+        match self.global_strings.get(&string) {
+            Some(value) => Ok(*value),
+            None => {
+                let value = self.builder.build_global_string_ptr(&string, "str")?;
+                let pointer = value.as_pointer_value();
+                self.global_strings.insert(string, pointer);
+                Ok(pointer)
+            }
+        }
+    }
+
+    fn compile_string(
+        &mut self,
+        stack: &mut Stack<'ctx>,
+        string: String,
+    ) -> Result<(), CompilerError> {
+        let len = string.len();
+        let value = self.build_global_string(string)?;
+        let size = self.context.i64_type().const_int((len + 1) as u64, false);
         let output_buffer =
             self.builder
                 .build_array_malloc(self.context.i8_type(), size, "output_buffer")?;
         self.builder
-            .build_memcpy(output_buffer, 1, value.as_pointer_value(), 1, size)?;
+            .build_memcpy(output_buffer, 1, value, 1, size)?;
         stack.push((
             UnitType::Literal(LiteralType::String),
             self.ref_count
@@ -1123,7 +1133,7 @@ impl<'ctx> Stack<'ctx> {
 }
 
 pub type BoxDefinitionType<'ctx> =
-    Box<dyn Fn(&CompilerContext<'ctx>, &mut Stack<'ctx>) -> Result<(), CompilerError> + 'ctx>;
+    Box<dyn Fn(&mut CompilerContext<'ctx>, &mut Stack<'ctx>) -> Result<(), CompilerError> + 'ctx>;
 pub type DefinitionType<'ctx> = Rc<BoxDefinitionType<'ctx>>;
 
 #[derive(Clone)]
