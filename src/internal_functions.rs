@@ -113,13 +113,17 @@ pub fn builtins_functions<'ctx>(
                                 .ok_or(CompilerError::GetFunctionError("strlen".into()))?;
                             let string1_size = compiler_context.builder.build_call(
                                 strlen,
-                                &[compiler_context.get_ptr_ptr(*p1)?.into()],
+                                &[compiler_context
+                                    .deref_rc_if_necessary(p1.as_basic_value_enum())?
+                                    .into()],
                                 "strlen_result_p1",
                             )?;
                             let string1_size = string1_size.try_as_basic_value().left().unwrap();
                             let string2_size = compiler_context.builder.build_call(
                                 strlen,
-                                &[compiler_context.get_ptr_ptr(*p2)?.into()],
+                                &[compiler_context
+                                    .deref_rc_if_necessary(p2.as_basic_value_enum())?
+                                    .into()],
                                 "strlen_result_p1",
                             )?;
                             let string2_size = string2_size.try_as_basic_value().left().unwrap();
@@ -138,9 +142,8 @@ pub fn builtins_functions<'ctx>(
                                 new_string_size,
                                 "output_buffer",
                             )?;
-                            let ref_count = compiler_context
-                                .ref_count
-                                .create(&compiler_context.builder, output_buffer)?;
+                            let ref_count =
+                                compiler_context.create_ref_counted_pointer(output_buffer)?;
                             let format_str = compiler_context.build_global_string("%s%s".into())?;
                             let sprintf = compiler_context
                                 .module
@@ -161,8 +164,8 @@ pub fn builtins_functions<'ctx>(
                                 "call_sprintf",
                             )?;
                             stack.push((UnitType::Literal(LiteralType::String), ref_count.into()));
-                            compiler_context.drop_value(value1.1)?;
-                            compiler_context.drop_value(value2.1)?;
+                            compiler_context.drop_value(value1.0, value1.1)?;
+                            compiler_context.drop_value(value2.0, value2.1)?;
                         }
                         _other => return Err(CompilerError::FunctionCallError),
                     }
@@ -189,9 +192,8 @@ pub fn builtins_functions<'ctx>(
                                 compiler_context.context.i8_type().array_type(40),
                                 "output_buffer",
                             )?;
-                            let ref_count = compiler_context
-                                .ref_count
-                                .create(&compiler_context.builder, output_buffer)?;
+                            let ref_count =
+                                compiler_context.create_ref_counted_pointer(output_buffer)?;
                             let format_str =
                                 compiler_context.build_global_string(format_str.into())?;
                             let sprintf = compiler_context
@@ -218,7 +220,7 @@ pub fn builtins_functions<'ctx>(
                  stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> {
                     let value = stack.pop().ok_or(CompilerError::StackUnderflow)?;
-                    let format_str = get_format_str(value.0)?;
+                    let format_str = get_format_str(value.0.clone())?;
                     let format_str = compiler_context.build_global_string(format_str.into())?;
                     let printf = compiler_context
                         .module
@@ -230,7 +232,7 @@ pub fn builtins_functions<'ctx>(
                         &[format_str.into(), deref_value.into()],
                         "printf_call",
                     )?;
-                    compiler_context.drop_value(value.1)?;
+                    compiler_context.drop_value(value.0, value.1)?;
                     Ok(())
                 },
             ) as BoxDefinitionType<'ctx>),
@@ -243,7 +245,7 @@ pub fn builtins_functions<'ctx>(
                  stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> {
                     let value = stack.pop().ok_or(CompilerError::StackUnderflow)?;
-                    let format_str = format!("{}\n", get_format_str(value.0)?);
+                    let format_str = format!("{}\n", get_format_str(value.0.clone())?);
                     let format_str = compiler_context.build_global_string(format_str)?;
                     let printf = compiler_context
                         .module
@@ -255,7 +257,7 @@ pub fn builtins_functions<'ctx>(
                         &[format_str.into(), deref_value.into()],
                         "printf_call",
                     )?;
-                    compiler_context.drop_value(value.1)?;
+                    compiler_context.drop_value(value.0, value.1)?;
                     Ok(())
                 },
             ) as BoxDefinitionType<'ctx>),
@@ -275,7 +277,10 @@ pub fn builtins_functions<'ctx>(
                  -> Result<(), CompilerError> {
                     let value = stack.pop().ok_or(CompilerError::StackUnderflow)?;
                     stack.push(value.clone());
-                    stack.push((value.0, compiler_context.clone_value(value.1)?));
+                    stack.push((
+                        value.0.clone(),
+                        compiler_context.clone_value(value.0, value.1)?,
+                    ));
                     Ok(())
                 },
             ) as BoxDefinitionType<'ctx>),
@@ -319,8 +324,14 @@ pub fn builtins_functions<'ctx>(
 
                     stack.push(value2.clone());
                     stack.push(value1.clone());
-                    stack.push((value2.0, compiler_context.clone_value(value2.1)?));
-                    stack.push((value1.0, compiler_context.clone_value(value1.1)?));
+                    stack.push((
+                        value2.0.clone(),
+                        compiler_context.clone_value(value2.0, value2.1)?,
+                    ));
+                    stack.push((
+                        value1.0.clone(),
+                        compiler_context.clone_value(value1.0, value1.1)?,
+                    ));
                     Ok(())
                 },
             ) as BoxDefinitionType<'ctx>),
@@ -390,7 +401,7 @@ pub fn builtins_functions<'ctx>(
                  stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> {
                     let value = stack.pop().ok_or(CompilerError::StackUnderflow)?;
-                    compiler_context.drop_value(value.1)?;
+                    compiler_context.drop_value(value.0, value.1)?;
                     Ok(())
                 },
             ) as BoxDefinitionType<'ctx>),
@@ -406,9 +417,9 @@ pub fn builtins_functions<'ctx>(
                  stack: &mut Stack<'ctx>|
                  -> Result<(), CompilerError> {
                     let value1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
-                    compiler_context.drop_value(value1.1)?;
+                    compiler_context.drop_value(value1.0, value1.1)?;
                     let value2 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
-                    compiler_context.drop_value(value2.1)?;
+                    compiler_context.drop_value(value2.0, value2.1)?;
                     Ok(())
                 },
             ) as BoxDefinitionType<'ctx>),
@@ -427,25 +438,23 @@ pub fn builtins_functions<'ctx>(
                  -> Result<(), CompilerError> {
                     let arg1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
                     let arg2 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
-                    match (arg1, arg2) {
+                    match (&arg1, &arg2) {
                         (
                             (UnitType::Custom { .. }, BasicValueEnum::PointerValue(n1)),
                             (UnitType::Custom { .. }, BasicValueEnum::PointerValue(n2)),
                         ) => {
-                            let boolean_struct_type = compiler_context
-                                .context
-                                .struct_type(&[compiler_context.context.i8_type().into()], true);
-                            let boolean_1 = compiler_context.get_ptr_ptr(n1)?;
-                            let boolean_2 = compiler_context.get_ptr_ptr(n2)?;
+                            let boolean_struct_type = compiler_context.base_custom_type();
+                            let boolean_1 = *n1;
+                            let boolean_2 = *n2;
 
                             let field_ptr = compiler_context.builder.build_struct_gep(
                                 boolean_struct_type,
                                 boolean_1,
-                                0,
+                                1,
                                 "field_ptr",
                             )?;
                             let boolean_1 = compiler_context.builder.build_load(
-                                compiler_context.context.i8_type(),
+                                compiler_context.context.i64_type(),
                                 field_ptr,
                                 "field_value",
                             )?;
@@ -453,11 +462,11 @@ pub fn builtins_functions<'ctx>(
                             let field_ptr = compiler_context.builder.build_struct_gep(
                                 boolean_struct_type,
                                 boolean_2,
-                                0,
+                                1,
                                 "field_ptr",
                             )?;
                             let boolean_2 = compiler_context.builder.build_load(
-                                compiler_context.context.i8_type(),
+                                compiler_context.context.i64_type(),
                                 field_ptr,
                                 "field_value",
                             )?;
@@ -468,8 +477,10 @@ pub fn builtins_functions<'ctx>(
                                 "and_result",
                             )?;
 
-                            compiler_context.drop_value(n1.as_basic_value_enum())?;
-                            compiler_context.drop_value(n2.as_basic_value_enum())?;
+                            compiler_context
+                                .drop_value(arg1.0.clone(), n1.as_basic_value_enum())?;
+                            compiler_context
+                                .drop_value(arg2.0.clone(), n2.as_basic_value_enum())?;
 
                             stack.push(create_boolean_result(
                                 compiler_context,
@@ -1685,8 +1696,14 @@ pub fn builtins_functions<'ctx>(
                                 compiler_context,
                                 result.as_basic_value_enum(),
                             )?);
-                            compiler_context.drop_value(n1.as_basic_value_enum())?;
-                            compiler_context.drop_value(n2.as_basic_value_enum())?;
+                            compiler_context.drop_value(
+                                UnitType::Literal(LiteralType::String),
+                                n1.as_basic_value_enum(),
+                            )?;
+                            compiler_context.drop_value(
+                                UnitType::Literal(LiteralType::String),
+                                n2.as_basic_value_enum(),
+                            )?;
                         }
                         _ => return Err(CompilerError::UnexpectedType),
                     }
@@ -1981,8 +1998,14 @@ pub fn builtins_functions<'ctx>(
                                 compiler_context,
                                 result.as_basic_value_enum(),
                             )?);
-                            compiler_context.drop_value(n1.as_basic_value_enum())?;
-                            compiler_context.drop_value(n2.as_basic_value_enum())?;
+                            compiler_context.drop_value(
+                                UnitType::Literal(LiteralType::String),
+                                n1.as_basic_value_enum(),
+                            )?;
+                            compiler_context.drop_value(
+                                UnitType::Literal(LiteralType::String),
+                                n2.as_basic_value_enum(),
+                            )?;
                         }
                         _ => return Err(CompilerError::UnexpectedType),
                     }
@@ -2277,8 +2300,14 @@ pub fn builtins_functions<'ctx>(
                                 compiler_context,
                                 result.as_basic_value_enum(),
                             )?);
-                            compiler_context.drop_value(n1.as_basic_value_enum())?;
-                            compiler_context.drop_value(n2.as_basic_value_enum())?;
+                            compiler_context.drop_value(
+                                UnitType::Literal(LiteralType::String),
+                                n1.as_basic_value_enum(),
+                            )?;
+                            compiler_context.drop_value(
+                                UnitType::Literal(LiteralType::String),
+                                n2.as_basic_value_enum(),
+                            )?;
                         }
                         _ => return Err(CompilerError::UnexpectedType),
                     }
@@ -2573,8 +2602,14 @@ pub fn builtins_functions<'ctx>(
                                 compiler_context,
                                 result.as_basic_value_enum(),
                             )?);
-                            compiler_context.drop_value(n1.as_basic_value_enum())?;
-                            compiler_context.drop_value(n2.as_basic_value_enum())?;
+                            compiler_context.drop_value(
+                                UnitType::Literal(LiteralType::String),
+                                n1.as_basic_value_enum(),
+                            )?;
+                            compiler_context.drop_value(
+                                UnitType::Literal(LiteralType::String),
+                                n2.as_basic_value_enum(),
+                            )?;
                         }
                         _ => return Err(CompilerError::UnexpectedType),
                     }
@@ -3775,17 +3810,34 @@ fn create_boolean_result<'ctx>(
     compiler_context: &mut CompilerContext<'ctx>,
     value: BasicValueEnum<'ctx>,
 ) -> Result<(UnitType, BasicValueEnum<'ctx>), CompilerError> {
-    let boolean_struct_type = compiler_context
-        .context
-        .struct_type(&[compiler_context.context.i8_type().into()], true);
-    let struct_val = compiler_context
-        .builder
-        .build_malloc(boolean_struct_type, "struct_value")?;
+    let boolean_struct_type = compiler_context.base_custom_type();
+    let struct_val = compiler_context.builder.build_array_malloc(
+        compiler_context.context.i8_type(),
+        boolean_struct_type
+            .size_of()
+            .expect("Should have a known size"),
+        "struct_value",
+    )?;
     let field_ptr =
         compiler_context
             .builder
-            .build_struct_gep(boolean_struct_type, struct_val, 0, "variant")?;
-    compiler_context.builder.build_store(field_ptr, value)?;
+            .build_struct_gep(boolean_struct_type, struct_val, 0, "rc")?;
+    compiler_context.builder.build_store(
+        field_ptr,
+        compiler_context.context.i64_type().const_int(1, true),
+    )?;
+    let field_ptr =
+        compiler_context
+            .builder
+            .build_struct_gep(boolean_struct_type, struct_val, 1, "variant")?;
+    let bool_i8 = compiler_context.builder.build_int_z_extend(
+        value.into_int_value(),
+        compiler_context.context.i64_type(),
+        "bool_i8",
+    )?;
+    compiler_context
+        .builder
+        .build_store(field_ptr, bool_i8.as_basic_value_enum())?;
 
     let ty = compiler_context
         .get_type(vec!["std".into(), "boolean".into(), "Boolean".into()])
@@ -3794,8 +3846,6 @@ fn create_boolean_result<'ctx>(
         name: ty.name.clone(),
         generic_types: vec![],
     };
-    let ref_count = compiler_context
-        .ref_count
-        .create(&compiler_context.builder, struct_val)?;
-    Ok((ty, ref_count.as_basic_value_enum()))
+
+    Ok((ty, struct_val.as_basic_value_enum()))
 }

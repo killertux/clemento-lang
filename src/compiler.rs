@@ -12,7 +12,7 @@ use inkwell::{
     builder::{Builder, BuilderError},
     context::Context,
     module::Module,
-    types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, IntType, PointerType, StructType},
+    types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, StructType},
     values::{AggregateValue, BasicValue, BasicValueEnum, PointerValue},
 };
 use thiserror::Error;
@@ -32,7 +32,6 @@ pub struct CompilerContext<'ctx> {
     pub module: Module<'ctx>,
     pub builder: Builder<'ctx>,
     pub imports: HashMap<String, Scope<'ctx>>,
-    pub ref_count: RefCount<'ctx>,
     pub type_definitions: HashMap<Vec<String>, CustomType>,
     pub global_strings: HashMap<String, PointerValue<'ctx>>,
 }
@@ -68,42 +67,6 @@ pub fn compile(file: impl AsRef<Path>) -> Result<PathBuf, CompilerError> {
     Ok(output_path)
 }
 
-pub struct RefCount<'ctx> {
-    ref_count_type: IntType<'ctx>,
-    ptr_type: PointerType<'ctx>,
-    ref_count_struct: StructType<'ctx>,
-}
-
-impl<'ctx> RefCount<'ctx> {
-    pub fn new(context: &'ctx Context) -> Self {
-        let ref_count_type = context.i64_type();
-        let ptr_type = context.ptr_type(AddressSpace::default());
-        let ref_count_struct = context.struct_type(&[ref_count_type.into(), ptr_type.into()], true);
-        Self {
-            ref_count_type,
-            ptr_type,
-            ref_count_struct,
-        }
-    }
-
-    pub fn create(
-        &self,
-        builder: &Builder<'ctx>,
-        ptr: PointerValue<'ctx>,
-    ) -> Result<PointerValue<'ctx>, CompilerError> {
-        let ref_count_type = self.ref_count_type;
-        let ref_count_struct = self.ref_count_struct;
-
-        let struct_val = builder.build_malloc(ref_count_struct, "struct_value")?;
-        let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 0, "rc")?;
-        builder.build_store(field_ptr, ref_count_type.const_int(1, false))?;
-        let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 1, "ptr")?;
-        builder.build_store(field_ptr, ptr)?;
-
-        Ok(struct_val)
-    }
-}
-
 impl<'ctx> CompilerContext<'ctx> {
     pub fn new(context: &'ctx Context) -> Self {
         let module = context.create_module("std");
@@ -114,34 +77,67 @@ impl<'ctx> CompilerContext<'ctx> {
             module,
             builder,
             imports: HashMap::new(),
-            ref_count: RefCount::new(context),
             type_definitions: HashMap::new(),
             global_strings: HashMap::new(),
         }
     }
 
-    pub fn drop_value(&self, value: BasicValueEnum<'ctx>) -> Result<(), CompilerError> {
-        match value {
-            BasicValueEnum::PointerValue(ptr) => {
-                let rc_field_ptr = self.builder.build_struct_gep(
-                    self.ref_count.ref_count_struct,
-                    ptr,
-                    0,
-                    "ref_count",
-                )?;
+    pub fn create_ref_counted_pointer(
+        &self,
+        value: PointerValue<'ctx>,
+    ) -> Result<PointerValue<'ctx>, CompilerError> {
+        let ref_count_type = self.context.i64_type();
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let ref_count_struct = self
+            .context
+            .struct_type(&[ref_count_type.into(), ptr_type.into()], true);
+
+        let struct_val = self
+            .builder
+            .build_malloc(ref_count_struct, "struct_value")?;
+        let field_ptr = self
+            .builder
+            .build_struct_gep(ref_count_struct, struct_val, 0, "rc")?;
+        self.builder
+            .build_store(field_ptr, ref_count_type.const_int(1, false))?;
+        let field_ptr = self
+            .builder
+            .build_struct_gep(ref_count_struct, struct_val, 1, "ptr")?;
+        self.builder.build_store(field_ptr, value)?;
+
+        Ok(struct_val)
+    }
+
+    pub fn drop_value(
+        &self,
+        ty: UnitType,
+        value: BasicValueEnum<'ctx>,
+    ) -> Result<(), CompilerError> {
+        let ref_count_type = self.context.i64_type();
+        match ty {
+            UnitType::Custom {
+                name,
+                generic_types,
+            } => {
+                let ref_count_struct = self.base_custom_type();
+                let ptr = value.into_pointer_value();
+
+                let rc_field_ptr =
+                    self.builder
+                        .build_struct_gep(ref_count_struct, ptr, 0, "ref_count")?;
                 let rc = self
                     .builder
-                    .build_load(self.ref_count.ref_count_type, rc_field_ptr, "get_ref_count")?
+                    .build_load(ref_count_type, rc_field_ptr, "get_ref_count")?
                     .into_int_value();
                 let result = self.builder.build_int_sub(
                     rc,
-                    self.ref_count.ref_count_type.const_int(1, false),
+                    ref_count_type.const_int(1, false),
                     "dec_ref_count",
                 )?;
                 let condition = self.builder.build_int_compare(
                     inkwell::IntPredicate::NE,
                     result,
-                    self.ref_count.ref_count_type.const_int(0, false),
+                    ref_count_type.const_int(0, false),
                     "if_cond",
                 )?;
 
@@ -164,15 +160,131 @@ impl<'ctx> CompilerContext<'ctx> {
                 self.builder.build_unconditional_branch(merge_block)?;
 
                 self.builder.position_at_end(free_rc);
-                let ptr_field_ptr = self.builder.build_struct_gep(
-                    self.ref_count.ref_count_struct,
-                    ptr,
-                    1,
-                    "ptr",
+                let variant_type = self.context.i64_type();
+
+                let variant_ptr =
+                    self.builder
+                        .build_struct_gep(ref_count_struct, ptr, 1, "variant")?;
+                let variant = self
+                    .builder
+                    .build_load(variant_type, variant_ptr, "get_variant")?
+                    .into_int_value();
+                let Some(ty) = self.get_type(name) else {
+                    return Err(CompilerError::UnexpectedType);
+                };
+                let mut blocks = Vec::new();
+                let variant_merge_block =
+                    self.context.append_basic_block(current_function, "merge");
+                for (index, _) in ty.variants.iter().enumerate() {
+                    let block = self.context.append_basic_block(current_function, "variant");
+                    blocks.push((
+                        self.context.i64_type().const_int(index as u64, false),
+                        block,
+                    ));
+                }
+                self.builder
+                    .build_switch(variant, variant_merge_block, &blocks)?;
+                let generics_map = ty
+                    .generics
+                    .iter()
+                    .map(|generic| generic.1.clone())
+                    .zip(generic_types.iter().cloned())
+                    .collect::<HashMap<_, _>>();
+                for (index, variant) in ty.variants.into_iter().enumerate() {
+                    let (_, block) = blocks[index];
+                    self.builder.position_at_end(block);
+                    let variant_type =
+                        custom_type_variant_struct(variant, generics_map.clone(), &self)?;
+                    if variant_type.count_fields() > 0 {
+                        let payload_ptr = self.builder.build_struct_gep(
+                            ref_count_struct,
+                            ptr,
+                            2,
+                            "payload_ptr",
+                        )?;
+
+                        for field in 0..variant_type.count_fields() {
+                            match variant_type.get_field_type_at_index(field) {
+                                Some(BasicTypeEnum::PointerType(pointer_ty)) => {
+                                    let field_ptr = self.builder.build_struct_gep(
+                                        variant_type,
+                                        payload_ptr,
+                                        field,
+                                        "field",
+                                    )?;
+                                    let field_value = self.builder.build_load(
+                                        BasicTypeEnum::PointerType(pointer_ty),
+                                        field_ptr,
+                                        "field_value",
+                                    )?;
+                                    self.builder.build_free(field_value.into_pointer_value())?;
+                                }
+                                Some(_) => {}
+                                None => {}
+                            }
+                        }
+                    }
+                    self.builder
+                        .build_unconditional_branch(variant_merge_block)?;
+                }
+                self.builder.position_at_end(variant_merge_block);
+
+                self.builder.build_free(ptr)?;
+                self.builder.build_unconditional_branch(merge_block)?;
+                self.builder.position_at_end(merge_block);
+                Ok(())
+            }
+            UnitType::Literal(LiteralType::String) => {
+                let ptr_type = self.context.ptr_type(AddressSpace::default());
+                let ref_count_struct = self
+                    .context
+                    .struct_type(&[ref_count_type.into(), ptr_type.into()], true);
+                let ptr = value.into_pointer_value();
+
+                let rc_field_ptr =
+                    self.builder
+                        .build_struct_gep(ref_count_struct, ptr, 0, "ref_count")?;
+                let rc = self
+                    .builder
+                    .build_load(ref_count_type, rc_field_ptr, "get_ref_count")?
+                    .into_int_value();
+                let result = self.builder.build_int_sub(
+                    rc,
+                    ref_count_type.const_int(1, false),
+                    "dec_ref_count",
                 )?;
+                let condition = self.builder.build_int_compare(
+                    inkwell::IntPredicate::NE,
+                    result,
+                    ref_count_type.const_int(0, false),
+                    "if_cond",
+                )?;
+
+                let current_function = self
+                    .builder
+                    .get_insert_block()
+                    .ok_or(CompilerError::IfWithoutFunction)?
+                    .get_parent()
+                    .ok_or(CompilerError::IfWithoutFunction)?;
+                let with_more_references = self
+                    .context
+                    .append_basic_block(current_function, "with_more_references");
+                let merge_block = self.context.append_basic_block(current_function, "merge");
+                let free_rc = self.context.append_basic_block(current_function, "free_rc");
+                self.builder
+                    .build_conditional_branch(condition, with_more_references, free_rc)?;
+
+                self.builder.position_at_end(with_more_references);
+                self.builder.build_store(rc_field_ptr, result)?;
+                self.builder.build_unconditional_branch(merge_block)?;
+
+                self.builder.position_at_end(free_rc);
+                let ptr_field_ptr =
+                    self.builder
+                        .build_struct_gep(ref_count_struct, ptr, 1, "ptr")?;
                 let ptr_field = self
                     .builder
-                    .build_load(self.ref_count.ptr_type, ptr_field_ptr, "get_ptr")?
+                    .build_load(ptr_type, ptr_field_ptr, "get_ptr")?
                     .into_pointer_value();
                 self.builder.build_free(ptr_field)?;
                 self.builder.build_free(ptr)?;
@@ -186,42 +298,69 @@ impl<'ctx> CompilerContext<'ctx> {
 
     pub fn clone_value(
         &self,
+        ty: UnitType,
         value: BasicValueEnum<'ctx>,
     ) -> Result<BasicValueEnum<'ctx>, CompilerError> {
-        match value {
-            BasicValueEnum::PointerValue(ptr) => {
-                let rc_field_ptr = self.builder.build_struct_gep(
-                    self.ref_count.ref_count_struct,
-                    ptr,
-                    0,
-                    "ref_count",
-                )?;
+        match ty {
+            UnitType::Literal(LiteralType::String) => {
+                let ptr = value.into_pointer_value();
+                let ref_count_type = self.context.i64_type();
+                let ref_count_struct = self.context.struct_type(&[ref_count_type.into()], true);
+
+                let rc_field_ptr =
+                    self.builder
+                        .build_struct_gep(ref_count_struct, ptr, 0, "ref_count")?;
                 let rc = self
                     .builder
-                    .build_load(self.ref_count.ref_count_type, rc_field_ptr, "get_ref_count")?
+                    .build_load(ref_count_type, rc_field_ptr, "get_ref_count")?
                     .into_int_value();
                 let result = self.builder.build_int_add(
                     rc,
-                    self.ref_count.ref_count_type.const_int(1, false),
+                    ref_count_type.const_int(1, false),
                     "inc_ref_count",
                 )?;
                 self.builder.build_store(rc_field_ptr, result)?;
                 Ok(BasicValueEnum::PointerValue(ptr))
             }
-            other => Ok(other),
+            UnitType::Custom { .. } => {
+                let ptr = value.into_pointer_value();
+                let ref_count_type = self.context.i64_type();
+                let ref_count_struct = self.base_custom_type();
+
+                let rc_field_ptr =
+                    self.builder
+                        .build_struct_gep(ref_count_struct, ptr, 0, "ref_count")?;
+                let rc = self
+                    .builder
+                    .build_load(ref_count_type, rc_field_ptr, "get_ref_count")?
+                    .into_int_value();
+                let result = self.builder.build_int_add(
+                    rc,
+                    ref_count_type.const_int(1, false),
+                    "inc_ref_count",
+                )?;
+                self.builder.build_store(rc_field_ptr, result)?;
+                Ok(BasicValueEnum::PointerValue(ptr))
+            }
+            _ => Ok(value),
         }
     }
 
-    pub fn get_ptr_ptr(
+    fn get_ptr_from_rc_ptr(
         &self,
         ptr: PointerValue<'ctx>,
     ) -> Result<PointerValue<'ctx>, CompilerError> {
-        let ptr_field_ptr =
-            self.builder
-                .build_struct_gep(self.ref_count.ref_count_struct, ptr, 1, "ref_ptr")?;
+        let ref_count_type = self.context.i64_type();
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let ref_count_struct = self
+            .context
+            .struct_type(&[ref_count_type.into(), ptr_type.into()], true);
+        let ptr_field_ptr = self
+            .builder
+            .build_struct_gep(ref_count_struct, ptr, 1, "ref_ptr")?;
         Ok(self
             .builder
-            .build_load(self.ref_count.ptr_type, ptr_field_ptr, "get_ptr")?
+            .build_load(ptr_type, ptr_field_ptr, "get_ptr")?
             .into_pointer_value())
     }
 
@@ -230,7 +369,7 @@ impl<'ctx> CompilerContext<'ctx> {
         value: BasicValueEnum<'ctx>,
     ) -> Result<BasicValueEnum<'ctx>, CompilerError> {
         match value {
-            BasicValueEnum::PointerValue(ptr) => Ok(self.get_ptr_ptr(ptr)?.into()),
+            BasicValueEnum::PointerValue(ptr) => Ok(self.get_ptr_from_rc_ptr(ptr)?.into()),
             _ => Ok(value),
         }
     }
@@ -358,19 +497,33 @@ impl<'ctx> CompilerContext<'ctx> {
                                 definitions.push((ty.clone(), Rc::new(Box::new(move |compiler_context: &mut CompilerContext<'ctx>,
                                       stack: &mut Stack<'ctx>|
                                       -> Result<(), CompilerError> {
+                                        let base_struct = compiler_context.base_custom_type();
                                         let variant_struct = custom_type_variant_struct(variant.clone(), generics_map.clone(), compiler_context)?;
                                         let values = stack.pop_n(ty.pop_types.len());
+                                        let obj_size = base_struct
+                                            .size_of()
+                                            .expect("size_of works");
+                                        let payload_size = variant_struct
+                                            .size_of()
+                                            .expect("size_of works");
+                                        let total_size = compiler_context.builder.build_int_add(
+                                            obj_size,
+                                            payload_size,
+                                            "obj_alloc_size",
+                                        )?;
 
-                                        let struct_val = compiler_context.builder.build_malloc(variant_struct, "struct_value")?;
-                                        let field_ptr = compiler_context.builder.build_struct_gep(variant_struct, struct_val, 0, "variant")?;
-                                        compiler_context.builder.build_store(field_ptr, compiler_context.context.i8_type().const_int(index as u64, false))?;
-                                        (1..(variant_struct.count_fields() as usize)).try_for_each(|field_index| -> Result<(), CompilerError> {
-                                            let field_ptr = compiler_context.builder.build_struct_gep(variant_struct, struct_val, field_index as u32, &format!("field_{}", field_index))?;
-                                            compiler_context.builder.build_store(field_ptr, values[field_index - 1].1)?;
+                                        let struct_val = compiler_context.builder.build_array_malloc(compiler_context.context.i8_type(), total_size, "struct_value")?;
+                                        let rc_ptr = compiler_context.builder.build_struct_gep(base_struct, struct_val, 0, "rc")?;
+                                        let field_ptr = compiler_context.builder.build_struct_gep(base_struct, struct_val, 1, "variant")?;
+                                        compiler_context.builder.build_store(rc_ptr, compiler_context.context.i64_type().const_int(1, false))?;
+                                        compiler_context.builder.build_store(field_ptr, compiler_context.context.i64_type().const_int(index as u64, false))?;
+                                        let payload_ptr = compiler_context.builder.build_struct_gep(base_struct, struct_val, 2, "payload")?;
+                                        (0..(variant_struct.count_fields() as usize)).try_for_each(|field_index| -> Result<(), CompilerError> {
+                                            let field_ptr = compiler_context.builder.build_struct_gep(variant_struct, payload_ptr, field_index as u32, &format!("field_{}", field_index))?;
+                                            compiler_context.builder.build_store(field_ptr, values[field_index].1)?;
                                             Ok(())
                                         })?;
-                                        let ref_count = compiler_context.ref_count.create(&compiler_context.builder, struct_val)?;
-                                        stack.push((ty.push_types[0].clone(), ref_count.into()));
+                                        stack.push((ty.push_types[0].clone(), struct_val.into()));
                                         Ok(())
                                 }))));
                                 Ok(())
@@ -759,8 +912,7 @@ impl<'ctx> CompilerContext<'ctx> {
             .build_memcpy(output_buffer, 1, value, 1, size)?;
         stack.push((
             UnitType::Literal(LiteralType::String),
-            self.ref_count
-                .create(&self.builder, output_buffer)?
+            self.create_ref_counted_pointer(output_buffer)?
                 .as_basic_value_enum(),
         ));
         Ok(())
@@ -901,17 +1053,14 @@ impl<'ctx> CompilerContext<'ctx> {
                         _ => panic!("Unsupported pattern type"),
                     }
                 }
+                let match_ptr = match_value.1.into_pointer_value();
 
-                let match_ptr = self.get_ptr_ptr(match_value.clone().1.into_pointer_value())?;
-
-                let struct_type = self
-                    .context
-                    .struct_type(&[self.context.i8_type().into()], true);
+                let struct_type = self.base_custom_type();
                 let ptr_field_ptr =
                     self.builder
-                        .build_struct_gep(struct_type, match_ptr, 0, "variant_value")?;
+                        .build_struct_gep(struct_type, match_ptr, 1, "variant_value")?;
                 let variant_value = self.builder.build_load(
-                    self.context.i8_type(),
+                    self.context.i64_type(),
                     ptr_field_ptr,
                     "variant_value_load",
                 )?;
@@ -925,7 +1074,7 @@ impl<'ctx> CompilerContext<'ctx> {
                         .enumerate()
                         .filter_map(|(index, case)| match &case.pattern {
                             Pattern::Variant { .. } => Some(
-                                self.context.i8_type().const_int(
+                                self.context.i64_type().const_int(
                                     *index_to_variant_index
                                         .get(&index)
                                         .expect("We created the map before")
@@ -984,6 +1133,12 @@ impl<'ctx> CompilerContext<'ctx> {
                                 .find(|v| Some(&v.0) == variant_name.last())
                                 .expect("The variant should always exist")
                                 .clone();
+                            let payload_ptr = self.builder.build_struct_gep(
+                                struct_type,
+                                match_ptr,
+                                2,
+                                "payload_ptr",
+                            )?;
                             let struct_type = custom_type_variant_struct(
                                 variant.clone(),
                                 generics_map.clone(),
@@ -999,8 +1154,8 @@ impl<'ctx> CompilerContext<'ctx> {
                                     .expect("We should always find the field");
                                 let ptr_field_ptr = self.builder.build_struct_gep(
                                     struct_type,
-                                    match_ptr,
-                                    (field_index + 1) as u32,
+                                    payload_ptr,
+                                    field_index as u32,
                                     "field_ptr",
                                 )?;
                                 let field_value = self.builder.build_load(
@@ -1067,7 +1222,7 @@ impl<'ctx> CompilerContext<'ctx> {
                     phi.add_incoming(values.as_slice());
                     stack.push((ty.0, phi.as_basic_value()));
                 }
-                self.drop_value(match_value.clone().1)?;
+                self.drop_value(match_value.0, match_value.1)?;
                 Ok(())
             }
             other => return Err(CompilerError::UnsupportedType(other)),
@@ -1077,6 +1232,15 @@ impl<'ctx> CompilerContext<'ctx> {
     pub fn get_type(&self, name: Vec<String>) -> Option<CustomType> {
         self.type_definitions.get(&name).cloned()
     }
+
+    pub fn base_custom_type(&self) -> StructType<'ctx> {
+        let fields = vec![
+            self.context.i64_type().into(),
+            self.context.i64_type().into(),
+            self.context.i8_type().array_type(0).into(),
+        ];
+        self.context.struct_type(&fields, true)
+    }
 }
 
 fn custom_type_variant_struct<'ctx>(
@@ -1084,21 +1248,21 @@ fn custom_type_variant_struct<'ctx>(
     generics_map: HashMap<VarType, UnitType>,
     compiler_context: &CompilerContext<'ctx>,
 ) -> Result<StructType<'ctx>, CompilerError> {
-    let mut fields = vec![compiler_context.context.i8_type().into()];
-    variant
-        .1
-        .iter()
-        .try_for_each(|field| -> Result<(), CompilerError> {
-            Ok(fields.push(
-                compiler_context.unit_type_to_llvm_type(match &field.1 {
+    Ok(compiler_context.context.struct_type(
+        &variant
+            .1
+            .iter()
+            .map(|field| -> Result<BasicTypeEnum<'ctx>, CompilerError> {
+                Ok(compiler_context.unit_type_to_llvm_type(match &field.1 {
                     UnitType::Var(var) => generics_map
                         .get(var)
                         .ok_or(CompilerError::FunctionCallError)?,
                     other => other,
-                })?,
-            ))
-        })?;
-    Ok(compiler_context.context.struct_type(&fields, true))
+                })?)
+            })
+            .collect::<Result<Vec<_>, CompilerError>>()?,
+        true,
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -1378,13 +1542,6 @@ fn call_function<'ctx>(
     if value.is_right() {
         return Err(CompilerError::FunctionCallError);
     }
-    // params.into_iter().try_for_each(|param| {
-    //     compiler_context.drop_value(
-    //         param
-    //             .try_into()
-    //             .expect("Created from a basic value enum. Should never fail"),
-    //     )
-    // })?;
 
     let return_value = value.left().ok_or(CompilerError::FunctionCallError)?;
     if ty.push_types.len() == 1 {
