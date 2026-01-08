@@ -1018,7 +1018,7 @@ impl<'ctx> CompilerContext<'ctx> {
                     }
                 }
                 for (ty, values) in values_for_phi.into_iter() {
-                    let phi = self.builder.build_phi(ty.1, "phi").unwrap();
+                    let phi = self.builder.build_phi(ty.1, "phi")?;
                     phi.add_incoming(values.as_slice());
                     stack.push((ty.0, phi.as_basic_value()));
                 }
@@ -1106,7 +1106,13 @@ impl<'ctx> CompilerContext<'ctx> {
                             let n_push_types = case.body.type_definition.push_types.len();
                             let scope = scope.clone();
                             if let Some(name) = name {
-                                scope.add_value(name, match_value.clone());
+                                scope.add_value(
+                                    name,
+                                    (
+                                        match_value.0.clone(),
+                                        self.clone_value(match_value.0.clone(), match_value.1)?,
+                                    ),
+                                );
                             }
                             self.compile_ast(
                                 scope,
@@ -1170,7 +1176,10 @@ impl<'ctx> CompilerContext<'ctx> {
                                     UnitType::Var(var) => generics_map.get(var).unwrap_or(ty),
                                     _ => ty,
                                 };
-                                scope.add_value(field.alias, (ty.clone(), field_value));
+                                scope.add_value(
+                                    field.alias,
+                                    (ty.clone(), self.clone_value(ty.clone(), field_value)?),
+                                );
                             }
                             self.compile_ast(
                                 scope,

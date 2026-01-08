@@ -76,6 +76,7 @@ impl<'a> Parser<'a> {
                     })),
                 },
                 TokenType::LeftParen => self.parse_type_annotation(token.position),
+                TokenType::LeftBracket => self.parse_list(token.position),
                 TokenType::SymbolWithPath(path) => Ok(Some(AstNode {
                     node_type: AstNodeType::SymbolWithPath(path),
                     position: token.position,
@@ -92,8 +93,7 @@ impl<'a> Parser<'a> {
                 TokenType::RightParen
                 | TokenType::RightBrace
                 | TokenType::RightBracket
-                | TokenType::RightArrow
-                | TokenType::LeftBracket => Err(ParserError::UnexpectedToken(
+                | TokenType::RightArrow => Err(ParserError::UnexpectedToken(
                     token.token_type,
                     token.position,
                 )),
@@ -781,6 +781,80 @@ impl<'a> Parser<'a> {
             }
             other => Err(ParserError::UnexpectedToken(other, token.position)),
         }
+    }
+
+    fn parse_list(&mut self, position: Position) -> Result<Option<AstNode>, ParserError> {
+        let mut elements = Vec::new();
+        while self
+            .tokens
+            .peek()
+            .map(|token| {
+                token
+                    .as_ref()
+                    .map(|token| token.token_type != TokenType::RightBracket)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+        {
+            elements.push(
+                self.parse()?
+                    .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?,
+            );
+        }
+        let token = self
+            .tokens
+            .next()
+            .transpose()?
+            .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
+        assert_token_type(&token, TokenType::RightBracket)?;
+        let element_type = elements.first().and_then(|node| {
+            node.type_definition
+                .as_ref()
+                .map(|type_definition| type_definition.push_types[0].clone())
+        });
+        let type_definition = element_type.as_ref().map(|ty| {
+            Type::new(
+                vec![],
+                vec![UnitType::Custom {
+                    name: vec!["list".into(), "List".into()],
+                    generic_types: vec![ty.clone()],
+                }],
+            )
+        });
+        let mut nodes = vec![AstNode {
+            node_type: AstNodeType::SymbolWithPath(vec!["list".into(), "Empty".into()]),
+            position: position.clone(),
+            type_definition: type_definition.clone(),
+        }];
+        nodes.extend(elements.into_iter().rev().flat_map(|node| {
+            vec![
+                node,
+                AstNode {
+                    node_type: AstNodeType::SymbolWithPath(vec!["list".into(), "List".into()]),
+                    position: position.clone(),
+                    type_definition: element_type.as_ref().map(|ty| {
+                        Type::new(
+                            vec![
+                                UnitType::Custom {
+                                    name: vec!["list".into(), "List".into()],
+                                    generic_types: vec![ty.clone()],
+                                },
+                                ty.clone(),
+                            ],
+                            vec![UnitType::Custom {
+                                name: vec!["list".into(), "List".into()],
+                                generic_types: vec![ty.clone()],
+                            }],
+                        )
+                    }),
+                },
+            ]
+        }));
+        Ok(Some(AstNode {
+            node_type: AstNodeType::Block(nodes),
+            position,
+            type_definition: type_definition,
+        }))
     }
 }
 

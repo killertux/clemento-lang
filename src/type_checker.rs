@@ -263,6 +263,7 @@ impl TypeChecker {
                         )
                     }),
                 )?;
+
                 validate_types_and_return_variable_substitution(
                     &type_stack,
                     &type_definition.pop_types,
@@ -385,6 +386,27 @@ impl TypeChecker {
                     generics.clone(),
                     variants.clone(),
                 );
+                let variants = variants
+                    .into_iter()
+                    .map(|variant| {
+                        Ok((
+                            variant.0,
+                            variant
+                                .1
+                                .into_iter()
+                                .map(|field| {
+                                    Ok((field.0, replace_custom_unit_type(scope, field.1)?))
+                                })
+                                .collect::<Result<Vec<(String, UnitType)>, TypeCheckerError>>()?,
+                        ))
+                    })
+                    .collect::<Result<Vec<(String, Vec<(String, UnitType)>)>, TypeCheckerError>>(
+                    )?;
+                scope.insert_type_definition(
+                    name_with_path.clone(),
+                    generics.clone(),
+                    variants.clone(),
+                );
                 self.type_definitions.insert(
                     name_with_path.clone(),
                     CustomType {
@@ -465,46 +487,12 @@ impl TypeChecker {
         let pop_types = ty
             .pop_types
             .into_iter()
-            .map(|ty| match ty {
-                UnitType::Custom {
-                    name,
-                    generic_types,
-                } => {
-                    let Some(ty) = scope.get_type(name.clone()) else {
-                        return Err(TypeCheckerError::TypeNotFound(name));
-                    };
-                    if ty.generics.len() != generic_types.len() {
-                        return Err(TypeCheckerError::TypeNotFound(name));
-                    }
-                    Ok(UnitType::Custom {
-                        name: ty.name,
-                        generic_types,
-                    })
-                }
-                other => Ok(other),
-            })
+            .map(|ty| replace_custom_unit_type(scope, ty))
             .collect::<Result<Vec<_>, _>>()?;
         let push_types = ty
             .push_types
             .into_iter()
-            .map(|ty| match ty {
-                UnitType::Custom {
-                    name,
-                    generic_types,
-                } => {
-                    let Some(ty) = scope.get_type(name.clone()) else {
-                        return Err(TypeCheckerError::TypeNotFound(name));
-                    };
-                    if ty.generics.len() != generic_types.len() {
-                        return Err(TypeCheckerError::TypeNotFound(name));
-                    }
-                    Ok(UnitType::Custom {
-                        name: ty.name,
-                        generic_types,
-                    })
-                }
-                other => Ok(other),
-            })
+            .map(|ty| replace_custom_unit_type(scope, ty))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Type::new(pop_types, push_types))
     }
@@ -682,16 +670,7 @@ impl TypeChecker {
                                 .expect("We checked that the variant exists")
                                 .into_iter()
                                 .map(|field| {
-                                    (
-                                        field.0,
-                                        match field.1 {
-                                            UnitType::Var(v) => generics_map
-                                                .get(&v)
-                                                .cloned()
-                                                .unwrap_or(UnitType::Var(v)),
-                                            other => other,
-                                        },
-                                    )
+                                    (field.0, substitute_unit_type(&generics_map, field.1))
                                 })
                                 .collect::<HashMap<_, _>>();
                             let mut scope = TypeScope::with_parent(scope.clone());
@@ -702,6 +681,7 @@ impl TypeChecker {
                                         variant_name.join("::"),
                                     ),
                                 )?;
+
                                 scope.insert_definition(
                                     field.alias.clone(),
                                     Type::new(vec![], vec![field_ty.clone()]),
@@ -809,6 +789,33 @@ impl TypeChecker {
     }
 }
 
+fn replace_custom_unit_type(
+    scope: &mut TypeScope,
+    ty: UnitType,
+) -> Result<UnitType, TypeCheckerError> {
+    match ty {
+        UnitType::Custom {
+            name,
+            generic_types,
+        } => {
+            let Some(ty) = scope.get_type(name.clone()) else {
+                return Err(TypeCheckerError::TypeNotFound(name));
+            };
+            if ty.generics.len() != generic_types.len() {
+                return Err(TypeCheckerError::TypeNotFound(name));
+            }
+            Ok(UnitType::Custom {
+                name: ty.name,
+                generic_types: generic_types
+                    .into_iter()
+                    .map(|ty| replace_custom_unit_type(scope, ty))
+                    .collect::<Result<Vec<_>, _>>()?,
+            })
+        }
+        other => Ok(other),
+    }
+}
+
 fn substitute_types(
     type_stack: &[UnitType],
     type_definition: Type,
@@ -831,58 +838,43 @@ fn apply_substitution(
         type_definition
             .pop_types
             .into_iter()
-            .map(|ty| match ty {
-                UnitType::Var(var) => variable_substitution
-                    .get(&var)
-                    .cloned()
-                    .unwrap_or(UnitType::Var(var)),
-                UnitType::Custom {
-                    name,
-                    generic_types,
-                } => UnitType::Custom {
-                    name,
-                    generic_types: generic_types
-                        .into_iter()
-                        .map(|generic_type| match generic_type {
-                            UnitType::Var(var) => variable_substitution
-                                .get(&var)
-                                .cloned()
-                                .unwrap_or(UnitType::Var(var)),
-                            other => other,
-                        })
-                        .collect(),
-                },
-                other => other,
-            })
+            .map(|ty| substitute_unit_type(variable_substitution, ty))
             .collect(),
         type_definition
             .push_types
             .into_iter()
-            .map(|ty| match ty {
-                UnitType::Var(var) => variable_substitution
-                    .get(&var)
-                    .cloned()
-                    .unwrap_or(UnitType::Var(var)),
-                UnitType::Custom {
-                    name,
-                    generic_types,
-                } => UnitType::Custom {
-                    name,
-                    generic_types: generic_types
-                        .into_iter()
-                        .map(|generic_type| match generic_type {
-                            UnitType::Var(var) => variable_substitution
-                                .get(&var)
-                                .cloned()
-                                .unwrap_or(UnitType::Var(var)),
-                            other => other,
-                        })
-                        .collect(),
-                },
-                other => other,
-            })
+            .map(|ty| substitute_unit_type(variable_substitution, ty))
             .collect(),
     )
+}
+
+fn substitute_unit_type(
+    variable_substitution: &HashMap<VarType, UnitType>,
+    ty: UnitType,
+) -> UnitType {
+    match ty {
+        UnitType::Var(var) => variable_substitution
+            .get(&var)
+            .cloned()
+            .unwrap_or(UnitType::Var(var)),
+        UnitType::Custom {
+            name,
+            generic_types,
+        } => UnitType::Custom {
+            name,
+            generic_types: generic_types
+                .into_iter()
+                .map(|generic_type| match generic_type {
+                    UnitType::Var(var) => variable_substitution
+                        .get(&var)
+                        .cloned()
+                        .unwrap_or(UnitType::Var(var)),
+                    other => other,
+                })
+                .collect(),
+        },
+        other => other,
+    }
 }
 
 pub fn validate_types_and_return_variable_substitution(
