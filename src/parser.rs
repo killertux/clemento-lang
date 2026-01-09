@@ -1960,4 +1960,103 @@ mod tests {
             }))
         );
     }
+
+    #[test]
+    fn parse_empty_list() {
+        let input = "[]";
+        let mut parser = Parser::new_from_str(input);
+        assert_eq!(
+            parser.next(),
+            Some(Ok(AstNode {
+                node_type: AstNodeType::Block(vec![AstNode {
+                    node_type: AstNodeType::SymbolWithPath(vec!["list".into(), "Empty".into()]),
+                    position: Position::new(1, 1, None),
+                    type_definition: None
+                }]),
+                position: Position::new(1, 1, None),
+                type_definition: None
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_list() {
+        let input = "[1 2 3]";
+        let mut parser = Parser::new_from_str(input);
+        let list_type = UnitType::Custom {
+            name: vec!["list".into(), "List".into()],
+            generic_types: vec![UnitType::Literal(LiteralType::Number(NumberType::I64))],
+        };
+        assert_eq!(
+            parser.next(),
+            Some(Ok(AstNode {
+                node_type: AstNodeType::Block(vec![
+                    AstNode {
+                        node_type: AstNodeType::SymbolWithPath(vec!["list".into(), "Empty".into()]),
+                        position: Position::new(1, 1, None),
+                        type_definition: Some(Type::new(vec![], vec![list_type.clone()]))
+                    },
+                    AstNode {
+                        node_type: AstNodeType::Number(Number::Integer(IntegerNumber::I64(3))),
+                        position: Position::new(1, 6, None),
+                        type_definition: Some(Type::new(
+                            vec![],
+                            vec![UnitType::Literal(LiteralType::Number(NumberType::I64))]
+                        ))
+                    },
+                    AstNode {
+                        node_type: AstNodeType::SymbolWithPath(vec!["list".into(), "List".into()]),
+                        position: Position::new(1, 1, None),
+                        type_definition: Some(Type::new(
+                            vec![
+                                list_type.clone(),
+                                UnitType::Literal(LiteralType::Number(NumberType::I64))
+                            ],
+                            vec![list_type.clone()]
+                        ))
+                    },
+                    AstNode {
+                        node_type: AstNodeType::Number(Number::Integer(IntegerNumber::I64(2))),
+                        position: Position::new(1, 4, None),
+                        type_definition: Some(Type::new(
+                            vec![],
+                            vec![UnitType::Literal(LiteralType::Number(NumberType::I64))]
+                        ))
+                    },
+                    AstNode {
+                        node_type: AstNodeType::SymbolWithPath(vec!["list".into(), "List".into()]),
+                        position: Position::new(1, 1, None),
+                        type_definition: Some(Type::new(
+                            vec![
+                                list_type.clone(),
+                                UnitType::Literal(LiteralType::Number(NumberType::I64))
+                            ],
+                            vec![list_type.clone()]
+                        ))
+                    },
+                    AstNode {
+                        node_type: AstNodeType::Number(Number::Integer(IntegerNumber::I64(1))),
+                        position: Position::new(1, 2, None),
+                        type_definition: Some(Type::new(
+                            vec![],
+                            vec![UnitType::Literal(LiteralType::Number(NumberType::I64))]
+                        ))
+                    },
+                    AstNode {
+                        node_type: AstNodeType::SymbolWithPath(vec!["list".into(), "List".into()]),
+                        position: Position::new(1, 1, None),
+                        type_definition: Some(Type::new(
+                            vec![
+                                list_type.clone(),
+                                UnitType::Literal(LiteralType::Number(NumberType::I64))
+                            ],
+                            vec![list_type.clone()]
+                        ))
+                    }
+                ]),
+                position: Position::new(1, 1, None),
+                type_definition: Some(Type::new(vec![], vec![list_type.clone()]))
+            }))
+        );
+    }
 }
