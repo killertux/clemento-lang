@@ -1,0 +1,7 @@
+type List<a> {
+    Empty
+    List(
+        next List<a>
+        element a
+    )
+}

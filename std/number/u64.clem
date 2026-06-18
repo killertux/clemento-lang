@@ -1,4 +1,6 @@
+import std::list
 import std::boolean(Boolean)
+import std::stack(dup swap rot drop touch)
 
 defx + (U64 U64 -> U64)
 defx - (U64 U64 -> U64)
@@ -8,8 +10,36 @@ defx % (U64 U64 -> U64)
 defx %u8 (U64 U8 -> U8)
 defx %u16 (U64 U16 -> U16)
 defx %u32 (U64 U32 -> U32)
-defx to_string (U64 -> String)
 defx gt (U64 U64 -> Boolean)
 defx lt (U64 U64 -> Boolean)
 defx = (U64 U64 -> Boolean)
 defx != (U64 U64 -> Boolean)
+
+def to_string (U64 -> String) {
+    defp digit (U64 -> Char) {
+        match {
+            0u64 -> '0'
+            1u64 -> '1'
+            2u64 -> '2'
+            3u64 -> '3'
+            4u64 -> '4'
+            5u64 -> '5'
+            6u64 -> '6'
+            7u64 -> '7'
+            8u64 -> '8'
+            9u64 -> '9'
+            * -> '?'
+        }
+    }
+    // go (accumulator n): prepends each digit of n (least-significant first) to acc.
+    defp go (String U64 -> String) {
+        dup 0u64 = match {
+            True -> { drop touch }
+            False -> { dup 10u64 % digit rot swap list::List swap 10u64 / go }
+        }
+    }
+    dup 0u64 = match {
+        True -> { drop "0" }
+        False -> { "" swap go }
+    }
+}

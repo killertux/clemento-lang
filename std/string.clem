@@ -1,1 +1,10 @@
-defx concat (String String -> String)
+import std::list
+import std::stack(swap touch)
+
+// A String is a List<Char>. concat appends: (head:tail) ++ b = head : (tail ++ b).
+def concat (String String -> String) {
+    swap match {
+        [] -> touch
+        [head ... tail] -> { tail swap concat head list::List }
+    }
+}

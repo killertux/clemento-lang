@@ -1,15 +1,17 @@
 use std::{
     collections::{HashMap, HashSet},
-    fmt::{Display, Formatter},
-    fs::read_to_string,
     iter::Peekable,
     path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
 };
 
-use thiserror::Error;
+mod ast;
+mod error;
 
-use crate::lexer::{IntegerNumber, Lexer, LexerError, Number, Position, Token, TokenType};
+pub use ast::{AstNode, AstNodeType, Case, FieldPattern, Import, NameWithAlias, Pattern};
+pub use error::ParserError;
+
+use crate::lexer::{IntegerNumber, Lexer, Number, Position, Token, TokenType};
+use crate::types::{LiteralType, NumberType, Type, UnitType, VarType};
 
 pub struct Parser<'a> {
     tokens: Peekable<Lexer<'a>>,
@@ -56,10 +58,27 @@ impl<'a> Parser<'a> {
                     node_type: AstNodeType::Number(num),
                     position: token.position,
                 })),
-                TokenType::String(string) => Ok(Some(AstNode {
-                    node_type: AstNodeType::String(string),
+                TokenType::String(string) => {
+                    // A string literal is sugar for a `List<Char>`: desugar to the
+                    // same cons-list the `['a' 'b' ...]` literal would build.
+                    let chars = string
+                        .chars()
+                        .map(|c| AstNode {
+                            node_type: AstNodeType::Char(c),
+                            position: token.position.clone(),
+                            type_definition: Some(Type::char()),
+                        })
+                        .collect();
+                    Ok(Some(build_cons_list(
+                        chars,
+                        token.position,
+                        Some(UnitType::Literal(LiteralType::Char)),
+                    )))
+                }
+                TokenType::Char(c) => Ok(Some(AstNode {
+                    node_type: AstNodeType::Char(c),
                     position: token.position,
-                    type_definition: Some(Type::string()),
+                    type_definition: Some(Type::char()),
                 })),
                 TokenType::LeftBrace => self.parse_block(token.position),
                 TokenType::Symbol(symbol) => match symbol.as_str() {
@@ -76,6 +95,7 @@ impl<'a> Parser<'a> {
                     })),
                 },
                 TokenType::LeftParen => self.parse_type_annotation(token.position),
+                TokenType::LeftBracket => self.parse_list(token.position),
                 TokenType::SymbolWithPath(path) => Ok(Some(AstNode {
                     node_type: AstNodeType::SymbolWithPath(path),
                     position: token.position,
@@ -92,8 +112,7 @@ impl<'a> Parser<'a> {
                 TokenType::RightParen
                 | TokenType::RightBrace
                 | TokenType::RightBracket
-                | TokenType::RightArrow
-                | TokenType::LeftBracket => Err(ParserError::UnexpectedToken(
+                | TokenType::RightArrow => Err(ParserError::UnexpectedToken(
                     token.token_type,
                     token.position,
                 )),
@@ -123,7 +142,7 @@ impl<'a> Parser<'a> {
             .ok_or(ParserError::UnexpectedEndOfInput(name_token.position))?;
         Ok(Some(AstNode {
             node_type: AstNodeType::Definition {
-                name: name.into(),
+                name,
                 is_private,
                 body: Box::new(body),
             },
@@ -319,32 +338,7 @@ impl<'a> Parser<'a> {
             alias: alias.unwrap_or(name),
         };
 
-        let node = {
-            if self.imports.contains(&name.name) {
-                Import {
-                    name,
-                    functions,
-                    node: None,
-                }
-            } else {
-                let file_content = read_to_string(&path)
-                    .map_err(|err| ParserError::ImportError(name.name.clone(), err.to_string()))?;
-
-                let program = Parser::new_from_file(&file_content, name.name.clone())
-                    .collect::<Result<Vec<AstNode>, ParserError>>()?;
-
-                self.imports.insert(name.name.clone());
-                Import {
-                    name,
-                    functions,
-                    node: Some(AstNode {
-                        node_type: AstNodeType::Block(program),
-                        position: Position::default(),
-                        type_definition: None,
-                    }),
-                }
-            }
-        };
+        let node = crate::imports::resolve_import(&mut self.imports, name, functions, &path)?;
 
         Ok(Some(AstNode {
             node_type: AstNodeType::Import(symbol, Box::new(node)),
@@ -428,12 +422,16 @@ impl<'a> Parser<'a> {
         };
 
         let mut var_types = Vec::new();
-        if let Some(_) = self.tokens.next_if(|token| {
-            token
-                .as_ref()
-                .map(|token| token.token_type == TokenType::LeftChevron)
-                .unwrap_or(false)
-        }) {
+        if self
+            .tokens
+            .next_if(|token| {
+                token
+                    .as_ref()
+                    .map(|token| token.token_type == TokenType::LeftChevron)
+                    .unwrap_or(false)
+            })
+            .is_some()
+        {
             loop {
                 let symbol = self
                     .tokens
@@ -510,12 +508,16 @@ impl<'a> Parser<'a> {
             ));
         };
         let mut fields: Vec<(String, UnitType)> = Vec::new();
-        if let Some(_) = self.tokens.next_if(|token| {
-            token
-                .as_ref()
-                .map(|token| token.token_type == TokenType::LeftParen)
-                .unwrap_or(false)
-        }) {
+        if self
+            .tokens
+            .next_if(|token| {
+                token
+                    .as_ref()
+                    .map(|token| token.token_type == TokenType::LeftParen)
+                    .unwrap_or(false)
+            })
+            .is_some()
+        {
             loop {
                 let symbol = self
                     .tokens
@@ -549,6 +551,41 @@ impl<'a> Parser<'a> {
         Ok((variant_name, fields))
     }
 
+    /// Parses an optional `<t1 t2 ...>` generic-argument list. Returns an empty
+    /// vec when the next token is not a `<`.
+    fn parse_generic_args(
+        &mut self,
+        position: &Position,
+        var_type_map: &mut HashMap<String, VarType>,
+        allow_insert_new_var_type: bool,
+    ) -> Result<Vec<UnitType>, ParserError> {
+        let mut types = Vec::new();
+        if self
+            .tokens
+            .next_if(|token| {
+                token
+                    .as_ref()
+                    .map(|token| token.token_type == TokenType::LeftChevron)
+                    .unwrap_or(false)
+            })
+            .is_some()
+        {
+            loop {
+                let symbol = self
+                    .tokens
+                    .next()
+                    .transpose()?
+                    .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
+                if matches!(symbol.token_type, TokenType::RightChevron) {
+                    break;
+                }
+                let ty = self.parse_unit_type(symbol, var_type_map, allow_insert_new_var_type)?;
+                types.push(ty);
+            }
+        }
+        Ok(types)
+    }
+
     fn parse_unit_type(
         &mut self,
         token: Token,
@@ -557,7 +594,15 @@ impl<'a> Parser<'a> {
     ) -> Result<UnitType, ParserError> {
         match &token.token_type {
             TokenType::Symbol(symbol) => match symbol.as_str() {
-                "String" => Ok(UnitType::Literal(LiteralType::String)),
+                // `String` is sugar for `List<Char>` (assumes `std::list` is imported as `list`).
+                "String" => Ok(UnitType::Custom {
+                    name: vec!["list".into(), "List".into()],
+                    generic_types: vec![UnitType::Literal(LiteralType::Char)],
+                }),
+                "Char" => Ok(UnitType::Literal(LiteralType::Char)),
+                // FFI raw-pointer types (see `LiteralType::CStr`/`Ptr`).
+                "CStr" => Ok(UnitType::Literal(LiteralType::CStr)),
+                "Ptr" => Ok(UnitType::Literal(LiteralType::Ptr)),
                 "U8" => Ok(UnitType::Literal(LiteralType::Number(NumberType::U8))),
                 "U16" => Ok(UnitType::Literal(LiteralType::Number(NumberType::U16))),
                 "U32" => Ok(UnitType::Literal(LiteralType::Number(NumberType::U32))),
@@ -584,28 +629,11 @@ impl<'a> Parser<'a> {
                             ))
                         }
                     } else {
-                        let mut types = Vec::new();
-                        if let Some(_) = self.tokens.next_if(|token| {
-                            token
-                                .as_ref()
-                                .map(|token| token.token_type == TokenType::LeftChevron)
-                                .unwrap_or(false)
-                        }) {
-                            loop {
-                                let symbol = self.tokens.next().transpose()?.ok_or(
-                                    ParserError::UnexpectedEndOfInput(token.position.clone()),
-                                )?;
-                                if matches!(symbol.token_type, TokenType::RightChevron) {
-                                    break;
-                                }
-                                let ty = self.parse_unit_type(
-                                    symbol,
-                                    var_type_map,
-                                    allow_insert_new_var_type,
-                                )?;
-                                types.push(ty);
-                            }
-                        }
+                        let types = self.parse_generic_args(
+                            &token.position,
+                            var_type_map,
+                            allow_insert_new_var_type,
+                        )?;
                         Ok(UnitType::Custom {
                             name: vec![string.to_string()],
                             generic_types: types,
@@ -614,27 +642,11 @@ impl<'a> Parser<'a> {
                 }
             },
             TokenType::SymbolWithPath(symbol_with_path) => {
-                let mut types = Vec::new();
-                if let Some(_) = self.tokens.next_if(|token| {
-                    token
-                        .as_ref()
-                        .map(|token| token.token_type == TokenType::LeftChevron)
-                        .unwrap_or(false)
-                }) {
-                    loop {
-                        let symbol = self
-                            .tokens
-                            .next()
-                            .transpose()?
-                            .ok_or(ParserError::UnexpectedEndOfInput(token.position.clone()))?;
-                        if matches!(symbol.token_type, TokenType::RightChevron) {
-                            break;
-                        }
-                        let ty =
-                            self.parse_unit_type(symbol, var_type_map, allow_insert_new_var_type)?;
-                        types.push(ty);
-                    }
-                }
+                let types = self.parse_generic_args(
+                    &token.position,
+                    var_type_map,
+                    allow_insert_new_var_type,
+                )?;
                 Ok(UnitType::Custom {
                     name: symbol_with_path.clone(),
                     generic_types: types,
@@ -746,7 +758,14 @@ impl<'a> Parser<'a> {
                     })
                     .unwrap_or(false)
                 {
-                    fields = self.parse_name_with_alias(token.position.clone())?;
+                    fields = self
+                        .parse_name_with_alias(token.position.clone())?
+                        .into_iter()
+                        .map(|nwa| FieldPattern {
+                            field: nwa.name,
+                            pattern: Pattern::Wildcard(Some(nwa.alias)),
+                        })
+                        .collect();
                 }
                 Ok((
                     Pattern::Variant {
@@ -769,7 +788,14 @@ impl<'a> Parser<'a> {
                     })
                     .unwrap_or(false)
                 {
-                    fields = self.parse_name_with_alias(token.position.clone())?;
+                    fields = self
+                        .parse_name_with_alias(token.position.clone())?
+                        .into_iter()
+                        .map(|nwa| FieldPattern {
+                            field: nwa.name,
+                            pattern: Pattern::Wildcard(Some(nwa.alias)),
+                        })
+                        .collect();
                 }
                 Ok((
                     Pattern::Variant {
@@ -779,8 +805,215 @@ impl<'a> Parser<'a> {
                     token.position,
                 ))
             }
+            TokenType::LeftBracket => {
+                // List/char-list pattern sugar: `[a b ... tail]`, `['a' c]`, `[]`.
+                // Each element is a binding (Symbol) or a char-literal match (Char).
+                let mut elements = Vec::new();
+                let mut tail = None;
+                loop {
+                    let element_token = self
+                        .tokens
+                        .next()
+                        .transpose()?
+                        .ok_or(ParserError::UnexpectedEndOfInput(token.position.clone()))?;
+                    match element_token.token_type {
+                        TokenType::RightBracket => break,
+                        TokenType::Symbol(spread) if spread == "..." => {
+                            let tail_token = self.tokens.next().transpose()?.ok_or(
+                                ParserError::UnexpectedEndOfInput(element_token.position.clone()),
+                            )?;
+                            let TokenType::Symbol(name) = tail_token.token_type else {
+                                return Err(ParserError::UnexpectedToken(
+                                    tail_token.token_type,
+                                    tail_token.position,
+                                ));
+                            };
+                            tail = Some(name);
+                            assert_token_type(
+                                &self.tokens.next().transpose()?.ok_or(
+                                    ParserError::UnexpectedEndOfInput(tail_token.position),
+                                )?,
+                                TokenType::RightBracket,
+                            )?;
+                            break;
+                        }
+                        TokenType::Symbol(name) => {
+                            elements.push(Pattern::Wildcard(Some(name)));
+                        }
+                        TokenType::Char(c) => elements.push(Pattern::Char(c)),
+                        other => {
+                            return Err(ParserError::UnexpectedToken(
+                                other,
+                                element_token.position,
+                            ));
+                        }
+                    }
+                }
+                Ok((
+                    desugar_list_pattern(&elements, tail.as_deref()),
+                    token.position,
+                ))
+            }
+            TokenType::Char(c) => Ok((Pattern::Char(c), token.position)),
+            TokenType::String(string) => {
+                // String pattern: `"abc"` (exact) or `"ab" ... rest` (prefix).
+                let elements: Vec<Pattern> = string.chars().map(Pattern::Char).collect();
+                let mut tail = None;
+                if self
+                    .tokens
+                    .next_if(|t| {
+                        t.as_ref()
+                            .map(|t| matches!(&t.token_type, TokenType::Symbol(s) if s == "..."))
+                            .unwrap_or(false)
+                    })
+                    .is_some()
+                {
+                    let tail_token = self
+                        .tokens
+                        .next()
+                        .transpose()?
+                        .ok_or(ParserError::UnexpectedEndOfInput(token.position.clone()))?;
+                    let TokenType::Symbol(name) = tail_token.token_type else {
+                        return Err(ParserError::UnexpectedToken(
+                            tail_token.token_type,
+                            tail_token.position,
+                        ));
+                    };
+                    tail = Some(name);
+                }
+                Ok((
+                    desugar_list_pattern(&elements, tail.as_deref()),
+                    token.position,
+                ))
+            }
             other => Err(ParserError::UnexpectedToken(other, token.position)),
         }
+    }
+
+    fn parse_list(&mut self, position: Position) -> Result<Option<AstNode>, ParserError> {
+        let mut elements = Vec::new();
+        while self
+            .tokens
+            .peek()
+            .map(|token| {
+                token
+                    .as_ref()
+                    .map(|token| token.token_type != TokenType::RightBracket)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+        {
+            elements.push(
+                self.parse()?
+                    .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?,
+            );
+        }
+        let token = self
+            .tokens
+            .next()
+            .transpose()?
+            .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
+        assert_token_type(&token, TokenType::RightBracket)?;
+        Ok(Some(build_cons_list(elements, position, None)))
+    }
+}
+
+/// Builds a `list::List` cons-list literal from `elements` (front-to-back),
+/// terminated by `list::Empty`. Shared by the `[...]` list-literal sugar and the
+/// `"..."` string-literal sugar (a `String` is a `List<Char>`). Assumes
+/// `std::list` is imported as `list`.
+fn build_cons_list(
+    elements: Vec<AstNode>,
+    position: Position,
+    element_type_hint: Option<UnitType>,
+) -> AstNode {
+    let element_type = elements
+        .first()
+        .and_then(|node| {
+            node.type_definition
+                .as_ref()
+                .map(|type_definition| type_definition.push_types[0].clone())
+        })
+        .or(element_type_hint);
+    let type_definition = element_type.as_ref().map(|ty| {
+        Type::new(
+            vec![],
+            vec![UnitType::Custom {
+                name: vec!["list".into(), "List".into()],
+                generic_types: vec![ty.clone()],
+            }],
+        )
+    });
+    let mut nodes = vec![AstNode {
+        node_type: AstNodeType::SymbolWithPath(vec!["list".into(), "Empty".into()]),
+        position: position.clone(),
+        type_definition: type_definition.clone(),
+    }];
+    nodes.extend(elements.into_iter().rev().flat_map(|node| {
+        vec![
+            node,
+            AstNode {
+                node_type: AstNodeType::SymbolWithPath(vec!["list".into(), "List".into()]),
+                position: position.clone(),
+                type_definition: element_type.as_ref().map(|ty| {
+                    Type::new(
+                        vec![
+                            UnitType::Custom {
+                                name: vec!["list".into(), "List".into()],
+                                generic_types: vec![ty.clone()],
+                            },
+                            ty.clone(),
+                        ],
+                        vec![UnitType::Custom {
+                            name: vec!["list".into(), "List".into()],
+                            generic_types: vec![ty.clone()],
+                        }],
+                    )
+                }),
+            },
+        ]
+    }));
+    AstNode {
+        node_type: AstNodeType::Block(nodes),
+        position: position.clone(),
+        type_definition,
+    }
+}
+
+/// Desugars a list pattern (`[e0 e1 ... tail]`) into nested `list::List` /
+/// `list::Empty` variant patterns, binding each element to its name and the tail
+/// (if present) to the remaining list. Mirrors the `[...]` literal sugar in
+/// `parse_list` and assumes `std::list` is imported as `list`.
+///
+/// Each element is a sub-pattern (a `Wildcard(Some(name))` binding or a
+/// `Char`/number-literal match); the tail (if present) binds the remaining list.
+///
+/// - `[]`            -> `list::Empty`
+/// - `[... t]`       -> bind whole list to `t`
+/// - `[a 'b' ... t]` -> `list::List(element a, next list::List(element 'b', next t))`
+/// - `[a b]`         -> `list::List(element a, next list::List(element b, next list::Empty))`
+fn desugar_list_pattern(elements: &[Pattern], tail: Option<&str>) -> Pattern {
+    match elements.split_first() {
+        None => match tail {
+            None => Pattern::Variant {
+                variant_name: vec!["list".into(), "Empty".into()],
+                fields: vec![],
+            },
+            Some(tail) => Pattern::Wildcard(Some(tail.to_string())),
+        },
+        Some((head, rest)) => Pattern::Variant {
+            variant_name: vec!["list".into(), "List".into()],
+            fields: vec![
+                FieldPattern {
+                    field: "element".into(),
+                    pattern: head.clone(),
+                },
+                FieldPattern {
+                    field: "next".into(),
+                    pattern: desugar_list_pattern(rest, tail),
+                },
+            ],
+        },
     }
 }
 
@@ -793,507 +1026,6 @@ fn assert_token_type(token: &Token, expected_type: TokenType) -> Result<(), Pars
             token.position.clone(),
         ))
     }
-}
-
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub enum AstNodeType<T> {
-    Number(Number),
-    String(String),
-    Symbol(String),
-    SymbolWithPath(Vec<String>),
-    Import(Vec<String>, Box<Import<T>>),
-    Definition {
-        name: String,
-        is_private: bool,
-        body: Box<T>,
-    },
-    ExternalDefinition(String, Type),
-    Block(Vec<T>),
-    CustomType {
-        name: String,
-        generics: Vec<(String, VarType)>,
-        variants: Vec<(String, Vec<(String, UnitType)>)>,
-    },
-    Match(Vec<Case<T>>),
-}
-
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub struct Case<T> {
-    pub pattern: Pattern,
-    pub body: Box<T>,
-}
-
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub enum Pattern {
-    Wildcard(Option<String>),
-    Number(Number),
-    Variant {
-        variant_name: Vec<String>,
-        fields: Vec<NameWithAlias>,
-    },
-}
-
-impl Display for Pattern {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Pattern::Wildcard(Some(name)) => write!(f, "* as {}", name),
-            Pattern::Wildcard(None) => write!(f, "*"),
-            Pattern::Number(number) => write!(f, "{}", number),
-            Pattern::Variant {
-                variant_name,
-                fields,
-            } => {
-                if fields.is_empty() {
-                    write!(f, "{}", variant_name.join("::"))
-                } else {
-                    write!(
-                        f,
-                        "{}({})",
-                        variant_name.join("::"),
-                        fields
-                            .iter()
-                            .map(|field| {
-                                if field.name == field.alias {
-                                    field.name.clone()
-                                } else {
-                                    format!("{} as {}", field.name, field.alias)
-                                }
-                            })
-                            .collect::<Vec<String>>()
-                            .join(" ")
-                    )
-                }
-            }
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub struct Import<T> {
-    pub name: NameWithAlias,
-    pub functions: Vec<NameWithAlias>,
-    pub node: Option<T>,
-}
-
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub struct NameWithAlias {
-    pub name: String,
-    pub alias: String,
-}
-
-impl<T> Display for AstNodeType<T>
-where
-    T: Display,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AstNodeType::Number(number) => write!(f, "{}", number),
-            AstNodeType::String(string) => write!(f, "\"{}\"", string),
-            AstNodeType::Symbol(symbol) => write!(f, "{}", symbol),
-            AstNodeType::SymbolWithPath(symbol) => write!(f, "{}", symbol.join("::")),
-            AstNodeType::Definition {
-                name: symbol,
-                is_private,
-                body,
-            } => {
-                if *is_private {
-                    writeln!(f, "defp {} {}", symbol, body)
-                } else {
-                    writeln!(f, "def {} {}", symbol, body)
-                }
-            }
-            AstNodeType::ExternalDefinition(symbol, ty) => writeln!(f, "defx {} {}", symbol, ty),
-            AstNodeType::Import(symbol, import) => {
-                write!(f, "import {}", symbol.join("::"))?;
-                if import.functions.len() > 0 {
-                    write!(
-                        f,
-                        "({})",
-                        import
-                            .functions
-                            .iter()
-                            .map(|func| {
-                                if func.name != func.alias {
-                                    format!("{} as {}", func.name, func.alias)
-                                } else {
-                                    func.name.to_string()
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    )?;
-                }
-                if import.name.alias != symbol[symbol.len() - 1] {
-                    write!(f, " as {}", import.name.alias)?;
-                }
-                Ok(())
-            }
-            AstNodeType::Block(nodes) => write!(
-                f,
-                "{{{}}}",
-                nodes
-                    .iter()
-                    .map(|node| node.to_string())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            ),
-            AstNodeType::CustomType {
-                name,
-                generics,
-                variants,
-            } => {
-                write!(f, "type {}", name)?;
-                if !generics.is_empty() {
-                    write!(f, "<")?;
-
-                    write!(
-                        f,
-                        "{}",
-                        generics
-                            .iter()
-                            .map(|(name, _)| name.clone())
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    )?;
-                    write!(f, ">")?;
-                }
-                write!(f, " {{")?;
-
-                let mut variants_str = Vec::new();
-                for (variant, fields) in variants {
-                    let mut variant_str = variant.clone();
-                    if !fields.is_empty() {
-                        variant_str += "(";
-
-                        for (field, ty) in fields {
-                            variant_str += &format!("{} {}", field, ty);
-                        }
-                        variant_str += ")";
-                    }
-                    variants_str.push(variant_str);
-                }
-                write!(f, "{}", variants_str.join(" "))?;
-                write!(f, "}}")
-            }
-            AstNodeType::Match(cases) => {
-                write!(f, "match {{")?;
-
-                let mut case_str = Vec::new();
-                for case in cases {
-                    match &case.pattern {
-                        Pattern::Wildcard(name) => match name {
-                            Some(name) => {
-                                case_str.push(format!("* as {} => {}", name, case.body));
-                            }
-                            None => {
-                                case_str.push(format!("* => {}", case.body));
-                            }
-                        },
-                        Pattern::Number(number) => {
-                            case_str.push(format!("{} => {}", number, case.body));
-                        }
-                        Pattern::Variant {
-                            variant_name,
-                            fields,
-                        } => {
-                            let mut variant_str = variant_name.join("::");
-                            if !fields.is_empty() {
-                                variant_str += "(";
-
-                                let mut variants = Vec::new();
-                                for name_with_alias in fields {
-                                    if name_with_alias.name == name_with_alias.alias {
-                                        variants.push(name_with_alias.name.clone());
-                                    } else {
-                                        variants.push(format!(
-                                            "{} as {}",
-                                            name_with_alias.name, name_with_alias.alias
-                                        ));
-                                    }
-                                }
-                                variant_str = format!("({})", variants.join(" "));
-                            }
-                            case_str.push(format!("{} => {}", variant_str, case.body));
-                        }
-                    }
-                }
-                write!(f, "{}", case_str.join(" "))?;
-                write!(f, "}}")
-            }
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub struct AstNode {
-    pub node_type: AstNodeType<AstNode>,
-    pub position: Position,
-    pub type_definition: Option<Type>,
-}
-
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub struct Type {
-    pub pop_types: Vec<UnitType>,
-    pub push_types: Vec<UnitType>,
-}
-
-#[derive(Debug, Eq, PartialEq, Clone)]
-pub enum UnitType {
-    Literal(LiteralType),
-    Var(VarType),
-    Custom {
-        name: Vec<String>,
-        generic_types: Vec<UnitType>,
-    },
-    Type(Type),
-}
-
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub enum LiteralType {
-    Number(NumberType),
-    String,
-}
-
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub enum NumberType {
-    U8,
-    U16,
-    U32,
-    U64,
-    U128,
-    I8,
-    I16,
-    I32,
-    I64,
-    I128,
-    F64,
-}
-
-static VAR_TYPE: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Debug, PartialEq, Eq, Clone, Hash)]
-pub struct VarType {
-    identifier: u64,
-}
-
-impl VarType {
-    pub fn new() -> Self {
-        let id = VAR_TYPE.fetch_add(1, Ordering::SeqCst);
-        VarType { identifier: id }
-    }
-}
-
-pub struct VarTypeToCharContainer {
-    map: HashMap<VarType, char>,
-    current_char: char,
-}
-
-impl VarTypeToCharContainer {
-    pub fn new() -> Self {
-        VarTypeToCharContainer {
-            map: HashMap::new(),
-            current_char: 'a',
-        }
-    }
-
-    pub fn get_string(&mut self, var_type: &VarType) -> String {
-        if let Some(c) = self.map.get(var_type) {
-            return c.to_string();
-        }
-        self.map.insert(var_type.clone(), self.current_char);
-        let return_string = self.current_char.to_string();
-        self.current_char = (self.current_char as u8 + 1) as char;
-        return_string
-    }
-}
-
-impl UnitType {
-    pub fn to_consistent_string(&self, var_t: &mut VarTypeToCharContainer) -> String {
-        match self {
-            UnitType::Literal(LiteralType::Number(NumberType::U8)) => "U8".into(),
-            UnitType::Literal(LiteralType::Number(NumberType::U16)) => "U16".into(),
-            UnitType::Literal(LiteralType::Number(NumberType::U32)) => "U32".into(),
-            UnitType::Literal(LiteralType::Number(NumberType::U64)) => "U64".into(),
-            UnitType::Literal(LiteralType::Number(NumberType::U128)) => "U128".into(),
-            UnitType::Literal(LiteralType::Number(NumberType::I8)) => "I8".into(),
-            UnitType::Literal(LiteralType::Number(NumberType::I16)) => "I16".into(),
-            UnitType::Literal(LiteralType::Number(NumberType::I32)) => "I32".into(),
-            UnitType::Literal(LiteralType::Number(NumberType::I64)) => "I64".into(),
-            UnitType::Literal(LiteralType::Number(NumberType::I128)) => "I128".into(),
-            UnitType::Literal(LiteralType::Number(NumberType::F64)) => "F64".into(),
-            UnitType::Literal(LiteralType::String) => "String".into(),
-            UnitType::Var(var_type) => var_t.get_string(var_type),
-            UnitType::Custom {
-                name,
-                generic_types,
-                ..
-            } => {
-                if generic_types.is_empty() {
-                    name.join("::")
-                } else {
-                    format!(
-                        "{}<{}>",
-                        name.join("::"),
-                        generic_types
-                            .iter()
-                            .map(|ty| ty.to_consistent_string(var_t))
-                            .collect::<Vec<String>>()
-                            .join(" ")
-                    )
-                }
-            }
-            UnitType::Type(ty) => {
-                format!("{}", ty)
-            }
-        }
-    }
-}
-
-impl Display for UnitType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            self.to_consistent_string(&mut VarTypeToCharContainer::new())
-        )
-    }
-}
-
-impl Type {
-    pub fn new(pop_types: Vec<UnitType>, push_types: Vec<UnitType>) -> Self {
-        Type {
-            pop_types,
-            push_types,
-        }
-    }
-
-    pub fn u8() -> Self {
-        Self {
-            pop_types: vec![],
-            push_types: vec![UnitType::Literal(LiteralType::Number(NumberType::U8))],
-        }
-    }
-
-    pub fn u16() -> Self {
-        Self {
-            pop_types: vec![],
-            push_types: vec![UnitType::Literal(LiteralType::Number(NumberType::U16))],
-        }
-    }
-
-    pub fn u32() -> Self {
-        Self {
-            pop_types: vec![],
-            push_types: vec![UnitType::Literal(LiteralType::Number(NumberType::U32))],
-        }
-    }
-
-    pub fn u64() -> Self {
-        Self {
-            pop_types: vec![],
-            push_types: vec![UnitType::Literal(LiteralType::Number(NumberType::U64))],
-        }
-    }
-
-    pub fn u128() -> Self {
-        Self {
-            pop_types: vec![],
-            push_types: vec![UnitType::Literal(LiteralType::Number(NumberType::U128))],
-        }
-    }
-
-    pub fn i8() -> Self {
-        Self {
-            pop_types: vec![],
-            push_types: vec![UnitType::Literal(LiteralType::Number(NumberType::I8))],
-        }
-    }
-
-    pub fn i16() -> Self {
-        Self {
-            pop_types: vec![],
-            push_types: vec![UnitType::Literal(LiteralType::Number(NumberType::I16))],
-        }
-    }
-
-    pub fn i32() -> Self {
-        Self {
-            pop_types: vec![],
-            push_types: vec![UnitType::Literal(LiteralType::Number(NumberType::I32))],
-        }
-    }
-
-    pub fn i64() -> Self {
-        Self {
-            pop_types: vec![],
-            push_types: vec![UnitType::Literal(LiteralType::Number(NumberType::I64))],
-        }
-    }
-
-    pub fn i128() -> Self {
-        Self {
-            pop_types: vec![],
-            push_types: vec![UnitType::Literal(LiteralType::Number(NumberType::I128))],
-        }
-    }
-    pub fn f64() -> Self {
-        Self {
-            pop_types: vec![],
-            push_types: vec![UnitType::Literal(LiteralType::Number(NumberType::F64))],
-        }
-    }
-
-    pub fn string() -> Self {
-        Self {
-            pop_types: vec![],
-            push_types: vec![UnitType::Literal(LiteralType::String)],
-        }
-    }
-
-    pub(crate) fn empty() -> Self {
-        Self {
-            pop_types: vec![],
-            push_types: vec![],
-        }
-    }
-}
-
-impl Display for Type {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let mut var_t_container = VarTypeToCharContainer::new();
-        write!(
-            f,
-            "({} -> {})",
-            self.pop_types
-                .iter()
-                .map(|t| t.to_consistent_string(&mut var_t_container))
-                .collect::<Vec<String>>()
-                .join(" "),
-            self.push_types
-                .iter()
-                .map(|t| t.to_consistent_string(&mut var_t_container))
-                .collect::<Vec<String>>()
-                .join(" ")
-        )
-    }
-}
-
-#[derive(Debug, PartialEq, Eq, Error)]
-pub enum ParserError {
-    #[error("Error importing file {0}: {1}")]
-    ImportError(String, String),
-    #[error(transparent)]
-    LexerError(#[from] LexerError),
-    #[error("Unexpected token {0:?} at {1}")]
-    UnexpectedToken(TokenType, Position),
-    #[error("Unexpected end of input at {0}")]
-    UnexpectedEndOfInput(Position),
-    #[error("Invalid generic type {0} at {1}. A generic type must be lowercase")]
-    InvalidVarType(String, Position),
-    #[error("Duplicate field {0} at {1}")]
-    DuplicateField(String, Position),
-    #[error("Duplicate variant {0} at {1}")]
-    DuplicateVariant(String, Position),
 }
 
 impl<'a> Iterator for Parser<'a> {
@@ -1326,15 +1058,20 @@ mod tests {
 
     #[test]
     fn test_parse_string() {
-        let input = "\"Hello\"";
+        // A string literal desugars to a `List<Char>` cons-list (a Block).
+        let input = "\"Hi\"";
         let mut parser = Parser::new_from_str(input);
+        let node = parser.next().unwrap().unwrap();
+        assert!(matches!(node.node_type, AstNodeType::Block(_)));
         assert_eq!(
-            parser.next(),
-            Some(Ok(AstNode {
-                node_type: AstNodeType::String(String::from("Hello")),
-                position: Position::new(1, 1, None),
-                type_definition: Some(Type::string()),
-            }))
+            node.type_definition,
+            Some(Type::new(
+                vec![],
+                vec![UnitType::Custom {
+                    name: vec!["list".into(), "List".into()],
+                    generic_types: vec![UnitType::Literal(LiteralType::Char)],
+                }]
+            ))
         );
     }
 
@@ -1443,7 +1180,13 @@ mod tests {
             Some(Ok(AstNode {
                 node_type: AstNodeType::ExternalDefinition(
                     "println".into(),
-                    Type::new(vec![UnitType::Literal(LiteralType::String)], vec![])
+                    Type::new(
+                        vec![UnitType::Custom {
+                            name: vec!["list".into(), "List".into()],
+                            generic_types: vec![UnitType::Literal(LiteralType::Char)],
+                        }],
+                        vec![]
+                    )
                 ),
                 position: Position::new(1, 1, None),
                 type_definition: None,
@@ -1694,7 +1437,13 @@ mod tests {
                     variants: vec![(
                         "User".into(),
                         vec![
-                            ("name".into(), UnitType::Literal(LiteralType::String)),
+                            (
+                                "name".into(),
+                                UnitType::Custom {
+                                    name: vec!["list".into(), "List".into()],
+                                    generic_types: vec![UnitType::Literal(LiteralType::Char)],
+                                }
+                            ),
                             (
                                 "age".into(),
                                 UnitType::Literal(LiteralType::Number(NumberType::U32))
@@ -1855,9 +1604,9 @@ mod tests {
                     Case {
                         pattern: Pattern::Variant {
                             variant_name: vec!["Ok".into()],
-                            fields: vec![NameWithAlias {
-                                name: "val".into(),
-                                alias: "val".into()
+                            fields: vec![FieldPattern {
+                                field: "val".into(),
+                                pattern: Pattern::Wildcard(Some("val".into()))
                             }]
                         },
                         body: Box::new(AstNode {
@@ -1869,9 +1618,9 @@ mod tests {
                     Case {
                         pattern: Pattern::Variant {
                             variant_name: vec!["Err".into()],
-                            fields: vec![NameWithAlias {
-                                name: "err".into(),
-                                alias: "error".into()
+                            fields: vec![FieldPattern {
+                                field: "err".into(),
+                                pattern: Pattern::Wildcard(Some("error".into()))
                             }]
                         },
                         body: Box::new(AstNode {
@@ -1884,6 +1633,266 @@ mod tests {
                 position: Position::new(1, 1, None),
                 type_definition: None,
             }))
+        );
+    }
+
+    #[test]
+    fn parse_empty_list() {
+        let input = "[]";
+        let mut parser = Parser::new_from_str(input);
+        assert_eq!(
+            parser.next(),
+            Some(Ok(AstNode {
+                node_type: AstNodeType::Block(vec![AstNode {
+                    node_type: AstNodeType::SymbolWithPath(vec!["list".into(), "Empty".into()]),
+                    position: Position::new(1, 1, None),
+                    type_definition: None
+                }]),
+                position: Position::new(1, 1, None),
+                type_definition: None
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_list() {
+        let input = "[1 2 3]";
+        let mut parser = Parser::new_from_str(input);
+        let list_type = UnitType::Custom {
+            name: vec!["list".into(), "List".into()],
+            generic_types: vec![UnitType::Literal(LiteralType::Number(NumberType::I64))],
+        };
+        assert_eq!(
+            parser.next(),
+            Some(Ok(AstNode {
+                node_type: AstNodeType::Block(vec![
+                    AstNode {
+                        node_type: AstNodeType::SymbolWithPath(vec!["list".into(), "Empty".into()]),
+                        position: Position::new(1, 1, None),
+                        type_definition: Some(Type::new(vec![], vec![list_type.clone()]))
+                    },
+                    AstNode {
+                        node_type: AstNodeType::Number(Number::Integer(IntegerNumber::I64(3))),
+                        position: Position::new(1, 6, None),
+                        type_definition: Some(Type::new(
+                            vec![],
+                            vec![UnitType::Literal(LiteralType::Number(NumberType::I64))]
+                        ))
+                    },
+                    AstNode {
+                        node_type: AstNodeType::SymbolWithPath(vec!["list".into(), "List".into()]),
+                        position: Position::new(1, 1, None),
+                        type_definition: Some(Type::new(
+                            vec![
+                                list_type.clone(),
+                                UnitType::Literal(LiteralType::Number(NumberType::I64))
+                            ],
+                            vec![list_type.clone()]
+                        ))
+                    },
+                    AstNode {
+                        node_type: AstNodeType::Number(Number::Integer(IntegerNumber::I64(2))),
+                        position: Position::new(1, 4, None),
+                        type_definition: Some(Type::new(
+                            vec![],
+                            vec![UnitType::Literal(LiteralType::Number(NumberType::I64))]
+                        ))
+                    },
+                    AstNode {
+                        node_type: AstNodeType::SymbolWithPath(vec!["list".into(), "List".into()]),
+                        position: Position::new(1, 1, None),
+                        type_definition: Some(Type::new(
+                            vec![
+                                list_type.clone(),
+                                UnitType::Literal(LiteralType::Number(NumberType::I64))
+                            ],
+                            vec![list_type.clone()]
+                        ))
+                    },
+                    AstNode {
+                        node_type: AstNodeType::Number(Number::Integer(IntegerNumber::I64(1))),
+                        position: Position::new(1, 2, None),
+                        type_definition: Some(Type::new(
+                            vec![],
+                            vec![UnitType::Literal(LiteralType::Number(NumberType::I64))]
+                        ))
+                    },
+                    AstNode {
+                        node_type: AstNodeType::SymbolWithPath(vec!["list".into(), "List".into()]),
+                        position: Position::new(1, 1, None),
+                        type_definition: Some(Type::new(
+                            vec![
+                                list_type.clone(),
+                                UnitType::Literal(LiteralType::Number(NumberType::I64))
+                            ],
+                            vec![list_type.clone()]
+                        ))
+                    }
+                ]),
+                position: Position::new(1, 1, None),
+                type_definition: Some(Type::new(vec![], vec![list_type.clone()]))
+            }))
+        );
+    }
+
+    /// Parses a single-arm `match` and returns that arm's (desugared) pattern.
+    fn first_match_pattern(src: &str) -> Pattern {
+        let mut parser = Parser::new_from_str(src);
+        let node = parser.next().expect("a node").expect("no parse error");
+        let AstNodeType::Match(cases) = node.node_type else {
+            panic!("expected a match node");
+        };
+        cases.into_iter().next().expect("one case").pattern
+    }
+
+    fn list_variant(fields: Vec<FieldPattern>) -> Pattern {
+        Pattern::Variant {
+            variant_name: vec!["list".into(), "List".into()],
+            fields,
+        }
+    }
+
+    fn list_empty() -> Pattern {
+        Pattern::Variant {
+            variant_name: vec!["list".into(), "Empty".into()],
+            fields: vec![],
+        }
+    }
+
+    fn field(name: &str, pattern: Pattern) -> FieldPattern {
+        FieldPattern {
+            field: name.into(),
+            pattern,
+        }
+    }
+
+    fn bind(name: &str) -> Pattern {
+        Pattern::Wildcard(Some(name.into()))
+    }
+
+    #[test]
+    fn list_pattern_empty() {
+        assert_eq!(first_match_pattern("match { [] -> 1i64 }"), list_empty());
+    }
+
+    #[test]
+    fn list_pattern_single_is_exact() {
+        // `[a]` is exact-length: element bound, tail must be Empty.
+        assert_eq!(
+            first_match_pattern("match { [a] -> 1i64 }"),
+            list_variant(vec![
+                field("element", bind("a")),
+                field("next", list_empty()),
+            ])
+        );
+    }
+
+    #[test]
+    fn list_pattern_two_exact() {
+        assert_eq!(
+            first_match_pattern("match { [a b] -> 1i64 }"),
+            list_variant(vec![
+                field("element", bind("a")),
+                field(
+                    "next",
+                    list_variant(vec![
+                        field("element", bind("b")),
+                        field("next", list_empty()),
+                    ])
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn list_pattern_head_tail() {
+        assert_eq!(
+            first_match_pattern("match { [head ... tail] -> 1i64 }"),
+            list_variant(vec![
+                field("element", bind("head")),
+                field("next", bind("tail")),
+            ])
+        );
+    }
+
+    #[test]
+    fn list_pattern_two_plus_tail() {
+        assert_eq!(
+            first_match_pattern("match { [a b ... rest] -> 1i64 }"),
+            list_variant(vec![
+                field("element", bind("a")),
+                field(
+                    "next",
+                    list_variant(vec![
+                        field("element", bind("b")),
+                        field("next", bind("rest")),
+                    ])
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn list_pattern_tail_only_binds_whole_list() {
+        assert_eq!(
+            first_match_pattern("match { [... all] -> 1i64 }"),
+            bind("all")
+        );
+    }
+
+    #[test]
+    fn char_literal_pattern() {
+        assert_eq!(
+            first_match_pattern("match { 'a' -> 1i64 }"),
+            Pattern::Char('a')
+        );
+    }
+
+    #[test]
+    fn string_pattern_exact() {
+        // "ab" -> list::List('a', next list::List('b', next list::Empty))
+        assert_eq!(
+            first_match_pattern("match { \"ab\" -> 1i64 }"),
+            list_variant(vec![
+                field("element", Pattern::Char('a')),
+                field(
+                    "next",
+                    list_variant(vec![
+                        field("element", Pattern::Char('b')),
+                        field("next", list_empty()),
+                    ])
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn string_pattern_prefix() {
+        // "a" ... rest -> list::List('a', next rest)
+        assert_eq!(
+            first_match_pattern("match { \"a\" ... rest -> 1i64 }"),
+            list_variant(vec![
+                field("element", Pattern::Char('a')),
+                field("next", bind("rest")),
+            ])
+        );
+    }
+
+    #[test]
+    fn char_list_pattern_mixed() {
+        // ['a' c ... rest] mixes a char-literal match and bindings.
+        assert_eq!(
+            first_match_pattern("match { ['a' c ... rest] -> 1i64 }"),
+            list_variant(vec![
+                field("element", Pattern::Char('a')),
+                field(
+                    "next",
+                    list_variant(vec![
+                        field("element", bind("c")),
+                        field("next", bind("rest")),
+                    ])
+                ),
+            ])
         );
     }
 }

@@ -8,34 +8,60 @@ use std::{
 };
 
 use inkwell::{
-    AddressSpace,
-    builder::{Builder, BuilderError},
+    AddressSpace, AtomicOrdering, AtomicRMWBinOp,
+    builder::Builder,
     context::Context,
     module::Module,
-    types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, IntType, PointerType, StructType},
+    types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, StructType},
     values::{AggregateValue, BasicValue, BasicValueEnum, PointerValue},
 };
-use thiserror::Error;
+mod error;
+
+pub use error::CompilerError;
 
 use crate::{
-    internal_functions::{InternalFunction, builtins_functions},
+    internal_functions::builtins_functions,
     lexer::{IntegerNumber, Number, Position},
-    parser::{
-        AstNode, AstNodeType, LiteralType, NumberType, Parser, ParserError, Pattern, Type,
-        UnitType, VarType,
-    },
-    type_checker::{AstNodeWithType, CustomType, TypeChecker, TypeCheckerError},
+    parser::{AstNode, AstNodeType, FieldPattern, Parser, ParserError, Pattern},
+    type_checker::{AstNodeWithType, TypeChecker},
+    types::{CustomType, LiteralType, NumberType, Type, UnitType, VarType},
 };
 
 pub struct CompilerContext<'ctx> {
     pub context: &'ctx Context,
     pub module: Module<'ctx>,
     pub builder: Builder<'ctx>,
-    pub internal_functions:
-        Box<dyn Fn(&Module<'ctx>, &CompilerContext<'ctx>) -> Vec<InternalFunction<'ctx>> + 'ctx>,
     pub imports: HashMap<String, Scope<'ctx>>,
-    pub ref_count: RefCount<'ctx>,
     pub type_definitions: HashMap<Vec<String>, CustomType>,
+    pub global_strings: HashMap<String, PointerValue<'ctx>>,
+    /// Set while a (non-`main`) definition's body is being compiled: identifies
+    /// the function currently in scope for self-tail-call rewriting. A self-call
+    /// that matches `function_name` and is in tail position becomes a branch back
+    /// to `loop_header` (storing fresh args into `param_slots`) instead of a real
+    /// `call`+`ret`, so direct recursion runs in constant stack. Saved/restored
+    /// around nested definition compilation.
+    tail_ctx: Option<TailContext<'ctx>>,
+    /// Whether the node about to be compiled sits in tail position (its result is
+    /// the enclosing function's result). Consumed at the call site in
+    /// `call_function`; only meaningful together with `tail_ctx`.
+    tail_position: bool,
+    /// Owned values (currently: `match` scrutinees) whose drop the surrounding
+    /// code defers until *after* the arm body — in normal flow that drop runs at
+    /// the `match`'s merge block. A self-tail-call back-edge skips the merge, so
+    /// before branching it must replay these drops itself, or the scrutinee leaks
+    /// once per iteration. Innermost-last; only populated for arms in tail
+    /// position (the only ones that can produce a back-edge).
+    tail_cleanups: Vec<(UnitType, BasicValueEnum<'ctx>)>,
+}
+
+/// Self-tail-call target for the function whose body is currently compiling.
+/// Mutual / cross-function tail calls are out of scope (they need real backend
+/// tail calls); only direct self-recursion is lowered to a loop here.
+#[derive(Clone)]
+struct TailContext<'ctx> {
+    function_name: String,
+    param_slots: Vec<PointerValue<'ctx>>,
+    loop_header: inkwell::basic_block::BasicBlock<'ctx>,
 }
 
 pub fn compile(file: impl AsRef<Path>) -> Result<PathBuf, CompilerError> {
@@ -69,85 +95,93 @@ pub fn compile(file: impl AsRef<Path>) -> Result<PathBuf, CompilerError> {
     Ok(output_path)
 }
 
-pub struct RefCount<'ctx> {
-    ref_count_type: IntType<'ctx>,
-    ptr_type: PointerType<'ctx>,
-    ref_count_struct: StructType<'ctx>,
-}
-
-impl<'ctx> RefCount<'ctx> {
-    pub fn new(context: &'ctx Context) -> Self {
-        let ref_count_type = context.i64_type();
-        let ptr_type = context.ptr_type(AddressSpace::default());
-        let ref_count_struct = context.struct_type(&[ref_count_type.into(), ptr_type.into()], true);
-        Self {
-            ref_count_type,
-            ptr_type,
-            ref_count_struct,
-        }
-    }
-
-    pub fn create(
-        &self,
-        builder: &Builder<'ctx>,
-        ptr: PointerValue<'ctx>,
-    ) -> Result<PointerValue<'ctx>, CompilerError> {
-        let ref_count_type = self.ref_count_type;
-        let ref_count_struct = self.ref_count_struct;
-
-        let struct_val = builder.build_malloc(ref_count_struct, "struct_value")?;
-        let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 0, "rc")?;
-        builder.build_store(field_ptr, ref_count_type.const_int(1, false))?;
-        let field_ptr = builder.build_struct_gep(ref_count_struct, struct_val, 1, "ptr")?;
-        builder.build_store(field_ptr, ptr)?;
-
-        Ok(struct_val)
-    }
-}
-
 impl<'ctx> CompilerContext<'ctx> {
     pub fn new(context: &'ctx Context) -> Self {
         let module = context.create_module("std");
         let builder = context.create_builder();
-        let internal_functions = Box::new(
-            move |module: &Module<'ctx>, context: &CompilerContext<'ctx>| {
-                builtins_functions(context, &module)
-            },
-        );
 
         Self {
             context,
             module,
             builder,
-            internal_functions,
             imports: HashMap::new(),
-            ref_count: RefCount::new(context),
             type_definitions: HashMap::new(),
+            global_strings: HashMap::new(),
+            tail_ctx: None,
+            tail_position: false,
+            tail_cleanups: Vec::new(),
         }
     }
 
-    pub fn drop_value(&self, value: BasicValueEnum<'ctx>) -> Result<(), CompilerError> {
-        match value {
-            BasicValueEnum::PointerValue(ptr) => {
-                let rc_field_ptr = self.builder.build_struct_gep(
-                    self.ref_count.ref_count_struct,
-                    ptr,
-                    0,
-                    "ref_count",
+    /// True when the block the builder is currently positioned in already has a
+    /// terminator — e.g. a self-tail-call just rewrote this path into a back-edge,
+    /// so callers must not emit a fall-through branch or a `ret` after it.
+    fn current_block_terminated(&self) -> bool {
+        self.builder
+            .get_insert_block()
+            .and_then(|b| b.get_terminator())
+            .is_some()
+    }
+
+    /// Allocates `size` bytes from the slab pool (`clem_alloc`) instead of `malloc`.
+    pub fn build_pool_alloc(
+        &self,
+        size: inkwell::values::IntValue<'ctx>,
+    ) -> Result<PointerValue<'ctx>, CompilerError> {
+        let clem_alloc = self
+            .module
+            .get_function("clem_alloc")
+            .ok_or(CompilerError::GetFunctionError("clem_alloc".into()))?;
+        Ok(self
+            .builder
+            .build_call(clem_alloc, &[size.into()], "alloc")?
+            .try_as_basic_value()
+            .left()
+            .ok_or(CompilerError::FunctionCallError)?
+            .into_pointer_value())
+    }
+
+    /// Returns a node to the slab pool (`clem_free`) instead of `free`.
+    pub fn build_pool_free(&self, ptr: PointerValue<'ctx>) -> Result<(), CompilerError> {
+        let clem_free = self
+            .module
+            .get_function("clem_free")
+            .ok_or(CompilerError::GetFunctionError("clem_free".into()))?;
+        self.builder.build_call(clem_free, &[ptr.into()], "")?;
+        Ok(())
+    }
+
+    pub fn drop_value(
+        &self,
+        ty: UnitType,
+        value: BasicValueEnum<'ctx>,
+    ) -> Result<(), CompilerError> {
+        let ref_count_type = self.context.i64_type();
+        match ty {
+            UnitType::Custom {
+                name,
+                generic_types,
+            } => {
+                let ref_count_struct = self.base_custom_type();
+                let ptr = value.into_pointer_value();
+
+                let rc_field_ptr =
+                    self.builder
+                        .build_struct_gep(ref_count_struct, ptr, 0, "ref_count")?;
+                // Atomically decrement the refcount. `old` is the value *before* the
+                // subtraction; Release ordering ensures any writes through this owner
+                // happen-before the decrement other owners observe.
+                let old = self.builder.build_atomicrmw(
+                    AtomicRMWBinOp::Sub,
+                    rc_field_ptr,
+                    ref_count_type.const_int(1, false),
+                    AtomicOrdering::Release,
                 )?;
-                let rc = self
-                    .builder
-                    .build_load(self.ref_count.ref_count_type, rc_field_ptr, "get_ref_count")?
-                    .into_int_value();
-                let result = self.builder.build_int_sub(
-                    rc,
-                    self.ref_count.ref_count_type.const_int(1, false),
-                    "dec_ref_count",
-                )?;
+                // We were the last owner iff the count was 1 before decrementing.
                 let condition = self.builder.build_int_compare(
                     inkwell::IntPredicate::NE,
-                    result,
-                    self.ref_count.ref_count_type.const_int(0, false),
+                    old,
+                    ref_count_type.const_int(1, false),
                     "if_cond",
                 )?;
 
@@ -165,23 +199,82 @@ impl<'ctx> CompilerContext<'ctx> {
                 self.builder
                     .build_conditional_branch(condition, with_more_references, free_rc)?;
 
+                // The atomicrmw already wrote the decremented count, so this path just
+                // continues without freeing.
                 self.builder.position_at_end(with_more_references);
-                self.builder.build_store(rc_field_ptr, result)?;
                 self.builder.build_unconditional_branch(merge_block)?;
 
                 self.builder.position_at_end(free_rc);
-                let ptr_field_ptr = self.builder.build_struct_gep(
-                    self.ref_count.ref_count_struct,
-                    ptr,
-                    1,
-                    "ptr",
-                )?;
-                let ptr_field = self
+                // Acquire fence: pair with the Release decrements above so every prior
+                // owner's writes are visible before we read the payload and free it.
+                self.builder.build_fence(AtomicOrdering::Acquire, 0, "")?;
+                let variant_type = self.context.i8_type();
+
+                let variant_ptr =
+                    self.builder
+                        .build_struct_gep(ref_count_struct, ptr, 1, "variant")?;
+                let variant = self
                     .builder
-                    .build_load(self.ref_count.ptr_type, ptr_field_ptr, "get_ptr")?
-                    .into_pointer_value();
-                self.builder.build_free(ptr_field)?;
-                self.builder.build_free(ptr)?;
+                    .build_load(variant_type, variant_ptr, "get_variant")?
+                    .into_int_value();
+                let Some(ty) = self.get_type(name) else {
+                    return Err(CompilerError::UnexpectedType);
+                };
+                let mut blocks = Vec::new();
+                let variant_merge_block =
+                    self.context.append_basic_block(current_function, "merge");
+                for (index, _) in ty.variants.iter().enumerate() {
+                    let block = self.context.append_basic_block(current_function, "variant");
+                    blocks.push((self.context.i8_type().const_int(index as u64, false), block));
+                }
+                self.builder
+                    .build_switch(variant, variant_merge_block, &blocks)?;
+                let generics_map = ty
+                    .generics
+                    .iter()
+                    .map(|generic| generic.1.clone())
+                    .zip(generic_types.iter().cloned())
+                    .collect::<HashMap<_, _>>();
+                for (index, variant) in ty.variants.into_iter().enumerate() {
+                    let (_, block) = blocks[index];
+                    self.builder.position_at_end(block);
+                    let variant_type =
+                        custom_type_variant_struct(variant, generics_map.clone(), self)?;
+                    if variant_type.count_fields() > 0 {
+                        let payload_ptr = self.builder.build_struct_gep(
+                            ref_count_struct,
+                            ptr,
+                            2,
+                            "payload_ptr",
+                        )?;
+
+                        for field in 0..variant_type.count_fields() {
+                            match variant_type.get_field_type_at_index(field) {
+                                Some(BasicTypeEnum::PointerType(pointer_ty)) => {
+                                    let field_ptr = self.builder.build_struct_gep(
+                                        variant_type,
+                                        payload_ptr,
+                                        field,
+                                        "field",
+                                    )?;
+                                    let field_value = self.builder.build_load(
+                                        BasicTypeEnum::PointerType(pointer_ty),
+                                        field_ptr,
+                                        "field_value",
+                                    )?;
+                                    self.build_pool_free(field_value.into_pointer_value())?;
+                                }
+                                Some(_) => {}
+                                None => {}
+                            }
+                        }
+                    }
+                    self.builder
+                        .build_unconditional_branch(variant_merge_block)?;
+                }
+                self.builder.position_at_end(variant_merge_block);
+
+                self.build_pool_free(ptr)?;
                 self.builder.build_unconditional_branch(merge_block)?;
                 self.builder.position_at_end(merge_block);
                 Ok(())
@@ -190,53 +283,84 @@ impl<'ctx> CompilerContext<'ctx> {
         }
     }
 
+    /// Releases one reference to a heap node, freeing **only the node itself**
+    /// (never its fields) when the count reaches zero.
+    ///
+    /// Used on self-tail-call back-edges, which bypass the `match` merge where the
+    /// scrutinee is normally dropped. The full `drop_value` recursively frees a
+    /// node's child pointers, but a child may have been bound out of the scrutinee
+    /// and threaded into the next iteration — e.g. `tail` in a list fold — so
+    /// freeing it here would be a use-after-free once the loop reloads it. Freeing
+    /// just the node avoids that. The trade-off: a sole-owned child (one not
+    /// threaded forward) is leaked, which matches the reference-counting runtime's
+    /// existing limitation around recursive types (it has no runtime deep-drop).
+    fn build_rc_release_node_only(
+        &self,
+        ty: UnitType,
+        value: BasicValueEnum<'ctx>,
+    ) -> Result<(), CompilerError> {
+        let UnitType::Custom { .. } = ty else {
+            return Ok(());
+        };
+        let ptr = value.into_pointer_value();
+        let rc_type = self.context.i64_type();
+        let base = self.base_custom_type();
+        let rc_ptr = self.builder.build_struct_gep(base, ptr, 0, "rc")?;
+        let old = self.builder.build_atomicrmw(
+            AtomicRMWBinOp::Sub,
+            rc_ptr,
+            rc_type.const_int(1, false),
+            AtomicOrdering::Release,
+        )?;
+        let is_last = self.builder.build_int_compare(
+            inkwell::IntPredicate::EQ,
+            old,
+            rc_type.const_int(1, false),
+            "tc_last_ref",
+        )?;
+        let current_function = self
+            .builder
+            .get_insert_block()
+            .ok_or(CompilerError::IfWithoutFunction)?
+            .get_parent()
+            .ok_or(CompilerError::IfWithoutFunction)?;
+        let free_block = self.context.append_basic_block(current_function, "tc_free");
+        let cont_block = self.context.append_basic_block(current_function, "tc_cont");
+        self.builder
+            .build_conditional_branch(is_last, free_block, cont_block)?;
+        self.builder.position_at_end(free_block);
+        self.builder.build_fence(AtomicOrdering::Acquire, 0, "")?;
+        self.build_pool_free(ptr)?;
+        self.builder.build_unconditional_branch(cont_block)?;
+        self.builder.position_at_end(cont_block);
+        Ok(())
+    }
+
     pub fn clone_value(
         &self,
+        ty: UnitType,
         value: BasicValueEnum<'ctx>,
     ) -> Result<BasicValueEnum<'ctx>, CompilerError> {
-        match value {
-            BasicValueEnum::PointerValue(ptr) => {
-                let rc_field_ptr = self.builder.build_struct_gep(
-                    self.ref_count.ref_count_struct,
-                    ptr,
-                    0,
-                    "ref_count",
+        match ty {
+            UnitType::Custom { .. } => {
+                let ptr = value.into_pointer_value();
+                let ref_count_type = self.context.i64_type();
+                let ref_count_struct = self.base_custom_type();
+
+                let rc_field_ptr =
+                    self.builder
+                        .build_struct_gep(ref_count_struct, ptr, 0, "ref_count")?;
+                // Atomically bump the refcount. Monotonic (Relaxed) is sufficient:
+                // incrementing only needs the count itself to be race-free, with no
+                // ordering against the referent's data.
+                self.builder.build_atomicrmw(
+                    AtomicRMWBinOp::Add,
+                    rc_field_ptr,
+                    ref_count_type.const_int(1, false),
+                    AtomicOrdering::Monotonic,
                 )?;
-                let rc = self
-                    .builder
-                    .build_load(self.ref_count.ref_count_type, rc_field_ptr, "get_ref_count")?
-                    .into_int_value();
-                let result = self.builder.build_int_add(
-                    rc,
-                    self.ref_count.ref_count_type.const_int(1, false),
-                    "inc_ref_count",
-                )?;
-                self.builder.build_store(rc_field_ptr, result)?;
                 Ok(BasicValueEnum::PointerValue(ptr))
             }
-            other => Ok(other),
-        }
-    }
-
-    pub fn get_ptr_ptr(
-        &self,
-        ptr: PointerValue<'ctx>,
-    ) -> Result<PointerValue<'ctx>, CompilerError> {
-        let ptr_field_ptr =
-            self.builder
-                .build_struct_gep(self.ref_count.ref_count_struct, ptr, 1, "ref_ptr")?;
-        Ok(self
-            .builder
-            .build_load(self.ref_count.ptr_type, ptr_field_ptr, "get_ptr")?
-            .into_pointer_value())
-    }
-
-    pub fn deref_rc_if_necessary(
-        &self,
-        value: BasicValueEnum<'ctx>,
-    ) -> Result<BasicValueEnum<'ctx>, CompilerError> {
-        match value {
-            BasicValueEnum::PointerValue(ptr) => Ok(self.get_ptr_ptr(ptr)?.into()),
             _ => Ok(value),
         }
     }
@@ -250,20 +374,35 @@ impl<'ctx> CompilerContext<'ctx> {
     ) -> Result<(), CompilerError> {
         match program.node_type {
             AstNodeType::Number(number) => self.compile_number(stack, number),
-            AstNodeType::String(string) => self.compile_string(stack, string),
+            AstNodeType::Char(c) => self.compile_char(stack, c),
             AstNodeType::Symbol(symbol) => {
+                // `tail_position` stays set across the call so `call_function` can
+                // see it; clear it afterwards so it never leaks to a sibling word.
                 scope.call_symbol(vec![symbol], self, program.type_definition, stack)?;
+                self.tail_position = false;
                 Ok(())
             }
             AstNodeType::SymbolWithPath(symbol) => {
                 scope.call_symbol(symbol, self, program.type_definition, stack)?;
+                self.tail_position = false;
                 Ok(())
             }
             AstNodeType::Block(nodes) => {
                 let scope = Scope::with_parent(scope);
-                for node in nodes {
+                // Only the last word of a tail-positioned block is itself in tail
+                // position; earlier words run for their stack effect.
+                let outer_tail = self.tail_position;
+                let last = nodes.len().saturating_sub(1);
+                for (index, node) in nodes.into_iter().enumerate() {
+                    self.tail_position = outer_tail && index == last;
                     self.compile_ast(scope.clone(), stack, node, module_path.clone())?;
+                    // A self-tail-call rewrote this point into a back-edge: the
+                    // block is terminated, so nothing further on this path runs.
+                    if self.current_block_terminated() {
+                        break;
+                    }
                 }
+                self.tail_position = false;
 
                 Ok(())
             }
@@ -271,8 +410,7 @@ impl<'ctx> CompilerContext<'ctx> {
                 name: symbol, body, ..
             } => self.compile_definition(scope, &symbol, *body, module_path),
             AstNodeType::ExternalDefinition(symbol, ty) => {
-                let internal_functions = &self.internal_functions;
-                for function in &internal_functions(&self.module, &self) {
+                for function in builtins_functions(self) {
                     if function.name == symbol && match_types(&ty.pop_types, &function.ty.pop_types)
                     {
                         let fun = function.function.clone();
@@ -362,22 +500,36 @@ impl<'ctx> CompilerContext<'ctx> {
                                     return Err(CompilerError::UnexpectedType);
                                 };
                                 let generics_map = generics.iter().map(|generic| generic.1.clone()).zip(generic_types.iter().cloned()).collect::<HashMap<_, _>>();
-                                definitions.push((ty.clone(), Rc::new(Box::new(move |compiler_context: &CompilerContext<'ctx>,
+                                definitions.push((ty.clone(), Rc::new(Box::new(move |compiler_context: &mut CompilerContext<'ctx>,
                                       stack: &mut Stack<'ctx>|
                                       -> Result<(), CompilerError> {
+                                        let base_struct = compiler_context.base_custom_type();
                                         let variant_struct = custom_type_variant_struct(variant.clone(), generics_map.clone(), compiler_context)?;
                                         let values = stack.pop_n(ty.pop_types.len());
+                                        let obj_size = base_struct
+                                            .size_of()
+                                            .expect("size_of works");
+                                        let payload_size = variant_struct
+                                            .size_of()
+                                            .expect("size_of works");
+                                        let total_size = compiler_context.builder.build_int_add(
+                                            obj_size,
+                                            payload_size,
+                                            "obj_alloc_size",
+                                        )?;
 
-                                        let struct_val = compiler_context.builder.build_malloc(variant_struct, "struct_value")?;
-                                        let field_ptr = compiler_context.builder.build_struct_gep(variant_struct, struct_val, 0, "variant")?;
+                                        let struct_val = compiler_context.build_pool_alloc(total_size)?;
+                                        let rc_ptr = compiler_context.builder.build_struct_gep(base_struct, struct_val, 0, "rc")?;
+                                        let field_ptr = compiler_context.builder.build_struct_gep(base_struct, struct_val, 1, "variant")?;
+                                        compiler_context.builder.build_store(rc_ptr, compiler_context.context.i64_type().const_int(1, false))?;
                                         compiler_context.builder.build_store(field_ptr, compiler_context.context.i8_type().const_int(index as u64, false))?;
-                                        (1..(variant_struct.count_fields() as usize)).try_for_each(|field_index| -> Result<(), CompilerError> {
-                                            let field_ptr = compiler_context.builder.build_struct_gep(variant_struct, struct_val, field_index as u32, &format!("field_{}", field_index))?;
-                                            compiler_context.builder.build_store(field_ptr, values[field_index - 1].1)?;
+                                        let payload_ptr = compiler_context.builder.build_struct_gep(base_struct, struct_val, 2, "payload")?;
+                                        (0..(variant_struct.count_fields() as usize)).try_for_each(|field_index| -> Result<(), CompilerError> {
+                                            let field_ptr = compiler_context.builder.build_struct_gep(variant_struct, payload_ptr, field_index as u32, &format!("field_{}", field_index))?;
+                                            compiler_context.builder.build_store(field_ptr, values[field_index].1)?;
                                             Ok(())
                                         })?;
-                                        let ref_count = compiler_context.ref_count.create(&compiler_context.builder, struct_val)?;
-                                        stack.push((ty.push_types[0].clone(), ref_count.into()));
+                                        stack.push((ty.push_types[0].clone(), struct_val.into()));
                                         Ok(())
                                 }))));
                                 Ok(())
@@ -392,6 +544,18 @@ impl<'ctx> CompilerContext<'ctx> {
                 self.compile_match(scope, cases, stack, module_path, program.type_definition)
             }
         }
+    }
+
+    /// A char literal lowers to its Unicode scalar (code point) as an i32.
+    fn compile_char(&self, stack: &mut Stack<'ctx>, c: char) -> Result<(), CompilerError> {
+        stack.push((
+            UnitType::Literal(LiteralType::Char),
+            self.context
+                .i32_type()
+                .const_int(c as u64, false)
+                .as_basic_value_enum(),
+        ));
+        Ok(())
     }
 
     fn compile_number(&self, stack: &mut Stack<'ctx>, number: Number) -> Result<(), CompilerError> {
@@ -521,9 +685,7 @@ impl<'ctx> CompilerContext<'ctx> {
         if symbol_name == "main" {
             let function_name = "main";
             let function_type = self.context.i32_type().fn_type(&[], false);
-            let function = self
-                .module
-                .add_function(&function_name, function_type, None);
+            let function = self.module.add_function(function_name, function_type, None);
             let new_scope = Scope::with_parent(cloned_scope);
 
             let entry = self.context.append_basic_block(function, "entry");
@@ -541,6 +703,9 @@ impl<'ctx> CompilerContext<'ctx> {
                 stack.push(param);
             }
 
+            // `main` is never self-recursive: no tail loop, no tail position.
+            self.tail_ctx = None;
+            self.tail_position = false;
             self.compile_ast(new_scope, &mut stack, body, module_path)?;
 
             match stack.pop() {
@@ -583,18 +748,20 @@ impl<'ctx> CompilerContext<'ctx> {
                             .collect::<Vec<_>>()
                             .join("_")
                     );
-                    let function_type = function_type;
 
                     let function = context
                         .module
                         .add_function(&function_name, function_type, None);
+                    // Kept for the tail-call context; `function_name` itself is
+                    // moved into the call closure below.
+                    let tail_function_name = function_name.clone();
                     let symbol_name_cloned = symbol_name.clone();
                     {
                         let mut definitions = definitions.borrow_mut();
                         definitions.push((
                             ty.clone(),
                             Rc::new(Box::new(
-                                move |compiler_context: &CompilerContext<'ctx>,
+                                move |compiler_context: &mut CompilerContext<'ctx>,
                                       stack: &mut Stack<'ctx>|
                                       -> Result<(), CompilerError> {
                                     call_function(
@@ -610,22 +777,72 @@ impl<'ctx> CompilerContext<'ctx> {
                     }
                     let new_scope = Scope::with_parent(cloned_scope);
 
+                    // Give each parameter a stack slot seeded with the incoming
+                    // argument, then fall into a loop header. A self-tail-call is
+                    // lowered to "store fresh args into these slots; branch back to
+                    // the header", reusing this frame so direct recursion runs in
+                    // constant stack regardless of the optimization level.
                     let entry = context.context.append_basic_block(function, "entry");
+                    let loop_header = context.context.append_basic_block(function, "tail_loop");
                     context.builder.position_at_end(entry);
 
-                    let mut stack = Stack::new();
-
-                    for param in body
+                    let mut param_slots = Vec::new();
+                    let mut reload = Vec::new();
+                    for (pop_type, arg) in body
                         .type_definition
                         .pop_types
                         .clone()
                         .into_iter()
                         .zip(function.get_param_iter())
                     {
-                        stack.push(param);
+                        let llvm_type = arg.get_type();
+                        let slot = context.builder.build_alloca(llvm_type, "param_slot")?;
+                        context.builder.build_store(slot, arg)?;
+                        param_slots.push(slot);
+                        reload.push((pop_type, llvm_type, slot));
+                    }
+                    context.builder.build_unconditional_branch(loop_header)?;
+                    context.builder.position_at_end(loop_header);
+
+                    let mut stack = Stack::new();
+                    for (pop_type, llvm_type, slot) in &reload {
+                        let value = context.builder.build_load(*llvm_type, *slot, "param")?;
+                        stack.push((pop_type.clone(), value));
                     }
 
-                    context.compile_ast(new_scope, &mut stack, body, module_path.clone())?;
+                    // Activate self-tail-call rewriting for this function's body,
+                    // saving/restoring any enclosing function's context (definition
+                    // bodies can be compiled nested — a `defp` first called from
+                    // inside another function's match arm). In particular
+                    // `tail_cleanups` MUST reset, or this function's back-edge would
+                    // try to release the enclosing function's scrutinee.
+                    let prev_tail_ctx = context.tail_ctx.take();
+                    let prev_tail_position = context.tail_position;
+                    let prev_tail_cleanups = std::mem::take(&mut context.tail_cleanups);
+                    context.tail_ctx = Some(TailContext {
+                        function_name: tail_function_name,
+                        param_slots,
+                        loop_header,
+                    });
+                    context.tail_position = true;
+
+                    let compile_result =
+                        context.compile_ast(new_scope, &mut stack, body, module_path.clone());
+
+                    context.tail_ctx = prev_tail_ctx;
+                    context.tail_position = prev_tail_position;
+                    context.tail_cleanups = prev_tail_cleanups;
+                    compile_result?;
+
+                    // The body may have ended on a back-edge (e.g. an infinite tail
+                    // loop), terminating the current block; only emit a return when
+                    // the path actually falls through to one.
+                    if context.current_block_terminated() {
+                        if let Some(block) = current_block {
+                            context.builder.position_at_end(block);
+                        }
+                        return Ok(());
+                    }
 
                     match function_type.get_return_type() {
                         Some(BasicTypeEnum::StructType(return_type)) => {
@@ -728,7 +945,11 @@ impl<'ctx> CompilerContext<'ctx> {
                     NumberType::U128 | NumberType::I128 => Ok(self.context.i128_type().into()),
                     NumberType::F64 => Ok(self.context.f64_type().into()),
                 },
-                LiteralType::String => Ok(self.context.ptr_type(AddressSpace::default()).into()),
+                LiteralType::Char => Ok(self.context.i32_type().into()),
+                // Raw C pointers (`char*` / `void*`) cross FFI as opaque pointers.
+                LiteralType::CStr | LiteralType::Ptr => {
+                    Ok(self.context.ptr_type(AddressSpace::default()).into())
+                }
             },
             UnitType::Var(_) => todo!("Handle variatic types"),
             UnitType::Type(_) => todo!("Handle function types"),
@@ -736,24 +957,473 @@ impl<'ctx> CompilerContext<'ctx> {
         }
     }
 
-    fn compile_string(&self, stack: &mut Stack<'ctx>, string: String) -> Result<(), CompilerError> {
-        let value = self.builder.build_global_string_ptr(&string, "str")?;
-        let size = self
-            .context
-            .i64_type()
-            .const_int((string.len() + 1) as u64, false);
-        let output_buffer =
+    pub fn build_global_string(
+        &mut self,
+        string: String,
+    ) -> Result<PointerValue<'ctx>, CompilerError> {
+        match self.global_strings.get(&string) {
+            Some(value) => Ok(*value),
+            None => {
+                let value = self.builder.build_global_string_ptr(&string, "str")?;
+                let pointer = value.as_pointer_value();
+                self.global_strings.insert(string, pointer);
+                Ok(pointer)
+            }
+        }
+    }
+
+    /// Writes a Unicode scalar (`cp`, an i32 code point) to stdout as UTF-8,
+    /// emitting 1–4 bytes via `putchar`. This is the one string-output primitive;
+    /// the stdlib walks a `List<Char>` calling `char::print` for each element.
+    pub fn emit_print_char(
+        &self,
+        cp: inkwell::values::IntValue<'ctx>,
+    ) -> Result<(), CompilerError> {
+        let i32_type = self.context.i32_type();
+        let putchar = self
+            .module
+            .get_function("putchar")
+            .ok_or(CompilerError::GetFunctionError("putchar".into()))?;
+        let function = self
+            .builder
+            .get_insert_block()
+            .ok_or(CompilerError::IfWithoutFunction)?
+            .get_parent()
+            .ok_or(CompilerError::IfWithoutFunction)?;
+
+        let one = self.context.append_basic_block(function, "utf8_1");
+        let multi = self.context.append_basic_block(function, "utf8_multi");
+        let two = self.context.append_basic_block(function, "utf8_2");
+        let three_plus = self.context.append_basic_block(function, "utf8_3p");
+        let three = self.context.append_basic_block(function, "utf8_3");
+        let four = self.context.append_basic_block(function, "utf8_4");
+        let done = self.context.append_basic_block(function, "utf8_done");
+
+        let c = |v: u64| i32_type.const_int(v, false);
+        // `cp >> shift` (logical) then `low6 | mask`, producing a continuation/lead byte.
+        let shifted =
+            |cp: inkwell::values::IntValue<'ctx>, shift: u64| -> Result<_, CompilerError> {
+                Ok(self.builder.build_right_shift(cp, c(shift), false, "sh")?)
+            };
+        let put = |byte: inkwell::values::IntValue<'ctx>| -> Result<(), CompilerError> {
             self.builder
-                .build_array_malloc(self.context.i8_type(), size, "output_buffer")?;
+                .build_call(putchar, &[byte.into()], "putchar")?;
+            Ok(())
+        };
+        let or = |a, b, name| self.builder.build_or(a, b, name);
+        let and = |a, b, name| self.builder.build_and(a, b, name);
+
+        // cp < 0x80 ?
+        let lt_80 =
+            self.builder
+                .build_int_compare(inkwell::IntPredicate::ULT, cp, c(0x80), "lt80")?;
+        self.builder.build_conditional_branch(lt_80, one, multi)?;
+
+        // 1-byte: the code point itself.
+        self.builder.position_at_end(one);
+        put(cp)?;
+        self.builder.build_unconditional_branch(done)?;
+
+        self.builder.position_at_end(multi);
+        let lt_800 =
+            self.builder
+                .build_int_compare(inkwell::IntPredicate::ULT, cp, c(0x800), "lt800")?;
         self.builder
-            .build_memcpy(output_buffer, 1, value.as_pointer_value(), 1, size)?;
-        stack.push((
-            UnitType::Literal(LiteralType::String),
-            self.ref_count
-                .create(&self.builder, output_buffer)?
-                .as_basic_value_enum(),
-        ));
+            .build_conditional_branch(lt_800, two, three_plus)?;
+
+        // 2-byte: 110xxxxx 10xxxxxx
+        self.builder.position_at_end(two);
+        put(or(c(0xC0), shifted(cp, 6)?, "b0")?)?;
+        put(or(c(0x80), and(cp, c(0x3F), "lo")?, "b1")?)?;
+        self.builder.build_unconditional_branch(done)?;
+
+        self.builder.position_at_end(three_plus);
+        let lt_10000 = self.builder.build_int_compare(
+            inkwell::IntPredicate::ULT,
+            cp,
+            c(0x10000),
+            "lt10000",
+        )?;
+        self.builder
+            .build_conditional_branch(lt_10000, three, four)?;
+
+        // 3-byte: 1110xxxx 10xxxxxx 10xxxxxx
+        self.builder.position_at_end(three);
+        put(or(c(0xE0), shifted(cp, 12)?, "b0")?)?;
+        put(or(c(0x80), and(shifted(cp, 6)?, c(0x3F), "m")?, "b1")?)?;
+        put(or(c(0x80), and(cp, c(0x3F), "lo")?, "b2")?)?;
+        self.builder.build_unconditional_branch(done)?;
+
+        // 4-byte: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+        self.builder.position_at_end(four);
+        put(or(c(0xF0), shifted(cp, 18)?, "b0")?)?;
+        put(or(c(0x80), and(shifted(cp, 12)?, c(0x3F), "m1")?, "b1")?)?;
+        put(or(c(0x80), and(shifted(cp, 6)?, c(0x3F), "m2")?, "b2")?)?;
+        put(or(c(0x80), and(cp, c(0x3F), "lo")?, "b3")?)?;
+        self.builder.build_unconditional_branch(done)?;
+
+        self.builder.position_at_end(done);
         Ok(())
+    }
+
+    /// Compiles a custom-type `match` as a decision tree over the pattern matrix
+    /// (Maranget-style). `value_columns` are the values currently being matched;
+    /// each row carries the remaining column patterns, the leaf bindings gathered
+    /// so far, and the body. The builder is positioned at this node's entry block;
+    /// every emitted leaf branches to `merge_block` (recording its pushed values
+    /// for the phi) and any unmatched value falls through to `default_block`.
+    // The arguments thread the decision-tree state through recursion; bundling
+    // them into a struct would obscure more than it clarifies.
+    #[allow(clippy::too_many_arguments)]
+    fn compile_rows(
+        &mut self,
+        scope: &Scope<'ctx>,
+        value_columns: &[(UnitType, BasicValueEnum<'ctx>)],
+        rows: Vec<MatchRow<'ctx>>,
+        stack: &Stack<'ctx>,
+        module_path: &[String],
+        merge_block: inkwell::basic_block::BasicBlock<'ctx>,
+        default_block: inkwell::basic_block::BasicBlock<'ctx>,
+        values_and_blocks: &mut Vec<(
+            Vec<(UnitType, BasicValueEnum<'ctx>)>,
+            inkwell::basic_block::BasicBlock<'ctx>,
+        )>,
+        // Tail position of the enclosing match: leaf arm bodies inherit it so a
+        // self-tail-call inside an arm lowers to a loop back-edge.
+        outer_tail: bool,
+    ) -> Result<(), CompilerError> {
+        let Some(first) = rows.first() else {
+            // No row can match here: fall through.
+            self.builder.build_unconditional_branch(default_block)?;
+            return Ok(());
+        };
+
+        // If the highest-priority row has no constructor left to test, it matches:
+        // bind its columns + accumulated bindings and compile its body (a leaf).
+        let Some(col) = first
+            .patterns
+            .iter()
+            .position(|p| !matches!(p, Pattern::Wildcard(_)))
+        else {
+            let scope = scope.clone();
+            for (i, pattern) in first.patterns.iter().enumerate() {
+                if let Pattern::Wildcard(Some(name)) = pattern {
+                    let (ty, value) = &value_columns[i];
+                    scope.add_value(
+                        name.clone(),
+                        (ty.clone(), self.clone_value(ty.clone(), *value)?),
+                    );
+                }
+            }
+            for (name, (ty, value)) in &first.bindings {
+                scope.add_value(
+                    name.clone(),
+                    (ty.clone(), self.clone_value(ty.clone(), *value)?),
+                );
+            }
+            let n_push_types = first.body.type_definition.push_types.len();
+            let mut temp_stack = stack.clone();
+            self.tail_position = outer_tail;
+            self.compile_ast(
+                scope,
+                &mut temp_stack,
+                first.body.clone(),
+                module_path.to_vec(),
+            )?;
+            // Skip the merge edge if a tail-call already terminated this arm with a
+            // back-edge to the loop header.
+            if !self.current_block_terminated() {
+                self.builder.build_unconditional_branch(merge_block)?;
+                let bb = self
+                    .builder
+                    .get_insert_block()
+                    .ok_or(CompilerError::IfWithoutFunction)?;
+                values_and_blocks.push((temp_stack.pop_n(n_push_types), bb));
+            }
+            return Ok(());
+        };
+
+        // Scalar literal (Char/Number) column: discriminate by value (int switch).
+        if matches!(first.patterns[col], Pattern::Char(_) | Pattern::Number(_)) {
+            return self.compile_literal_rows(
+                scope,
+                value_columns,
+                rows,
+                col,
+                stack,
+                module_path,
+                merge_block,
+                default_block,
+                values_and_blocks,
+                outer_tail,
+            );
+        }
+
+        // Discriminate on column `col` (a custom-typed value).
+        let (col_ty, col_value) = value_columns[col].clone();
+        let UnitType::Custom {
+            name,
+            generic_types,
+        } = &col_ty
+        else {
+            return Err(CompilerError::UnsupportedPattern);
+        };
+        let custom_type = self
+            .get_type(name.clone())
+            .ok_or(CompilerError::TypeNotInScope)?;
+        let generics_map = custom_type
+            .generics
+            .iter()
+            .map(|generic| generic.1.clone())
+            .zip(generic_types.iter().cloned())
+            .collect::<HashMap<_, _>>();
+
+        // Constructors explicitly tested in this column, in first-appearance order.
+        let mut constructors: Vec<String> = Vec::new();
+        for row in &rows {
+            if let Pattern::Variant { variant_name, .. } = &row.patterns[col]
+                && let Some(c) = variant_name.last()
+                && !constructors.contains(c)
+            {
+                constructors.push(c.clone());
+            }
+        }
+
+        let current_function = self
+            .builder
+            .get_insert_block()
+            .ok_or(CompilerError::IfWithoutFunction)?
+            .get_parent()
+            .ok_or(CompilerError::IfWithoutFunction)?;
+        let switch_default = self
+            .context
+            .append_basic_block(current_function, "match_default");
+
+        let base = self.base_custom_type();
+        let match_ptr = col_value.into_pointer_value();
+        let disc_ptr = self
+            .builder
+            .build_struct_gep(base, match_ptr, 1, "variant")?;
+        let discriminant = self
+            .builder
+            .build_load(self.context.i8_type(), disc_ptr, "variant_load")?
+            .into_int_value();
+
+        let mut switch_arms = Vec::new();
+        for c in &constructors {
+            let index = custom_type
+                .variants
+                .iter()
+                .position(|v| &v.0 == c)
+                .ok_or_else(|| CompilerError::VariantNotFound(c.clone()))?;
+            let block = self
+                .context
+                .append_basic_block(current_function, &format!("case_{}", c));
+            switch_arms.push((index, c.clone(), block));
+        }
+        self.builder.build_switch(
+            discriminant,
+            switch_default,
+            &switch_arms
+                .iter()
+                .map(|(index, _, block)| {
+                    (
+                        self.context.i8_type().const_int(*index as u64, false),
+                        *block,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )?;
+
+        // Each tested constructor: destructure its fields and recurse with the
+        // column replaced by the variant's field columns.
+        for (_, c, block) in &switch_arms {
+            self.builder.position_at_end(*block);
+            let variant = custom_type
+                .variants
+                .iter()
+                .find(|v| &v.0 == c)
+                .expect("constructor exists")
+                .clone();
+            let payload_ptr = self
+                .builder
+                .build_struct_gep(base, match_ptr, 2, "payload_ptr")?;
+            let variant_struct =
+                custom_type_variant_struct(variant.clone(), generics_map.clone(), self)?;
+
+            let mut field_values = Vec::new();
+            for (field_index, (_, field_ty)) in variant.1.iter().enumerate() {
+                let resolved_ty = substitute_unit(field_ty, &generics_map);
+                let field_ptr = self.builder.build_struct_gep(
+                    variant_struct,
+                    payload_ptr,
+                    field_index as u32,
+                    "field_ptr",
+                )?;
+                let field_value = self.builder.build_load(
+                    variant_struct
+                        .get_field_type_at_index(field_index as u32)
+                        .expect("field exists"),
+                    field_ptr,
+                    "field_value",
+                )?;
+                field_values.push((resolved_ty, field_value));
+            }
+
+            let specialized = specialize_rows(&rows, col, c, &variant, &col_ty, col_value);
+            let mut new_columns = value_columns.to_vec();
+            let tail = new_columns.split_off(col + 1);
+            new_columns.pop();
+            new_columns.extend(field_values);
+            new_columns.extend(tail);
+
+            self.compile_rows(
+                scope,
+                &new_columns,
+                specialized,
+                stack,
+                module_path,
+                merge_block,
+                switch_default,
+                values_and_blocks,
+                outer_tail,
+            )?;
+        }
+
+        // The default: rows whose column `col` is a wildcard match any remaining
+        // constructor (binding the whole value if named).
+        self.builder.position_at_end(switch_default);
+        let defaulted = default_rows(&rows, col, &col_ty, col_value);
+        let mut default_columns = value_columns.to_vec();
+        default_columns.remove(col);
+        self.compile_rows(
+            scope,
+            &default_columns,
+            defaulted,
+            stack,
+            module_path,
+            merge_block,
+            default_block,
+            values_and_blocks,
+            outer_tail,
+        )
+    }
+
+    /// Like `compile_rows`, but for a column holding a scalar literal (`Char` or
+    /// number): discriminates the value with an integer `switch` (one block per
+    /// distinct literal, default for wildcard rows). Literal columns have no
+    /// sub-fields, so matching just drops the column (binding the value for a
+    /// wildcard row).
+    #[allow(clippy::too_many_arguments)]
+    fn compile_literal_rows(
+        &mut self,
+        scope: &Scope<'ctx>,
+        value_columns: &[(UnitType, BasicValueEnum<'ctx>)],
+        rows: Vec<MatchRow<'ctx>>,
+        col: usize,
+        stack: &Stack<'ctx>,
+        module_path: &[String],
+        merge_block: inkwell::basic_block::BasicBlock<'ctx>,
+        default_block: inkwell::basic_block::BasicBlock<'ctx>,
+        values_and_blocks: &mut Vec<(
+            Vec<(UnitType, BasicValueEnum<'ctx>)>,
+            inkwell::basic_block::BasicBlock<'ctx>,
+        )>,
+        outer_tail: bool,
+    ) -> Result<(), CompilerError> {
+        let (col_ty, col_value) = value_columns[col].clone();
+        let scrutinee = col_value.into_int_value();
+
+        // Drops column `col`; for a wildcard pattern, records its binding.
+        let without_col = |row: &MatchRow<'ctx>, bind_value: bool| -> MatchRow<'ctx> {
+            let mut patterns = row.patterns.clone();
+            let removed = patterns.remove(col);
+            let mut bindings = row.bindings.clone();
+            if bind_value && let Pattern::Wildcard(Some(name)) = removed {
+                bindings.push((name, (col_ty.clone(), col_value)));
+            }
+            MatchRow {
+                patterns,
+                bindings,
+                body: row.body.clone(),
+            }
+        };
+
+        // Distinct literal values tested in this column (first-appearance order).
+        let mut literals: Vec<u64> = Vec::new();
+        for row in &rows {
+            if let Some(k) = literal_key(&row.patterns[col])
+                && !literals.contains(&k)
+            {
+                literals.push(k);
+            }
+        }
+
+        let function = self
+            .builder
+            .get_insert_block()
+            .ok_or(CompilerError::IfWithoutFunction)?
+            .get_parent()
+            .ok_or(CompilerError::IfWithoutFunction)?;
+        let switch_default = self.context.append_basic_block(function, "lit_default");
+
+        let mut arms = Vec::new();
+        for &lit in &literals {
+            let block = self.context.append_basic_block(function, "lit_case");
+            arms.push((scrutinee.get_type().const_int(lit, false), block, lit));
+        }
+        self.builder.build_switch(
+            scrutinee,
+            switch_default,
+            &arms.iter().map(|(c, b, _)| (*c, *b)).collect::<Vec<_>>(),
+        )?;
+
+        for (_, block, lit) in &arms {
+            self.builder.position_at_end(*block);
+            // Rows matching this literal (drop col, no binding) or wildcards
+            // (drop col, bind the value).
+            let specialized: Vec<MatchRow<'ctx>> = rows
+                .iter()
+                .filter_map(|row| match &row.patterns[col] {
+                    Pattern::Wildcard(_) => Some(without_col(row, true)),
+                    p if literal_key(p) == Some(*lit) => Some(without_col(row, false)),
+                    _ => None,
+                })
+                .collect();
+            let mut columns = value_columns.to_vec();
+            columns.remove(col);
+            self.compile_rows(
+                scope,
+                &columns,
+                specialized,
+                stack,
+                module_path,
+                merge_block,
+                switch_default,
+                values_and_blocks,
+                outer_tail,
+            )?;
+        }
+
+        self.builder.position_at_end(switch_default);
+        let defaulted: Vec<MatchRow<'ctx>> = rows
+            .iter()
+            .filter(|row| matches!(row.patterns[col], Pattern::Wildcard(_)))
+            .map(|row| without_col(row, true))
+            .collect();
+        let mut columns = value_columns.to_vec();
+        columns.remove(col);
+        self.compile_rows(
+            scope,
+            &columns,
+            defaulted,
+            stack,
+            module_path,
+            merge_block,
+            default_block,
+            values_and_blocks,
+            outer_tail,
+        )
     }
 
     fn compile_match(
@@ -767,6 +1437,12 @@ impl<'ctx> CompilerContext<'ctx> {
         let Some(match_value) = stack.pop() else {
             return Err(CompilerError::StackUnderflow);
         };
+        // If the whole match is in tail position, so is every arm body (each arm's
+        // last word is the function's result). Stash that intent and clear the live
+        // flag so the discriminant/switch scaffolding below never trips it; we
+        // re-arm it right before compiling each arm body.
+        let outer_tail = self.tail_position;
+        self.tail_position = false;
         let current_function = self
             .builder
             .get_insert_block()
@@ -784,20 +1460,21 @@ impl<'ctx> CompilerContext<'ctx> {
                             .append_basic_block(current_function, &format!("case_{}", index)),
                     );
                 }
+                let switch_cases = cases
+                    .iter()
+                    .map(|case| match &case.pattern {
+                        Pattern::Number(n) => {
+                            Ok(self.number_to_llvm_number(n.clone()).1.into_int_value())
+                        }
+                        _ => Err(CompilerError::UnsupportedPattern),
+                    })
+                    .zip(case_blocks[0..case_blocks.len() - 1].iter().cloned())
+                    .map(|(value, block)| Ok((value?, block)))
+                    .collect::<Result<Vec<_>, CompilerError>>()?;
                 self.builder.build_switch(
                     match_value.1.into_int_value(),
                     case_blocks[case_blocks.len() - 1],
-                    cases
-                        .iter()
-                        .map(|case| match &case.pattern {
-                            Pattern::Number(n) => {
-                                self.number_to_llvm_number(n.clone()).1.into_int_value()
-                            }
-                            _ => panic!("Unsupported pattern type"),
-                        })
-                        .zip(case_blocks[0..case_blocks.len() - 1].iter().cloned())
-                        .collect::<Vec<_>>()
-                        .as_slice(),
+                    switch_cases.as_slice(),
                 )?;
                 for (index, case) in cases.into_iter().enumerate() {
                     let mut temp_stack = stack.clone();
@@ -805,18 +1482,23 @@ impl<'ctx> CompilerContext<'ctx> {
                         Pattern::Number(_) => {
                             self.builder.position_at_end(case_blocks[index]);
                             let n_push_types = case.body.type_definition.push_types.len();
+                            self.tail_position = outer_tail;
                             self.compile_ast(
                                 scope.clone(),
                                 &mut temp_stack,
                                 *case.body,
                                 module_path.clone(),
                             )?;
-                            self.builder.build_unconditional_branch(merge_block)?;
-                            let bb = self
-                                .builder
-                                .get_insert_block()
-                                .ok_or(CompilerError::IfWithoutFunction)?;
-                            values_and_blocks.push((temp_stack.pop_n(n_push_types), bb));
+                            // Skip the merge edge if a tail-call already terminated
+                            // this arm with a back-edge to the loop header.
+                            if !self.current_block_terminated() {
+                                self.builder.build_unconditional_branch(merge_block)?;
+                                let bb = self
+                                    .builder
+                                    .get_insert_block()
+                                    .ok_or(CompilerError::IfWithoutFunction)?;
+                                values_and_blocks.push((temp_stack.pop_n(n_push_types), bb));
+                            }
                         }
                         Pattern::Wildcard(name) => {
                             self.builder.position_at_end(case_blocks[index]);
@@ -825,24 +1507,33 @@ impl<'ctx> CompilerContext<'ctx> {
                             if let Some(name) = name {
                                 scope.add_value(name, match_value.clone());
                             }
+                            self.tail_position = outer_tail;
                             self.compile_ast(
                                 scope,
                                 &mut temp_stack,
                                 *case.body,
                                 module_path.clone(),
                             )?;
-                            self.builder.build_unconditional_branch(merge_block)?;
-                            let bb = self
-                                .builder
-                                .get_insert_block()
-                                .ok_or(CompilerError::IfWithoutFunction)?;
-                            values_and_blocks.push((temp_stack.pop_n(n_push_types), bb));
+                            if !self.current_block_terminated() {
+                                self.builder.build_unconditional_branch(merge_block)?;
+                                let bb = self
+                                    .builder
+                                    .get_insert_block()
+                                    .ok_or(CompilerError::IfWithoutFunction)?;
+                                values_and_blocks.push((temp_stack.pop_n(n_push_types), bb));
+                            }
                         }
-                        _ => panic!("This is not a valid pattern for this type"),
+                        _ => return Err(CompilerError::UnsupportedPattern),
                     }
                 }
                 stack.pop_n(match_type.pop_types.len());
                 self.builder.position_at_end(merge_block);
+                // INVARIANT: every arm pushes the same number of values, each of
+                // the same LLVM type, in the same order. This is guaranteed by the
+                // type checker (TypeCheckerError::InvalidMatchBody rejects arms whose
+                // stack effect differs), so building one phi per position is sound.
+                // If that check is ever weakened, mismatched arms would silently
+                // produce malformed IR here rather than a clean compiler error.
                 let mut values_for_phi = Vec::new();
                 for (values, block) in values_and_blocks.iter() {
                     for (index, value) in values.iter().enumerate() {
@@ -852,194 +1543,61 @@ impl<'ctx> CompilerContext<'ctx> {
                         }
                         values_for_phi[index]
                             .1
-                            .push((&value.1 as &dyn BasicValue, block.clone()));
+                            .push((&value.1 as &dyn BasicValue, *block));
                     }
                 }
                 for (ty, values) in values_for_phi.into_iter() {
-                    let phi = self.builder.build_phi(ty.1, "phi").unwrap();
+                    let phi = self.builder.build_phi(ty.1, "phi")?;
                     phi.add_incoming(values.as_slice());
                     stack.push((ty.0, phi.as_basic_value()));
                 }
                 Ok(())
             }
-            UnitType::Custom {
-                name,
-                generic_types,
-                ..
-            } => {
-                let Some(custom_type) = self.get_type(name) else {
-                    panic!("We should always find the custom type in the scope")
-                };
-                let mut case_blocks = Vec::new();
-                let mut values_and_blocks = Vec::new();
-                let mut index_to_variant_index = HashMap::new();
-                for (index, case) in cases.iter().enumerate() {
-                    match &case.pattern {
-                        Pattern::Wildcard(_) => {}
-                        Pattern::Variant { variant_name, .. } => {
-                            let variant_index = custom_type
-                                .variants
-                                .iter()
-                                .position(|variant| Some(&variant.0) == variant_name.last())
-                                .unwrap();
-                            index_to_variant_index.insert(index, variant_index);
-                            case_blocks.push(self.context.append_basic_block(
-                                current_function,
-                                &format!("case_{}", variant_index),
-                            ));
-                        }
-                        _ => panic!("Unsupported pattern type"),
-                    }
-                }
+            UnitType::Custom { .. } => {
+                let rows: Vec<MatchRow<'ctx>> = cases
+                    .into_iter()
+                    .map(|case| MatchRow {
+                        patterns: vec![case.pattern],
+                        bindings: Vec::new(),
+                        body: *case.body,
+                    })
+                    .collect();
 
-                let match_ptr = self.get_ptr_ptr(match_value.clone().1.into_pointer_value())?;
-
-                let struct_type = self
+                // The match is exhaustive (type checker guarantees it), so the
+                // final fall-through is unreachable.
+                let default_block = self
                     .context
-                    .struct_type(&[self.context.i8_type().into()], true);
-                let ptr_field_ptr =
-                    self.builder
-                        .build_struct_gep(struct_type, match_ptr, 0, "variant_value")?;
-                let variant_value = self.builder.build_load(
-                    self.context.i8_type(),
-                    ptr_field_ptr,
-                    "variant_value_load",
-                )?;
-                let else_block = self.context.append_basic_block(current_function, "else");
-
-                self.builder.build_switch(
-                    variant_value.into_int_value(),
-                    else_block,
-                    cases
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, case)| match &case.pattern {
-                            Pattern::Variant { .. } => Some(
-                                self.context.i8_type().const_int(
-                                    *index_to_variant_index
-                                        .get(&index)
-                                        .expect("We created the map before")
-                                        as u64,
-                                    false,
-                                ),
-                            ),
-                            _ => None,
-                        })
-                        .zip(case_blocks[0..case_blocks.len()].iter().cloned())
-                        .collect::<Vec<_>>()
-                        .as_slice(),
-                )?;
-
-                let generics_map = custom_type
-                    .generics
-                    .iter()
-                    .map(|generic| generic.1.clone())
-                    .zip(generic_types.iter().cloned())
-                    .collect::<HashMap<_, _>>();
-
-                let mut has_wild_card = false;
-                for (index, case) in cases.into_iter().enumerate() {
-                    let mut temp_stack = stack.clone();
-                    match case.pattern {
-                        Pattern::Wildcard(name) => {
-                            has_wild_card = true;
-                            self.builder.position_at_end(else_block);
-                            let n_push_types = case.body.type_definition.push_types.len();
-                            let scope = scope.clone();
-                            if let Some(name) = name {
-                                scope.add_value(name, match_value.clone());
-                            }
-                            self.compile_ast(
-                                scope,
-                                &mut temp_stack,
-                                *case.body,
-                                module_path.clone(),
-                            )?;
-                            self.builder.build_unconditional_branch(merge_block)?;
-                            let bb = self
-                                .builder
-                                .get_insert_block()
-                                .ok_or(CompilerError::IfWithoutFunction)?;
-                            values_and_blocks.push((temp_stack.pop_n(n_push_types), bb));
-                        }
-                        Pattern::Variant {
-                            variant_name,
-                            fields,
-                        } => {
-                            self.builder.position_at_end(case_blocks[index]);
-                            let n_push_types = case.body.type_definition.push_types.len();
-                            let variant = custom_type
-                                .variants
-                                .iter()
-                                .find(|v| Some(&v.0) == variant_name.last())
-                                .expect("The variant should always exist")
-                                .clone();
-                            let struct_type = custom_type_variant_struct(
-                                variant.clone(),
-                                generics_map.clone(),
-                                &self,
-                            )?;
-
-                            let scope = scope.clone();
-                            for field in fields {
-                                let field_index = variant
-                                    .1
-                                    .iter()
-                                    .position(|f| f.0 == field.name)
-                                    .expect("We should always find the field");
-                                let ptr_field_ptr = self.builder.build_struct_gep(
-                                    struct_type,
-                                    match_ptr,
-                                    (field_index + 1) as u32,
-                                    "field_ptr",
-                                )?;
-                                let field_value = self.builder.build_load(
-                                    struct_type
-                                        .get_field_type_at_index(field_index as u32)
-                                        .expect("We know that this field exists"),
-                                    ptr_field_ptr,
-                                    "field_value",
-                                )?;
-                                let ty = &variant.1[field_index].1;
-                                let ty = match ty {
-                                    UnitType::Var(var) => generics_map.get(var).unwrap_or(ty),
-                                    _ => ty,
-                                };
-                                scope.add_value(field.alias, (ty.clone(), field_value));
-                            }
-                            self.compile_ast(
-                                scope,
-                                &mut temp_stack,
-                                *case.body,
-                                module_path.clone(),
-                            )?;
-                            self.builder.build_unconditional_branch(merge_block)?;
-                            let bb = self
-                                .builder
-                                .get_insert_block()
-                                .ok_or(CompilerError::IfWithoutFunction)?;
-                            values_and_blocks.push((temp_stack.pop_n(n_push_types), bb));
-                        }
-                        _ => panic!("Unsupported variant type"),
-                    }
+                    .append_basic_block(current_function, "match_unreachable");
+                let mut values_and_blocks = Vec::new();
+                // For tail-positioned arms, the back-edge bypasses the merge drop
+                // below, so register the scrutinee as a deferred cleanup it replays.
+                // (A non-tail match never back-edges, so skip the bookkeeping.)
+                if outer_tail {
+                    self.tail_cleanups
+                        .push((match_value.0.clone(), match_value.1));
                 }
+                self.compile_rows(
+                    &scope,
+                    std::slice::from_ref(&match_value),
+                    rows,
+                    stack,
+                    &module_path,
+                    merge_block,
+                    default_block,
+                    &mut values_and_blocks,
+                    outer_tail,
+                )?;
+                if outer_tail {
+                    self.tail_cleanups.pop();
+                }
+                self.builder.position_at_end(default_block);
+                self.builder.build_unreachable()?;
+
                 stack.pop_n(match_type.pop_types.len() - 1);
-                if !has_wild_card {
-                    self.builder.position_at_end(else_block);
-                    let bb = self
-                        .builder
-                        .get_insert_block()
-                        .ok_or(CompilerError::IfWithoutFunction)?;
-                    values_and_blocks.push((
-                        values_and_blocks
-                            .last()
-                            .map(|d| d.0.clone())
-                            .unwrap_or(Vec::new()),
-                        bb,
-                    ));
-                    self.builder.build_unconditional_branch(merge_block)?;
-                }
                 self.builder.position_at_end(merge_block);
+                // INVARIANT: every arm pushes the same number of values, each of the
+                // same LLVM type, in the same order (guaranteed by the type checker
+                // via InvalidMatchBody), so one phi per position is sound.
                 let mut values_for_phi = Vec::new();
                 for (values, block) in values_and_blocks.iter() {
                     for (index, value) in values.iter().enumerate() {
@@ -1049,24 +1607,345 @@ impl<'ctx> CompilerContext<'ctx> {
                         }
                         values_for_phi[index]
                             .1
-                            .push((&value.1 as &dyn BasicValue, block.clone()));
+                            .push((&value.1 as &dyn BasicValue, *block));
                     }
                 }
                 for (ty, values) in values_for_phi.into_iter() {
-                    let phi = self.builder.build_phi(ty.1, "phi").unwrap();
+                    let phi = self.builder.build_phi(ty.1, "phi")?;
                     phi.add_incoming(values.as_slice());
                     stack.push((ty.0, phi.as_basic_value()));
                 }
-                self.drop_value(match_value.clone().1)?;
+                self.drop_value(match_value.0, match_value.1)?;
                 Ok(())
             }
-            other => return Err(CompilerError::UnsupportedType(other)),
+            other => Err(CompilerError::UnsupportedType(other)),
         }
     }
 
     pub fn get_type(&self, name: Vec<String>) -> Option<CustomType> {
         self.type_definitions.get(&name).cloned()
     }
+
+    /// Layout of every heap-allocated custom-type value (packed):
+    /// `{ i64 refcount, i8 variant_tag, payload }`. The variant tag is an `i8`
+    /// (≤256 variants), saving 7 bytes per object versus an `i64`.
+    pub fn base_custom_type(&self) -> StructType<'ctx> {
+        let fields = vec![
+            self.context.i64_type().into(),
+            self.context.i8_type().into(),
+            self.context.i8_type().array_type(0).into(),
+        ];
+        self.context.struct_type(&fields, true)
+    }
+
+    /// Builds a `List<Char>` (a `String`) value from a NUL-terminated ASCII C
+    /// buffer at runtime, by walking it back-to-front and consing each byte.
+    /// Used by the native `f64::to_string` (which formats via `sprintf`).
+    pub fn emit_string_from_cstr(
+        &self,
+        buffer: PointerValue<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>, CompilerError> {
+        let list = self
+            .get_type(vec!["std".into(), "list".into(), "List".into()])
+            .ok_or(CompilerError::TypeNotInScope)?;
+        let mut generics_map = HashMap::new();
+        if let Some((_, var)) = list.generics.first() {
+            generics_map.insert(var.clone(), UnitType::Literal(LiteralType::Char));
+        }
+        let empty_index = list
+            .variants
+            .iter()
+            .position(|v| v.0 == "Empty")
+            .ok_or_else(|| CompilerError::VariantNotFound("Empty".into()))?;
+        let list_index = list
+            .variants
+            .iter()
+            .position(|v| v.0 == "List")
+            .ok_or_else(|| CompilerError::VariantNotFound("List".into()))?;
+        let empty_variant = list.variants[empty_index].clone();
+        let list_variant = list.variants[list_index].clone();
+
+        let base = self.base_custom_type();
+        let i64_type = self.context.i64_type();
+        let i32_type = self.context.i32_type();
+        let i8_type = self.context.i8_type();
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+
+        let empty_struct = custom_type_variant_struct(empty_variant, generics_map.clone(), self)?;
+        let list_struct = custom_type_variant_struct(list_variant, generics_map.clone(), self)?;
+        let base_size = base.size_of().expect("sized");
+
+        let build_empty = || -> Result<PointerValue<'ctx>, CompilerError> {
+            let total = self.builder.build_int_add(
+                base_size,
+                empty_struct.size_of().expect("sized"),
+                "sz",
+            )?;
+            let p = self.build_pool_alloc(total)?;
+            self.builder.build_store(
+                self.builder.build_struct_gep(base, p, 0, "rc")?,
+                i64_type.const_int(1, false),
+            )?;
+            self.builder.build_store(
+                self.builder.build_struct_gep(base, p, 1, "variant")?,
+                i8_type.const_int(empty_index as u64, false),
+            )?;
+            Ok(p)
+        };
+        let build_cons = |next: PointerValue<'ctx>,
+                          element: inkwell::values::IntValue<'ctx>|
+         -> Result<PointerValue<'ctx>, CompilerError> {
+            let total = self.builder.build_int_add(
+                base_size,
+                list_struct.size_of().expect("sized"),
+                "sz",
+            )?;
+            let p = self.build_pool_alloc(total)?;
+            self.builder.build_store(
+                self.builder.build_struct_gep(base, p, 0, "rc")?,
+                i64_type.const_int(1, false),
+            )?;
+            self.builder.build_store(
+                self.builder.build_struct_gep(base, p, 1, "variant")?,
+                i8_type.const_int(list_index as u64, false),
+            )?;
+            let payload = self.builder.build_struct_gep(base, p, 2, "payload")?;
+            // Field order matches the variant declaration `List(next, element)`.
+            self.builder.build_store(
+                self.builder
+                    .build_struct_gep(list_struct, payload, 0, "next")?,
+                next,
+            )?;
+            self.builder.build_store(
+                self.builder
+                    .build_struct_gep(list_struct, payload, 1, "element")?,
+                element,
+            )?;
+            Ok(p)
+        };
+
+        let strlen = self
+            .module
+            .get_function("strlen")
+            .ok_or(CompilerError::GetFunctionError("strlen".into()))?;
+        let len = self
+            .builder
+            .build_call(strlen, &[buffer.into()], "len")?
+            .try_as_basic_value()
+            .left()
+            .ok_or(CompilerError::FunctionCallError)?
+            .into_int_value();
+        let acc0 = build_empty()?;
+
+        let function = self
+            .builder
+            .get_insert_block()
+            .ok_or(CompilerError::IfWithoutFunction)?
+            .get_parent()
+            .ok_or(CompilerError::IfWithoutFunction)?;
+        let entry = self
+            .builder
+            .get_insert_block()
+            .ok_or(CompilerError::IfWithoutFunction)?;
+        let cond = self.context.append_basic_block(function, "decode_cond");
+        let body = self.context.append_basic_block(function, "decode_body");
+        let done = self.context.append_basic_block(function, "decode_done");
+        self.builder.build_unconditional_branch(cond)?;
+
+        self.builder.position_at_end(cond);
+        let i_phi = self.builder.build_phi(i64_type, "i")?;
+        let acc_phi = self.builder.build_phi(ptr_type, "acc")?;
+        i_phi.add_incoming(&[(&len as &dyn BasicValue, entry)]);
+        acc_phi.add_incoming(&[(&acc0 as &dyn BasicValue, entry)]);
+        let i_val = i_phi.as_basic_value().into_int_value();
+        let acc_val = acc_phi.as_basic_value().into_pointer_value();
+        let positive = self.builder.build_int_compare(
+            inkwell::IntPredicate::UGT,
+            i_val,
+            i64_type.const_zero(),
+            "pos",
+        )?;
+        self.builder
+            .build_conditional_branch(positive, body, done)?;
+
+        self.builder.position_at_end(body);
+        let idx = self
+            .builder
+            .build_int_sub(i_val, i64_type.const_int(1, false), "idx")?;
+        let char_ptr = unsafe {
+            self.builder
+                .build_gep(i8_type, buffer, &[idx], "char_ptr")?
+        };
+        let byte = self
+            .builder
+            .build_load(i8_type, char_ptr, "byte")?
+            .into_int_value();
+        let code_point = self
+            .builder
+            .build_int_z_extend(byte, i32_type, "code_point")?;
+        let new_acc = build_cons(acc_val, code_point)?;
+        let body_end = self
+            .builder
+            .get_insert_block()
+            .ok_or(CompilerError::IfWithoutFunction)?;
+        i_phi.add_incoming(&[(&idx as &dyn BasicValue, body_end)]);
+        acc_phi.add_incoming(&[(&new_acc as &dyn BasicValue, body_end)]);
+        self.builder.build_unconditional_branch(cond)?;
+
+        self.builder.position_at_end(done);
+        Ok(acc_val.as_basic_value_enum())
+    }
+}
+
+/// Deeply replaces every `Var` in `ty` using `generics_map`, recursing into the
+/// generic arguments of `Custom` types and nested function `Type`s. Needed so a
+/// nested field type like `List<a>` resolves to `List<I64>` (not `List<Var>`)
+/// before codegen, which cannot lower a bare type variable.
+fn substitute_unit(ty: &UnitType, generics_map: &HashMap<VarType, UnitType>) -> UnitType {
+    match ty {
+        UnitType::Var(var) => generics_map.get(var).cloned().unwrap_or_else(|| ty.clone()),
+        UnitType::Custom {
+            name,
+            generic_types,
+        } => UnitType::Custom {
+            name: name.clone(),
+            generic_types: generic_types
+                .iter()
+                .map(|t| substitute_unit(t, generics_map))
+                .collect(),
+        },
+        UnitType::Type(inner) => UnitType::Type(Type::new(
+            inner
+                .pop_types
+                .iter()
+                .map(|t| substitute_unit(t, generics_map))
+                .collect(),
+            inner
+                .push_types
+                .iter()
+                .map(|t| substitute_unit(t, generics_map))
+                .collect(),
+        )),
+        UnitType::Literal(_) => ty.clone(),
+    }
+}
+
+/// One arm in the match decision matrix: the remaining column patterns, the leaf
+/// bindings gathered while descending the tree, and the body to compile on match.
+#[derive(Clone)]
+struct MatchRow<'ctx> {
+    patterns: Vec<Pattern>,
+    bindings: Vec<(String, (UnitType, BasicValueEnum<'ctx>))>,
+    body: AstNodeWithType,
+}
+
+/// The integer value of a scalar literal pattern (`Char` code point or integer),
+/// used to key the `switch` when discriminating a literal column. `None` for
+/// non-literal patterns (and floats, which aren't matched).
+fn literal_key(pattern: &Pattern) -> Option<u64> {
+    match pattern {
+        Pattern::Char(c) => Some(*c as u64),
+        Pattern::Number(Number::Integer(n)) => Some(match n {
+            IntegerNumber::U8(v) => *v as u64,
+            IntegerNumber::U16(v) => *v as u64,
+            IntegerNumber::U32(v) => *v as u64,
+            IntegerNumber::U64(v) => *v,
+            IntegerNumber::U128(v) => *v as u64,
+            IntegerNumber::I8(v) => *v as u64,
+            IntegerNumber::I16(v) => *v as u64,
+            IntegerNumber::I32(v) => *v as u64,
+            IntegerNumber::I64(v) => *v as u64,
+            IntegerNumber::I128(v) => *v as u64,
+        }),
+        _ => None,
+    }
+}
+
+/// The sub-patterns for a variant's fields, in declaration order (a field the
+/// pattern omits becomes a wildcard).
+fn variant_sub_patterns(
+    variant: &(String, Vec<(String, UnitType)>),
+    fields: &[FieldPattern],
+) -> Vec<Pattern> {
+    variant
+        .1
+        .iter()
+        .map(|(field_name, _)| {
+            fields
+                .iter()
+                .find(|f| &f.field == field_name)
+                .map(|f| f.pattern.clone())
+                .unwrap_or(Pattern::Wildcard(None))
+        })
+        .collect()
+}
+
+/// Specializes the matrix by `constructor`: keeps rows whose column `col` matches
+/// it (expanding into the variant's field columns) or is a wildcard (expanding to
+/// wildcard columns, and binding the whole value if the wildcard was named).
+fn specialize_rows<'ctx>(
+    rows: &[MatchRow<'ctx>],
+    col: usize,
+    constructor: &str,
+    variant: &(String, Vec<(String, UnitType)>),
+    col_ty: &UnitType,
+    col_value: BasicValueEnum<'ctx>,
+) -> Vec<MatchRow<'ctx>> {
+    let mut out = Vec::new();
+    for row in rows {
+        let (sub, extra_binding) = match &row.patterns[col] {
+            Pattern::Variant {
+                variant_name,
+                fields,
+            } if variant_name.last().map(|s| s.as_str()) == Some(constructor) => {
+                (variant_sub_patterns(variant, fields), None)
+            }
+            Pattern::Wildcard(name) => (
+                vec![Pattern::Wildcard(None); variant.1.len()],
+                name.as_ref()
+                    .map(|name| (name.clone(), (col_ty.clone(), col_value))),
+            ),
+            _ => continue,
+        };
+        let mut patterns = row.patterns[..col].to_vec();
+        patterns.extend(sub);
+        patterns.extend_from_slice(&row.patterns[col + 1..]);
+        let mut bindings = row.bindings.clone();
+        bindings.extend(extra_binding);
+        out.push(MatchRow {
+            patterns,
+            bindings,
+            body: row.body.clone(),
+        });
+    }
+    out
+}
+
+/// The default matrix: rows whose column `col` is a wildcard (it matches any
+/// remaining constructor), with that column removed and a binding added if named.
+fn default_rows<'ctx>(
+    rows: &[MatchRow<'ctx>],
+    col: usize,
+    col_ty: &UnitType,
+    col_value: BasicValueEnum<'ctx>,
+) -> Vec<MatchRow<'ctx>> {
+    let mut out = Vec::new();
+    for row in rows {
+        if let Pattern::Wildcard(name) = &row.patterns[col] {
+            let mut patterns = row.patterns.clone();
+            patterns.remove(col);
+            let mut bindings = row.bindings.clone();
+            if let Some(name) = name {
+                bindings.push((name.clone(), (col_ty.clone(), col_value)));
+            }
+            out.push(MatchRow {
+                patterns,
+                bindings,
+                body: row.body.clone(),
+            });
+        }
+    }
+    out
 }
 
 fn custom_type_variant_struct<'ctx>(
@@ -1074,21 +1953,21 @@ fn custom_type_variant_struct<'ctx>(
     generics_map: HashMap<VarType, UnitType>,
     compiler_context: &CompilerContext<'ctx>,
 ) -> Result<StructType<'ctx>, CompilerError> {
-    let mut fields = vec![compiler_context.context.i8_type().into()];
-    variant
-        .1
-        .iter()
-        .try_for_each(|field| -> Result<(), CompilerError> {
-            Ok(fields.push(
+    Ok(compiler_context.context.struct_type(
+        &variant
+            .1
+            .iter()
+            .map(|field| -> Result<BasicTypeEnum<'ctx>, CompilerError> {
                 compiler_context.unit_type_to_llvm_type(match &field.1 {
                     UnitType::Var(var) => generics_map
                         .get(var)
                         .ok_or(CompilerError::FunctionCallError)?,
                     other => other,
-                })?,
-            ))
-        })?;
-    Ok(compiler_context.context.struct_type(&fields, true))
+                })
+            })
+            .collect::<Result<Vec<_>, CompilerError>>()?,
+        true,
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -1123,8 +2002,19 @@ impl<'ctx> Stack<'ctx> {
 }
 
 pub type BoxDefinitionType<'ctx> =
-    Box<dyn Fn(&CompilerContext<'ctx>, &mut Stack<'ctx>) -> Result<(), CompilerError> + 'ctx>;
+    Box<dyn Fn(&mut CompilerContext<'ctx>, &mut Stack<'ctx>) -> Result<(), CompilerError> + 'ctx>;
 pub type DefinitionType<'ctx> = Rc<BoxDefinitionType<'ctx>>;
+
+/// The monomorphised instances of a (possibly generic) definition: each is a
+/// concrete `Type` paired with the code that compiles it.
+type DefinitionInstances<'ctx> = Rc<RefCell<Vec<(Type, DefinitionType<'ctx>)>>>;
+
+/// Lazily specialises a definition for a requested `Type`, pushing the compiled
+/// instance into the shared [`DefinitionInstances`] list.
+type DefinitionCreator<'ctx> = Box<
+    dyn Fn(Type, &mut CompilerContext<'ctx>, DefinitionInstances<'ctx>) -> Result<(), CompilerError>
+        + 'ctx,
+>;
 
 #[derive(Clone)]
 pub struct Scope<'ctx> {
@@ -1132,22 +2022,7 @@ pub struct Scope<'ctx> {
 }
 
 struct InternalScope<'ctx> {
-    definitions: HashMap<
-        String,
-        (
-            Option<
-                Box<
-                    dyn (Fn(
-                            Type,
-                            &mut CompilerContext<'ctx>,
-                            Rc<RefCell<Vec<(Type, DefinitionType<'ctx>)>>>,
-                        ) -> Result<(), CompilerError>)
-                        + 'ctx,
-                >,
-            >,
-            Rc<RefCell<Vec<(Type, DefinitionType<'ctx>)>>>,
-        ),
-    >,
+    definitions: HashMap<String, (Option<DefinitionCreator<'ctx>>, DefinitionInstances<'ctx>)>,
     external_definitions: HashMap<String, Type>,
     imported: HashMap<String, Scope<'ctx>>,
     imported_functions: HashMap<String, (String, String)>,
@@ -1231,18 +2106,9 @@ impl<'ctx> Scope<'ctx> {
                 {
                     return from_definitions;
                 }
-                if let Some(from_definitions) = inner
-                    .external_definitions
-                    .get(&last)
-                    .cloned()
-                    .and_then(|_| {
-                        Some(call_function(
-                            context,
-                            stack,
-                            last.clone(),
-                            last.clone(),
-                            ty.clone(),
-                        ))
+                if let Some(from_definitions) =
+                    inner.external_definitions.get(&last).cloned().map(|_| {
+                        call_function(context, stack, last.clone(), last.clone(), ty.clone())
                     })
                 {
                     return from_definitions;
@@ -1293,18 +2159,7 @@ impl<'ctx> Scope<'ctx> {
             .insert(alias, (real_name, module_alias));
     }
 
-    fn add_function_definition(
-        &self,
-        symbol: &str,
-        creator: Box<
-            dyn (Fn(
-                    Type,
-                    &mut CompilerContext<'ctx>,
-                    Rc<RefCell<Vec<(Type, DefinitionType<'ctx>)>>>,
-                ) -> Result<(), CompilerError>)
-                + 'ctx,
-        >,
-    ) {
+    fn add_function_definition(&self, symbol: &str, creator: DefinitionCreator<'ctx>) {
         let mut inner = self.scope.borrow_mut();
         inner.definitions.insert(
             symbol.to_string(),
@@ -1346,6 +2201,34 @@ fn call_function<'ctx>(
     if params.len() != ty.pop_types.len() {
         return Err(CompilerError::StackUnderflow);
     }
+
+    // Tail-call optimization: a self-call in tail position is rewritten into a
+    // branch back to the function's loop header instead of a real call. We store
+    // the freshly computed arguments into the parameter slots and jump; the slots
+    // are reloaded at the header, so the frame is reused and the recursion runs
+    // in constant stack. Only direct self-recursion (matching `function_name`)
+    // qualifies — mutual/cross-function tail calls fall through to a normal call.
+    if compiler_context.tail_position
+        && let Some(tail_ctx) = compiler_context.tail_ctx.as_ref()
+        && tail_ctx.function_name == function_name
+    {
+        for (slot, (_, value)) in tail_ctx.param_slots.iter().zip(params.iter()) {
+            compiler_context.builder.build_store(*slot, *value)?;
+        }
+        // This path bypasses every enclosing `match` merge, so release their
+        // deferred scrutinee references here (innermost first) before looping;
+        // otherwise each iteration leaks its scrutinee. We release only the node
+        // (not its fields) — see `build_rc_release_node_only` — because a field may
+        // have been bound out and threaded into the next iteration.
+        for (ty, value) in compiler_context.tail_cleanups.iter().rev() {
+            compiler_context.build_rc_release_node_only(ty.clone(), *value)?;
+        }
+        compiler_context
+            .builder
+            .build_unconditional_branch(tail_ctx.loop_header)?;
+        return Ok(());
+    }
+
     let params = params
         .into_iter()
         .map(|param| param.1.into())
@@ -1368,13 +2251,6 @@ fn call_function<'ctx>(
     if value.is_right() {
         return Err(CompilerError::FunctionCallError);
     }
-    // params.into_iter().try_for_each(|param| {
-    //     compiler_context.drop_value(
-    //         param
-    //             .try_into()
-    //             .expect("Created from a basic value enum. Should never fail"),
-    //     )
-    // })?;
 
     let return_value = value.left().ok_or(CompilerError::FunctionCallError)?;
     if ty.push_types.len() == 1 {
@@ -1428,38 +2304,4 @@ fn match_types(left: &[UnitType], right: &[UnitType]) -> bool {
         }
     }
     true
-}
-
-#[derive(Debug, Error)]
-pub enum CompilerError {
-    #[error(transparent)]
-    Parser(#[from] ParserError),
-    #[error(transparent)]
-    IO(#[from] std::io::Error),
-    #[error(transparent)]
-    TypeChecker(#[from] TypeCheckerError),
-    #[error("Failed to write LLVM IR to file: {0}")]
-    WriteLLVMError(String),
-    #[error("Stack underflow")]
-    StackUnderflow,
-    #[error("Builder error: {0}")]
-    BuilderError(#[from] BuilderError),
-    #[error("Failed to get function: {0}")]
-    GetFunctionError(String),
-    #[error("Undefined symbol: {0}")]
-    UndefinedSymbol(String),
-    #[error("Invalid stack for function {0}")]
-    InvalidStackForFunction(String),
-    #[error("Function call error")]
-    FunctionCallError,
-    #[error("Unexpected type")]
-    UnexpectedType,
-    #[error("If statement without function")]
-    IfWithoutFunction,
-    #[error("Invalid import type at {0}")]
-    InvalidImportType(Position),
-    #[error("Import not found")]
-    ImportNotFound,
-    #[error("Unsupported type")]
-    UnsupportedType(UnitType),
 }

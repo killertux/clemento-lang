@@ -1,0 +1,18 @@
+import std::list
+import std::io
+import std::ffi
+
+// FFI with custom C glue. `shout` lives in the sibling `ffi-string.c` (linked
+// automatically because it shares this file's name). It takes a C string and
+// returns a brand-new Clemento `String`, built on the C side with the helpers
+// from `clem.h`.
+defx shout (CStr -> String)
+defx banner ( -> CStr)
+
+def main {
+    // String -> CStr -> (C uppercases, builds a String) -> back to Clemento.
+    "hello, world" ffi::to_cstr shout io::println
+
+    // C hands back a CStr; `ffi::from_cstr` turns it into an owned String.
+    banner ffi::from_cstr io::println
+}

@@ -1,0 +1,39 @@
+import std::io
+import std::number::i64
+import std::list
+import std::string(concat)
+
+def print_list (list::List<I64> -> ) {
+    defp inner_print_list (list::List<I64> -> ) {
+        match {
+            list::Empty -> { " " io::print }
+            list::List(element next) -> {
+                " " io::print element i64::to_string io::print
+                next inner_print_list
+            }
+        }
+    }
+    "[" io::print
+    inner_print_list
+    "]" io::print
+}
+
+def print_list_of_list (list::List<list::List<I64>> -> ) {
+    defp inner_print_list (list::List<list::List<I64>> -> ) {
+        match {
+            list::Empty -> {}
+            list::List(element next) -> {
+                element print_list
+                next inner_print_list
+            }
+        }
+    }
+    "[" io::print
+    inner_print_list
+    "]" io::print
+}
+
+def main {
+    [1 2 3 4] print_list "\n" io::print
+    [[1 2] [3 4]] print_list_of_list "\n" io::print
+}

@@ -1,2 +1,14 @@
-defx print (String ->)
-defx println (String ->)
+import std::list
+import std::char
+
+// A String is a List<Char>; print walks it, emitting each char as UTF-8.
+def print (String ->) {
+    match {
+        [] -> {}
+        [head ... tail] -> { head char::print tail print }
+    }
+}
+
+def println (String ->) {
+    print 10u32 char::from_code_point char::print
+}

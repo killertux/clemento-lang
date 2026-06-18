@@ -9,9 +9,12 @@ ClementoLang is my hobby programming language. It is a concatenative language in
 ## Roadmap
 
 - [x] Static typing
-- [ ] ADT (Algebraic data type)
-- [ ] Type Classes
+- [x] ADT (Algebraic data type)
 - [X] Compile
+- [ ] Lists
+- [ ] Quotation (Functions as first class)
+- [ ] Dependency management
+- [ ] String as lists
 - [ ] Permissions system or use monads
 - [ ] Create a proper documentation
 - [ ] Better tooling
