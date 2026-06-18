@@ -44,6 +44,7 @@ pub enum TokenType {
     RightArrow,
     LeftChevron,
     RightChevron,
+    Backslash,
     Number(Number),
     String(String),
     Char(char),

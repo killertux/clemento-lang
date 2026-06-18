@@ -1,0 +1,55 @@
+import std::list
+import std::io(println)
+import std::number::i64(+ * to_string)
+import std::stack(dup swap drop rot)
+
+// A plain unary function. We can either invoke it (`double`) or push it as a
+// value with `\double`.
+def double (I64 -> I64) {
+    2i64 *
+}
+
+// Higher-order: take a value and a function value, and apply the function twice.
+// `apply` pops the function on top of the stack and runs it against the value
+// beneath it. The function value is reused, so we `dup` it.
+//   stack on entry: [x, f]
+def twice (I64 (I64 -> I64) -> I64) {
+    dup        // [x, f, f]
+    rot        // [f, f, x]
+    swap       // [f, x, f]
+    apply      // [f, f(x)]
+    swap       // [f(x), f]
+    apply      // [f(f(x))]
+}
+
+// Higher-order over a list: apply a function value to every element and sum the
+// results. `swap` brings the list to the top so it can be matched; the function
+// value waits beneath it and is `dup`licated so it can be applied to the head and
+// threaded into the recursion.
+def sum_mapped (list::List<I64> (I64 -> I64) -> I64) {
+    swap
+    match {
+        [] -> { drop 0i64 }
+        [head ... tail] -> {
+            dup                    // [f, f]
+            tail swap sum_mapped   // [f, sum_of_rest]
+            swap head swap apply   // [sum_of_rest, f(head)]
+            +                      // sum_of_rest + f(head)
+        }
+    }
+}
+
+def main {
+    // Anonymous quotation, applied inline.
+    3i64 \{ 1i64 + } apply to_string println        // 4
+
+    // Named reference, applied inline.
+    5i64 \double apply to_string println            // 10
+
+    // Pass a function value into a higher-order definition.
+    5i64 \double twice to_string println            // 20
+    5i64 \{ 1i64 + } twice to_string println        // 7
+
+    // Higher-order over a list: double every element, then sum (2+4+6+8).
+    [1i64 2i64 3i64 4i64] \double sum_mapped to_string println  // 20
+}

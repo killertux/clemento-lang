@@ -95,6 +95,7 @@ impl<'a> Parser<'a> {
                     })),
                 },
                 TokenType::LeftParen => self.parse_type_annotation(token.position),
+                TokenType::Backslash => self.parse_function_value(token.position),
                 TokenType::LeftBracket => self.parse_list(token.position),
                 TokenType::SymbolWithPath(path) => Ok(Some(AstNode {
                     node_type: AstNodeType::SymbolWithPath(path),
@@ -152,6 +153,18 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_block(&mut self, position: Position) -> Result<Option<AstNode>, ParserError> {
+        let nodes = self.parse_block_body(position.clone())?;
+        Ok(Some(AstNode {
+            node_type: AstNodeType::Block(nodes),
+            position,
+            type_definition: None,
+        }))
+    }
+
+    /// Collects the words of a `{ ... }` body, consuming the closing `}`. The
+    /// opening `{` must already have been consumed by the caller. Shared by
+    /// regular blocks and `\{ ... }` quotations.
+    fn parse_block_body(&mut self, position: Position) -> Result<Vec<AstNode>, ParserError> {
         let mut nodes = Vec::new();
         while self
             .tokens
@@ -173,8 +186,25 @@ impl<'a> Parser<'a> {
         if !matches!(node.token_type, TokenType::RightBrace) {
             return Err(ParserError::UnexpectedToken(node.token_type, position));
         }
+        Ok(nodes)
+    }
+
+    /// Parses a function value following a `\`: either `\{ ... }` (an anonymous
+    /// quotation) or `\name` / `\mod::name` (a reference to a named definition).
+    fn parse_function_value(&mut self, position: Position) -> Result<Option<AstNode>, ParserError> {
+        let token = self
+            .tokens
+            .next()
+            .transpose()?
+            .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
+        let node_type = match token.token_type {
+            TokenType::LeftBrace => AstNodeType::Quotation(self.parse_block_body(token.position)?),
+            TokenType::Symbol(symbol) => AstNodeType::FunctionRef(vec![symbol]),
+            TokenType::SymbolWithPath(path) => AstNodeType::FunctionRef(path),
+            other => return Err(ParserError::UnexpectedToken(other, token.position)),
+        };
         Ok(Some(AstNode {
-            node_type: AstNodeType::Block(nodes),
+            node_type,
             position,
             type_definition: None,
         }))
@@ -197,9 +227,20 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_type(&mut self, position: &Position) -> Result<Type, ParserError> {
+        let mut var_type_map: HashMap<String, VarType> = HashMap::new();
+        self.parse_type_inner(position, &mut var_type_map)
+    }
+
+    /// Parses the body of a `( ... -> ... )` stack-effect type (the opening `(`
+    /// must already be consumed). Takes the surrounding `var_type_map` so nested
+    /// function types share type variables with the enclosing signature.
+    fn parse_type_inner(
+        &mut self,
+        position: &Position,
+        var_type_map: &mut HashMap<String, VarType>,
+    ) -> Result<Type, ParserError> {
         let mut pop_types = Vec::new();
         let mut push_types = Vec::new();
-        let mut var_type_map: HashMap<String, VarType> = HashMap::new();
         while self
             .tokens
             .peek()
@@ -214,7 +255,7 @@ impl<'a> Parser<'a> {
             let ty = self
                 .tokens
                 .next()
-                .map(|token| self.parse_unit_type(token?, &mut var_type_map, true))
+                .map(|token| self.parse_unit_type(token?, var_type_map, true))
                 .transpose()?
                 .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
             pop_types.push(ty);
@@ -236,7 +277,7 @@ impl<'a> Parser<'a> {
             let ty = self
                 .tokens
                 .next()
-                .map(|token| self.parse_unit_type(token?, &mut var_type_map, true))
+                .map(|token| self.parse_unit_type(token?, var_type_map, true))
                 .transpose()?
                 .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
             push_types.push(ty);
@@ -651,6 +692,12 @@ impl<'a> Parser<'a> {
                     name: symbol_with_path.clone(),
                     generic_types: types,
                 })
+            }
+            // A nested `( ... -> ... )` is a function type used as a value type,
+            // e.g. the `(I64 -> I64)` parameter in `(I64 (I64 -> I64) -> I64)`.
+            TokenType::LeftParen => {
+                let ty = self.parse_type_inner(&token.position, var_type_map)?;
+                Ok(UnitType::Type(ty))
             }
             _ => Err(ParserError::UnexpectedToken(
                 token.token_type,
@@ -1086,6 +1133,55 @@ mod tests {
                 position: Position::new(1, 1, None),
                 type_definition: None,
             }))
+        );
+    }
+
+    #[test]
+    fn test_parse_function_ref() {
+        let mut parser = Parser::new_from_str("\\double");
+        let node = parser.next().unwrap().unwrap();
+        assert_eq!(
+            node.node_type,
+            AstNodeType::FunctionRef(vec!["double".into()])
+        );
+    }
+
+    #[test]
+    fn test_parse_function_ref_with_path() {
+        let mut parser = Parser::new_from_str("\\std::double");
+        let node = parser.next().unwrap().unwrap();
+        assert_eq!(
+            node.node_type,
+            AstNodeType::FunctionRef(vec!["std".into(), "double".into()])
+        );
+    }
+
+    #[test]
+    fn test_parse_quotation() {
+        let mut parser = Parser::new_from_str("\\{ 1i64 + }");
+        let node = parser.next().unwrap().unwrap();
+        let AstNodeType::Quotation(nodes) = node.node_type else {
+            panic!("expected a quotation, got {:?}", node.node_type);
+        };
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[1].node_type, AstNodeType::Symbol("+".into()));
+    }
+
+    #[test]
+    fn test_parse_nested_function_type_annotation() {
+        // The `(I64 -> I64)` parameter is a function type used as a value type.
+        let mut parser = Parser::new_from_str("(I64 (I64 -> I64) -> I64) f");
+        let node = parser.next().unwrap().unwrap();
+        let i64 = UnitType::Literal(LiteralType::Number(NumberType::I64));
+        assert_eq!(
+            node.type_definition,
+            Some(Type::new(
+                vec![
+                    i64.clone(),
+                    UnitType::Type(Type::new(vec![i64.clone()], vec![i64.clone()])),
+                ],
+                vec![i64],
+            ))
         );
     }
 

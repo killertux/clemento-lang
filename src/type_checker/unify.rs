@@ -46,7 +46,7 @@ pub(super) fn substitute_types(
     Ok(apply_substitution(&variable_substitution, type_definition))
 }
 
-fn apply_substitution(
+pub(super) fn apply_substitution(
     variable_substitution: &HashMap<VarType, UnitType>,
     type_definition: Type,
 ) -> Type {
@@ -78,17 +78,16 @@ pub(super) fn substitute_unit_type(
             generic_types,
         } => UnitType::Custom {
             name,
+            // Recurse: a generic argument may itself be a `Custom`/`Type` that
+            // contains type variables (e.g. `List<(a -> a)>`).
             generic_types: generic_types
                 .into_iter()
-                .map(|generic_type| match generic_type {
-                    UnitType::Var(var) => variable_substitution
-                        .get(&var)
-                        .cloned()
-                        .unwrap_or(UnitType::Var(var)),
-                    other => other,
-                })
+                .map(|generic_type| substitute_unit_type(variable_substitution, generic_type))
                 .collect(),
         },
+        // Substitute the type variables that appear *inside* a function type, so
+        // bindings reach e.g. the `a` in a `(a -> a)` parameter.
+        UnitType::Type(ty) => UnitType::Type(apply_substitution(variable_substitution, ty)),
         other => other,
     }
 }
@@ -193,13 +192,27 @@ pub(super) fn validate_types_and_return_variable_substitution(
                 )?);
             }
             (UnitType::Type(ty1), UnitType::Type(ty2)) => {
-                if ty1 != ty2 {
+                // Structurally unify two function types so a concrete `(I64 -> I64)`
+                // can match a generic `(a -> a)` parameter, binding `a := I64`.
+                if ty1.pop_types.len() != ty2.pop_types.len()
+                    || ty1.push_types.len() != ty2.push_types.len()
+                {
                     return Err(TypeCheckerError::TypeConflict(
                         position,
                         Box::new(UnitType::Type(ty1.clone())),
                         Box::new(UnitType::Type(ty2.clone())),
                     ));
                 }
+                variable_substitution.extend(validate_types_and_return_variable_substitution(
+                    &ty1.pop_types,
+                    &ty2.pop_types,
+                    position.clone(),
+                )?);
+                variable_substitution.extend(validate_types_and_return_variable_substitution(
+                    &ty1.push_types,
+                    &ty2.push_types,
+                    position.clone(),
+                )?);
             }
             (UnitType::Type(ty), UnitType::Var(var)) | (UnitType::Var(var), UnitType::Type(ty)) => {
                 let existent =
@@ -215,6 +228,13 @@ pub(super) fn validate_types_and_return_variable_substitution(
                 }
             }
             (UnitType::Var(var1), UnitType::Var(var2)) => {
+                // A variable unified with itself carries no information; inserting
+                // `v := v` would falsely block a later, real binding `v := u`
+                // (this happens when structurally unifying a function type against
+                // itself, e.g. `(a -> a)` vs `(a -> a)`).
+                if var1 == var2 {
+                    continue;
+                }
                 let existent =
                     variable_substitution.insert(var1.clone(), UnitType::Var(var2.clone()));
                 if let Some(existent) = existent
@@ -237,4 +257,60 @@ pub(super) fn validate_types_and_return_variable_substitution(
         }
     }
     Ok(variable_substitution)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{LiteralType, NumberType};
+
+    fn i64_ty() -> UnitType {
+        UnitType::Literal(LiteralType::Number(NumberType::I64))
+    }
+
+    #[test]
+    fn unifies_through_function_types() {
+        // `(I64 -> I64)` must unify with a generic `(a -> a)`, binding `a := I64`.
+        let a = VarType::new();
+        let concrete = UnitType::Type(Type::new(vec![i64_ty()], vec![i64_ty()]));
+        let generic = UnitType::Type(Type::new(
+            vec![UnitType::Var(a.clone())],
+            vec![UnitType::Var(a.clone())],
+        ));
+        let subst = validate_types_and_return_variable_substitution(
+            &[concrete],
+            &[generic],
+            Position::default(),
+        )
+        .expect("should unify");
+        assert_eq!(subst.get(&a), Some(&i64_ty()));
+    }
+
+    #[test]
+    fn substitutes_inside_function_types() {
+        // Substitution must reach the variables nested inside a function type.
+        let a = VarType::new();
+        let mut map = HashMap::new();
+        map.insert(a.clone(), i64_ty());
+        let ty = UnitType::Type(Type::new(vec![UnitType::Var(a)], vec![]));
+        let result = substitute_unit_type(&map, ty);
+        assert_eq!(result, UnitType::Type(Type::new(vec![i64_ty()], vec![])));
+    }
+
+    #[test]
+    fn mismatched_function_types_conflict() {
+        let concrete = UnitType::Type(Type::new(vec![i64_ty()], vec![i64_ty()]));
+        let char_fn = UnitType::Type(Type::new(
+            vec![UnitType::Literal(LiteralType::Char)],
+            vec![UnitType::Literal(LiteralType::Char)],
+        ));
+        assert!(
+            validate_types_and_return_variable_substitution(
+                &[concrete],
+                &[char_fn],
+                Position::default()
+            )
+            .is_err()
+        );
+    }
 }

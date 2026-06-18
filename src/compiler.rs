@@ -13,7 +13,10 @@ use inkwell::{
     context::Context,
     module::Module,
     types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, StructType},
-    values::{AggregateValue, BasicValue, BasicValueEnum, PointerValue},
+    values::{
+        AggregateValue, BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue,
+        PointerValue,
+    },
 };
 mod error;
 
@@ -365,6 +368,151 @@ impl<'ctx> CompilerContext<'ctx> {
         }
     }
 
+    /// Lifts a `\{ ... }` quotation into a fresh top-level LLVM function with the
+    /// inferred signature `sig`, compiles its body, and returns the function so
+    /// the caller can push its pointer. Quotations are anonymous (never
+    /// self-recursive) and capture nothing — they operate purely on the stack.
+    fn compile_quotation(
+        &mut self,
+        scope: Scope<'ctx>,
+        sig: Type,
+        nodes: Vec<AstNodeWithType>,
+        position: Position,
+        module_path: Vec<String>,
+    ) -> Result<FunctionValue<'ctx>, CompilerError> {
+        let current_block = self.builder.get_insert_block();
+        let function_type = self.get_llvm_function_type(&sig)?;
+        let name = format!("quot_{}", QUOT_ID.fetch_add(1, Ordering::Relaxed));
+        let function = self.module.add_function(&name, function_type, None);
+
+        let entry = self.context.append_basic_block(function, "entry");
+        self.builder.position_at_end(entry);
+
+        let mut stack = Stack::new();
+        for (pop_type, arg) in sig.pop_types.iter().cloned().zip(function.get_param_iter()) {
+            stack.push((pop_type, arg));
+        }
+
+        // Anonymous quotations are never self-recursive: no tail loop. Save and
+        // restore the enclosing function's tail context (we may be lifting this
+        // quotation from inside another function's body).
+        let prev_tail_ctx = self.tail_ctx.take();
+        let prev_tail_position = self.tail_position;
+        let prev_tail_cleanups = std::mem::take(&mut self.tail_cleanups);
+        self.tail_position = false;
+
+        let body = AstNodeWithType::new(AstNodeType::Block(nodes), position, sig.clone());
+        let result = self.compile_ast(scope, &mut stack, body, module_path);
+
+        self.tail_ctx = prev_tail_ctx;
+        self.tail_position = prev_tail_position;
+        self.tail_cleanups = prev_tail_cleanups;
+        result?;
+
+        if !self.current_block_terminated() {
+            self.emit_function_return(function_type, &mut stack, &name)?;
+        }
+
+        if let Some(block) = current_block {
+            self.builder.position_at_end(block);
+        }
+        Ok(function)
+    }
+
+    /// Packs the remaining stack into the function's `ret` (single value, packed
+    /// struct for multiple results, or `void`). Shared by quotation lifting and
+    /// builtin-wrapper generation; the caller must have checked the block isn't
+    /// already terminated.
+    fn emit_function_return(
+        &self,
+        function_type: inkwell::types::FunctionType<'ctx>,
+        stack: &mut Stack<'ctx>,
+        name: &str,
+    ) -> Result<(), CompilerError> {
+        match function_type.get_return_type() {
+            Some(BasicTypeEnum::StructType(return_type)) => {
+                let return_val = stack.remove_all();
+                let mut struct_val = return_type.get_undef().as_aggregate_value_enum();
+                for (index, value) in return_val.into_iter().enumerate() {
+                    struct_val = self.builder.build_insert_value(
+                        struct_val,
+                        value.1,
+                        index as u32,
+                        &format!("ret_{}", index),
+                    )?;
+                }
+                self.builder
+                    .build_return(Some(&struct_val.as_basic_value_enum()))?;
+            }
+            Some(return_type) => {
+                let return_val = stack.remove_all();
+                if return_val.len() != 1 {
+                    return Err(CompilerError::InvalidStackForFunction(name.to_string()));
+                }
+                let return_val = return_val[0].clone().1;
+                if return_val.get_type() != return_type {
+                    return Err(CompilerError::InvalidStackForFunction(name.to_string()));
+                }
+                self.builder.build_return(Some(&return_val))?;
+            }
+            None => {
+                if !stack.is_empty() {
+                    return Err(CompilerError::InvalidStackForFunction(name.to_string()));
+                }
+                self.builder.build_return(None)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Builds a real LLVM function wrapping a builtin's inline IR-emitter at a
+    /// concrete signature, so `\+`, `\swap`, etc. can be used as function values.
+    /// The wrapper seeds a temporary stack with its parameters, runs the builtin
+    /// closure (which emits the IR inline), and returns the result(s).
+    fn materialize_builtin_wrapper(
+        &mut self,
+        name: &str,
+        sig: Type,
+        inline: &DefinitionType<'ctx>,
+    ) -> Result<FunctionValue<'ctx>, CompilerError> {
+        let current_block = self.builder.get_insert_block();
+        let function_type = self.get_llvm_function_type(&sig)?;
+        let mangled = format!(
+            "builtinwrap_{}_{}__{}",
+            name,
+            sig.pop_types
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join("_"),
+            sig.push_types
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join("_")
+        );
+        let function = self.module.add_function(&mangled, function_type, None);
+
+        let entry = self.context.append_basic_block(function, "entry");
+        self.builder.position_at_end(entry);
+
+        let mut stack = Stack::new();
+        for (pop_type, arg) in sig.pop_types.iter().cloned().zip(function.get_param_iter()) {
+            stack.push((pop_type, arg));
+        }
+
+        inline(self, &mut stack)?;
+
+        if !self.current_block_terminated() {
+            self.emit_function_return(function_type, &mut stack, &mangled)?;
+        }
+
+        if let Some(block) = current_block {
+            self.builder.position_at_end(block);
+        }
+        Ok(function)
+    }
+
     fn compile_ast(
         &mut self,
         scope: Scope<'ctx>,
@@ -376,9 +524,16 @@ impl<'ctx> CompilerContext<'ctx> {
             AstNodeType::Number(number) => self.compile_number(stack, number),
             AstNodeType::Char(c) => self.compile_char(stack, c),
             AstNodeType::Symbol(symbol) => {
-                // `tail_position` stays set across the call so `call_function` can
-                // see it; clear it afterwards so it never leaks to a sibling word.
-                scope.call_symbol(vec![symbol], self, program.type_definition, stack)?;
+                // `apply` is the builtin that runs a function value off the stack;
+                // it is not a real definition, so dispatch it directly.
+                if symbol == "apply" {
+                    apply_function(self, stack)?;
+                } else {
+                    // `tail_position` stays set across the call so `call_function`
+                    // can see it; clear it afterwards so it never leaks to a
+                    // sibling word.
+                    scope.call_symbol(vec![symbol], self, program.type_definition, stack)?;
+                }
                 self.tail_position = false;
                 Ok(())
             }
@@ -406,6 +561,42 @@ impl<'ctx> CompilerContext<'ctx> {
 
                 Ok(())
             }
+            AstNodeType::FunctionRef(symbol) => {
+                // The type checker resolved this to `( -> Type(sig))`: materialize
+                // the named definition at `sig` and push its pointer as a value.
+                let UnitType::Type(sig) = program.type_definition.push_types[0].clone() else {
+                    return Err(CompilerError::UnexpectedType);
+                };
+                if type_contains_var(&sig) {
+                    return Err(CompilerError::UnresolvedFunctionValue(symbol.join("::")));
+                }
+                let function = scope.materialize_symbol(symbol, self, sig.clone())?;
+                let pointer = function.as_global_value().as_pointer_value();
+                stack.push((UnitType::Type(sig), pointer.as_basic_value_enum()));
+                self.tail_position = false;
+                Ok(())
+            }
+            AstNodeType::Quotation(nodes) => {
+                let UnitType::Type(sig) = program.type_definition.push_types[0].clone() else {
+                    return Err(CompilerError::UnexpectedType);
+                };
+                if type_contains_var(&sig) {
+                    return Err(CompilerError::UnresolvedFunctionValue(
+                        "{ ... }".to_string(),
+                    ));
+                }
+                let function = self.compile_quotation(
+                    Scope::with_parent(scope),
+                    sig.clone(),
+                    nodes,
+                    program.position,
+                    module_path,
+                )?;
+                let pointer = function.as_global_value().as_pointer_value();
+                stack.push((UnitType::Type(sig), pointer.as_basic_value_enum()));
+                self.tail_position = false;
+                Ok(())
+            }
             AstNodeType::Definition {
                 name: symbol, body, ..
             } => self.compile_definition(scope, &symbol, *body, module_path),
@@ -419,12 +610,10 @@ impl<'ctx> CompilerContext<'ctx> {
                             Box::new(
                                 move |ty: Type,
                                       _: &mut CompilerContext<'ctx>,
-                                      definitions: Rc<
-                                    RefCell<Vec<(Type, DefinitionType<'ctx>)>>,
-                                >|
+                                      definitions: DefinitionInstances<'ctx>|
                                       -> Result<(), CompilerError> {
                                     let mut definitions = definitions.borrow_mut();
-                                    definitions.push((ty, fun.clone()));
+                                    definitions.push((ty, fun.clone(), None));
                                     Ok(())
                                 },
                             ),
@@ -486,26 +675,33 @@ impl<'ctx> CompilerContext<'ctx> {
                 );
 
                 for (index, variant) in variants.into_iter().enumerate() {
-                    let generics = generics.clone();
                     scope.add_function_definition(
                         variant.0.clone().as_str(),
                         Box::new(
                             move |ty: Type,
                                   _: &mut CompilerContext<'ctx>,
-                                  definitions: Rc<RefCell<Vec<(Type, DefinitionType<'ctx>)>>>|
+                                  definitions: DefinitionInstances<'ctx>|
                                   -> Result<(), CompilerError> {
                                 let mut definitions = definitions.borrow_mut();
-                                let variant = variant.clone();
-                                let UnitType::Custom {  name:_, generic_types } = &ty.clone().push_types[0] else {
-                                    return Err(CompilerError::UnexpectedType);
-                                };
-                                let generics_map = generics.iter().map(|generic| generic.1.clone()).zip(generic_types.iter().cloned()).collect::<HashMap<_, _>>();
                                 definitions.push((ty.clone(), Rc::new(Box::new(move |compiler_context: &mut CompilerContext<'ctx>,
                                       stack: &mut Stack<'ctx>|
                                       -> Result<(), CompilerError> {
                                         let base_struct = compiler_context.base_custom_type();
-                                        let variant_struct = custom_type_variant_struct(variant.clone(), generics_map.clone(), compiler_context)?;
                                         let values = stack.pop_n(ty.pop_types.len());
+                                        // Build the heap payload layout from the actual field
+                                        // values' LLVM types rather than from the (possibly still
+                                        // generic) field types. This lets a generic definition
+                                        // construct a generic value: the value carries a concrete
+                                        // type even when the constructor's static type variable
+                                        // was never monomorphized. The match/drop paths rebuild
+                                        // the same layout from the concrete type, so they agree.
+                                        let variant_struct = compiler_context.context.struct_type(
+                                            &values
+                                                .iter()
+                                                .map(|value| value.1.get_type())
+                                                .collect::<Vec<_>>(),
+                                            true,
+                                        );
                                         let obj_size = base_struct
                                             .size_of()
                                             .expect("size_of works");
@@ -531,7 +727,7 @@ impl<'ctx> CompilerContext<'ctx> {
                                         })?;
                                         stack.push((ty.push_types[0].clone(), struct_val.into()));
                                         Ok(())
-                                }))));
+                                })), None));
                                 Ok(())
                             },
                         ),
@@ -727,9 +923,34 @@ impl<'ctx> CompilerContext<'ctx> {
             Box::new(
                 move |ty: Type,
                       context: &mut CompilerContext<'ctx>,
-                      definitions: Rc<RefCell<Vec<(Type, DefinitionType<'ctx>)>>>| {
+                      definitions: DefinitionInstances<'ctx>| {
                     let cloned_scope = cloned_scope.clone();
-                    let body = body.clone();
+                    let mut body = body.clone();
+                    // Concretize the generic body for this monomorphic instance:
+                    // match the def's (possibly generic) signature against the
+                    // concrete `ty` and rewrite every node's type. This is what
+                    // makes generic defs — and function-value parameters typed
+                    // `(a -> a)` — usable at a concrete type.
+                    let mut generics_map = HashMap::new();
+                    for (template, concrete) in body
+                        .type_definition
+                        .pop_types
+                        .iter()
+                        .zip(ty.pop_types.iter())
+                    {
+                        bind_generics(template, concrete, &mut generics_map);
+                    }
+                    for (template, concrete) in body
+                        .type_definition
+                        .push_types
+                        .iter()
+                        .zip(ty.push_types.iter())
+                    {
+                        bind_generics(template, concrete, &mut generics_map);
+                    }
+                    if !generics_map.is_empty() {
+                        substitute_ast_types(&mut body, &generics_map);
+                    }
                     let current_block = context.builder.get_insert_block();
 
                     let function_type = context.get_llvm_function_type(&ty)?;
@@ -773,6 +994,7 @@ impl<'ctx> CompilerContext<'ctx> {
                                     )
                                 },
                             )),
+                            Some(function),
                         ));
                     }
                     let new_scope = Scope::with_parent(cloned_scope);
@@ -952,7 +1174,8 @@ impl<'ctx> CompilerContext<'ctx> {
                 }
             },
             UnitType::Var(_) => todo!("Handle variatic types"),
-            UnitType::Type(_) => todo!("Handle function types"),
+            // A function value is an opaque code pointer.
+            UnitType::Type(_) => Ok(self.context.ptr_type(AddressSpace::default()).into()),
             UnitType::Custom { .. } => Ok(self.context.ptr_type(AddressSpace::default()).into()),
         }
     }
@@ -1801,6 +2024,21 @@ impl<'ctx> CompilerContext<'ctx> {
 /// generic arguments of `Custom` types and nested function `Type`s. Needed so a
 /// nested field type like `List<a>` resolves to `List<I64>` (not `List<Var>`)
 /// before codegen, which cannot lower a bare type variable.
+/// Whether a stack-effect type still mentions a type variable — i.e. it was not
+/// fully concretized by resolution/monomorphization. A function value with such
+/// a type can't be lowered to a concrete LLVM function.
+fn type_contains_var(ty: &Type) -> bool {
+    fn unit_contains_var(unit: &UnitType) -> bool {
+        match unit {
+            UnitType::Var(_) => true,
+            UnitType::Custom { generic_types, .. } => generic_types.iter().any(unit_contains_var),
+            UnitType::Type(inner) => type_contains_var(inner),
+            UnitType::Literal(_) => false,
+        }
+    }
+    ty.pop_types.iter().any(unit_contains_var) || ty.push_types.iter().any(unit_contains_var)
+}
+
 fn substitute_unit(ty: &UnitType, generics_map: &HashMap<VarType, UnitType>) -> UnitType {
     match ty {
         UnitType::Var(var) => generics_map.get(var).cloned().unwrap_or_else(|| ty.clone()),
@@ -1827,6 +2065,71 @@ fn substitute_unit(ty: &UnitType, generics_map: &HashMap<VarType, UnitType>) -> 
                 .collect(),
         )),
         UnitType::Literal(_) => ty.clone(),
+    }
+}
+
+/// Builds the `type-var -> concrete` map by structurally matching a generic
+/// `template` type against the `concrete` type requested for a monomorphic
+/// instance. One-directional (every variable lives in `template`), recursing
+/// through `Custom` generics and nested function types.
+fn bind_generics(template: &UnitType, concrete: &UnitType, map: &mut HashMap<VarType, UnitType>) {
+    match (template, concrete) {
+        (UnitType::Var(var), concrete) => {
+            map.insert(var.clone(), concrete.clone());
+        }
+        (
+            UnitType::Custom {
+                generic_types: t, ..
+            },
+            UnitType::Custom {
+                generic_types: c, ..
+            },
+        ) => {
+            for (t, c) in t.iter().zip(c.iter()) {
+                bind_generics(t, c, map);
+            }
+        }
+        (UnitType::Type(t), UnitType::Type(c)) => {
+            for (t, c) in t.pop_types.iter().zip(c.pop_types.iter()) {
+                bind_generics(t, c, map);
+            }
+            for (t, c) in t.push_types.iter().zip(c.push_types.iter()) {
+                bind_generics(t, c, map);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Rewrites every `type_definition` in an AST subtree with `map`, used to
+/// concretize a generic definition's body for a monomorphic instance. Reuses
+/// [`substitute_unit`], which recurses through function and custom types.
+fn substitute_ast_types(node: &mut AstNodeWithType, map: &HashMap<VarType, UnitType>) {
+    node.type_definition = Type::new(
+        node.type_definition
+            .pop_types
+            .iter()
+            .map(|t| substitute_unit(t, map))
+            .collect(),
+        node.type_definition
+            .push_types
+            .iter()
+            .map(|t| substitute_unit(t, map))
+            .collect(),
+    );
+    match &mut node.node_type {
+        AstNodeType::Block(nodes) | AstNodeType::Quotation(nodes) => {
+            for n in nodes {
+                substitute_ast_types(n, map);
+            }
+        }
+        AstNodeType::Match(cases) => {
+            for case in cases {
+                substitute_ast_types(&mut case.body, map);
+            }
+        }
+        AstNodeType::Definition { body, .. } => substitute_ast_types(body, map),
+        _ => {}
     }
 }
 
@@ -2007,7 +2310,11 @@ pub type DefinitionType<'ctx> = Rc<BoxDefinitionType<'ctx>>;
 
 /// The monomorphised instances of a (possibly generic) definition: each is a
 /// concrete `Type` paired with the code that compiles it.
-type DefinitionInstances<'ctx> = Rc<RefCell<Vec<(Type, DefinitionType<'ctx>)>>>;
+// The third element is the materialized LLVM function for this instance, present
+// only for real `def`s (used by `\name` references). Builtins and variant
+// constructors emit inline IR and have no single function, so they store `None`.
+type DefinitionInstances<'ctx> =
+    Rc<RefCell<Vec<(Type, DefinitionType<'ctx>, Option<FunctionValue<'ctx>>)>>>;
 
 /// Lazily specialises a definition for a requested `Type`, pushing the compiled
 /// instance into the shared [`DefinitionInstances`] list.
@@ -2032,6 +2339,8 @@ struct InternalScope<'ctx> {
 }
 
 static SCOPE_ID: AtomicU64 = AtomicU64::new(0);
+// Unique suffix for the LLVM functions lifted out of `\{ ... }` quotations.
+static QUOT_ID: AtomicU64 = AtomicU64::new(0);
 
 impl<'ctx> Scope<'ctx> {
     fn with_parent(parent: Scope<'ctx>) -> Self {
@@ -2137,6 +2446,101 @@ impl<'ctx> Scope<'ctx> {
                     return parent.call_symbol(symbol, context, ty, stack);
                 }
 
+                Err(CompilerError::UndefinedSymbol(symbol.join("::")))
+            }
+        }
+    }
+
+    /// Resolves a symbol to its materialized LLVM function (instantiating the
+    /// monomorphic instance for `ty` if needed) without calling it — used by
+    /// `\name` to push a function pointer onto the stack. Mirrors the lookup
+    /// chain of [`call_symbol`].
+    fn materialize_symbol(
+        &self,
+        mut symbol: Vec<String>,
+        context: &mut CompilerContext<'ctx>,
+        ty: Type,
+    ) -> Result<FunctionValue<'ctx>, CompilerError> {
+        let inner = self.scope.borrow();
+        match symbol.len() {
+            1 => {
+                let last = symbol
+                    .last()
+                    .expect("We checked for the symbol size")
+                    .clone();
+
+                if let Some((creator, definitions)) = inner.definitions.get(&last) {
+                    // Already materialized (a real `def`, or a builtin we wrapped
+                    // earlier at this type)?
+                    if let Some(function) = definitions
+                        .borrow()
+                        .iter()
+                        .find(|def_ty| ty == def_ty.0)
+                        .and_then(|def_ty| def_ty.2)
+                    {
+                        return Ok(function);
+                    }
+                    // Make sure an instance for this concrete type exists.
+                    if !definitions.borrow().iter().any(|def_ty| ty == def_ty.0) {
+                        if let Some(creator) = creator {
+                            creator(ty.clone(), context, definitions.clone())?;
+                        } else {
+                            return Err(CompilerError::CannotReferenceFunction(last));
+                        }
+                    }
+                    // A `def` instance carries `Some(function)` and was returned
+                    // above. Reaching here means a builtin (inline IR, no function):
+                    // build a wrapper around its emitter closure and cache it.
+                    let inline = {
+                        let definitions = definitions.borrow();
+                        let instance = definitions
+                            .iter()
+                            .find(|def_ty| ty == def_ty.0)
+                            .ok_or_else(|| CompilerError::CannotReferenceFunction(last.clone()))?;
+                        if let Some(function) = instance.2 {
+                            return Ok(function);
+                        }
+                        instance.1.clone()
+                    };
+                    let wrapper =
+                        context.materialize_builtin_wrapper(&last, ty.clone(), &inline)?;
+                    if let Some(instance) = definitions
+                        .borrow_mut()
+                        .iter_mut()
+                        .find(|def_ty| ty == def_ty.0)
+                    {
+                        instance.2 = Some(wrapper);
+                    }
+                    return Ok(wrapper);
+                }
+                if inner.external_definitions.contains_key(&last) {
+                    return context
+                        .module
+                        .get_function(&last)
+                        .ok_or(CompilerError::GetFunctionError(last));
+                }
+                if let Some(imported_functions) = inner.imported_functions.get(&last) {
+                    return self.materialize_symbol(
+                        vec![imported_functions.1.clone(), imported_functions.0.clone()],
+                        context,
+                        ty,
+                    );
+                }
+                if let Some(parent) = inner.parent.as_ref() {
+                    return parent.materialize_symbol(symbol, context, ty);
+                }
+                Err(CompilerError::UndefinedSymbol(symbol.join("::")))
+            }
+            0 => Err(CompilerError::UndefinedSymbol(symbol.join("::"))),
+            _ => {
+                let first = symbol.remove(0);
+                if let Some(from_imports) = inner.imported.get(&first) {
+                    return from_imports.materialize_symbol(symbol, context, ty);
+                }
+                if let Some(parent) = inner.parent.as_ref() {
+                    symbol.insert(0, first);
+                    return parent.materialize_symbol(symbol, context, ty);
+                }
                 Err(CompilerError::UndefinedSymbol(symbol.join("::")))
             }
         }
@@ -2265,6 +2669,60 @@ fn call_function<'ctx>(
                 &format!("field_{}", index),
             )?;
 
+            stack.push((field_type.clone(), field_value));
+        }
+    }
+
+    Ok(())
+}
+
+/// Lowers `apply`: pop the function value on top of the stack, pop the arguments
+/// its signature requires, and call it through its pointer with an indirect call.
+fn apply_function<'ctx>(
+    compiler_context: &CompilerContext<'ctx>,
+    stack: &mut Stack<'ctx>,
+) -> Result<(), CompilerError> {
+    let (func_unit, func_value) = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+    let UnitType::Type(sig) = func_unit else {
+        return Err(CompilerError::UnexpectedType);
+    };
+
+    let params = stack.pop_n(sig.pop_types.len());
+    if params.len() != sig.pop_types.len() {
+        return Err(CompilerError::StackUnderflow);
+    }
+    let params = params
+        .into_iter()
+        .map(|param| param.1.into())
+        .collect::<Vec<BasicMetadataValueEnum>>();
+
+    let fn_type = compiler_context.get_llvm_function_type(&sig)?;
+    let function_pointer = func_value.into_pointer_value();
+    let call = compiler_context.builder.build_indirect_call(
+        fn_type,
+        function_pointer,
+        &params,
+        "apply_call",
+    )?;
+    if sig.push_types.is_empty() {
+        return Ok(());
+    }
+
+    let value = call.try_as_basic_value();
+    if value.is_right() {
+        return Err(CompilerError::FunctionCallError);
+    }
+    let return_value = value.left().ok_or(CompilerError::FunctionCallError)?;
+    if sig.push_types.len() == 1 {
+        stack.push((sig.push_types[0].clone(), return_value));
+    } else {
+        let struct_value = return_value.into_struct_value().as_aggregate_value_enum();
+        for (index, field_type) in sig.push_types.iter().enumerate() {
+            let field_value = compiler_context.builder.build_extract_value(
+                struct_value,
+                index as u32,
+                &format!("field_{}", index),
+            )?;
             stack.push((field_type.clone(), field_value));
         }
     }

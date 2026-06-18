@@ -179,6 +179,29 @@ mod tests {
     }
 
     #[test]
+    fn lex_backslash() {
+        // `\name` lexes as a Backslash followed by the bare symbol.
+        let input = "\\double";
+        let lexer = Lexer::new(input, None);
+        let tokens = lexer
+            .collect::<Result<Vec<Token>, LexerError>>()
+            .expect("Failed to collect tokens");
+        assert_eq!(
+            tokens,
+            vec![
+                Token {
+                    token_type: TokenType::Backslash,
+                    position: Position::new(1, 1, None),
+                },
+                Token {
+                    token_type: TokenType::Symbol("double".to_string()),
+                    position: Position::new(1, 2, None),
+                }
+            ]
+        );
+    }
+
+    #[test]
     fn lex_right_arrow() {
         let input = r#"->"#;
         let mut lexer = Lexer::new(input, None);

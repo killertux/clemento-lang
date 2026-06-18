@@ -17,6 +17,12 @@ pub enum AstNodeType<T> {
     },
     ExternalDefinition(String, Type),
     Block(Vec<T>),
+    /// `\name` / `\mod::name`: pushes a reference to a named definition as a
+    /// function value (instead of invoking it).
+    FunctionRef(Vec<String>),
+    /// `\{ ... }`: an anonymous quotation. Structurally a block, but pushed onto
+    /// the stack as a function value rather than executed inline.
+    Quotation(Vec<T>),
     CustomType {
         name: String,
         generics: Vec<(String, VarType)>,
@@ -154,6 +160,16 @@ where
             AstNodeType::Block(nodes) => write!(
                 f,
                 "{{{}}}",
+                nodes
+                    .iter()
+                    .map(|node| node.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+            AstNodeType::FunctionRef(symbol) => write!(f, "\\{}", symbol.join("::")),
+            AstNodeType::Quotation(nodes) => write!(
+                f,
+                "\\{{{}}}",
                 nodes
                     .iter()
                     .map(|node| node.to_string())
