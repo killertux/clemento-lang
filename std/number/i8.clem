@@ -1,3 +1,5 @@
+import std::list
+import std::number::i64
 import std::boolean(Boolean)
 import std::stack(dup touch)
 
@@ -6,7 +8,8 @@ defx - (I8 I8 -> I8)
 defx * (I8 I8 -> I8)
 defx / (I8 I8 -> I8)
 defx % (I8 I8 -> I8)
-defx to_string (I8 -> String)
+defx to_i64 (I8 -> I64)
+def to_string (I8 -> String) { to_i64 i64::to_string }
 defx gt (I8 I8 -> Boolean)
 defx lt (I8 I8 -> Boolean)
 defx = (I8 I8 -> Boolean)

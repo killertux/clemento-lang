@@ -1,0 +1,13 @@
+import std::list
+
+// FFI marshalling between a Clemento `String` (List<Char>) and a raw C string.
+//
+// `to_cstr` renders a string into a freshly allocated, NUL-terminated C buffer
+// (UTF-8) and consumes the input string. Pass the result to a `defx`'d C
+// function taking a `CStr`, then release it with `free_cstr`.
+//
+// `from_cstr` builds an owned string from a C `CStr` (e.g. one returned by a
+// C function); it does not free the input pointer.
+defx to_cstr (String -> CStr)
+defx from_cstr (CStr -> String)
+defx free_cstr (CStr ->)

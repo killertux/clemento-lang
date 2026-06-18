@@ -1,3 +1,4 @@
+import std::list
 import std::io
 import std::stack
 import std::number::i64

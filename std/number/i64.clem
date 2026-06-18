@@ -1,4 +1,6 @@
+import std::list
 import std::boolean(Boolean)
+import std::stack(dup swap rot drop touch)
 
 defx + (I64 I64 -> I64)
 defx - (I64 I64 -> I64)
@@ -8,8 +10,45 @@ defx % (I64 I64 -> I64)
 defx %i8 (I64 I8 -> I8)
 defx %i16 (I64 I16 -> I16)
 defx %i32 (I64 I32 -> I32)
-defx to_string (I64 -> String)
 defx gt (I64 I64 -> Boolean)
 defx lt (I64 I64 -> Boolean)
 defx = (I64 I64 -> Boolean)
 defx != (I64 I64 -> Boolean)
+
+def to_string (I64 -> String) {
+    defp digit (I64 -> Char) {
+        match {
+            0i64 -> '0'
+            1i64 -> '1'
+            2i64 -> '2'
+            3i64 -> '3'
+            4i64 -> '4'
+            5i64 -> '5'
+            6i64 -> '6'
+            7i64 -> '7'
+            8i64 -> '8'
+            9i64 -> '9'
+            * -> '?'
+        }
+    }
+    // Extract digits without negating the whole number (so I64::MIN works):
+    // each step takes |n % 10| (a single digit 0-9) and divides n toward zero.
+    defp go (String I64 -> String) {
+        dup 0i64 = match {
+            True -> { drop touch }
+            False -> {
+                dup 10i64 %
+                dup 0i64 lt match { True -> { 0i64 swap - } False -> touch }
+                digit
+                rot swap list::List swap 10i64 / go
+            }
+        }
+    }
+    dup 0i64 = match {
+        True -> { drop "0" }
+        False -> {
+            dup 0i64 lt swap "" swap go
+            swap match { True -> { '-' list::List } False -> touch }
+        }
+    }
+}
