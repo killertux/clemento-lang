@@ -46,9 +46,16 @@ pub fn builtins_functions<'ctx>(
         context.module.add_function("putchar", putchar_type, None);
         // Slab-pool allocator runtime (linked from clem_runtime.c).
         let clem_alloc_type = ptr_type.fn_type(&[context.context.i64_type().into()], false);
-        context.module.add_function("clem_alloc", clem_alloc_type, None);
-        let clem_free_type = context.context.void_type().fn_type(&[ptr_type.into()], false);
-        context.module.add_function("clem_free", clem_free_type, None);
+        context
+            .module
+            .add_function("clem_alloc", clem_alloc_type, None);
+        let clem_free_type = context
+            .context
+            .void_type()
+            .fn_type(&[ptr_type.into()], false);
+        context
+            .module
+            .add_function("clem_free", clem_free_type, None);
         // FFI string marshalling (clem_runtime.c): String (List<Char>) <-> char*.
         let from_cstr_type = ptr_type.fn_type(&[ptr_type.into()], false);
         context
@@ -59,7 +66,10 @@ pub fn builtins_functions<'ctx>(
             .module
             .add_function("clem_string_to_cstr", to_cstr_type, None);
         // libc free, for releasing buffers produced by `ffi::to_cstr`.
-        let free_type = context.context.void_type().fn_type(&[ptr_type.into()], false);
+        let free_type = context
+            .context
+            .void_type()
+            .fn_type(&[ptr_type.into()], false);
         context.module.add_function("free", free_type, None);
     }
 
@@ -362,12 +372,16 @@ pub fn builtins_functions<'ctx>(
                     match (arg1.1, arg2.1) {
                         (BasicValueEnum::IntValue(n1), BasicValueEnum::IntValue(n2)) => {
                             let result =
-                                compiler_context.builder.build_int_add(n1, n2, "add_result")?;
+                                compiler_context
+                                    .builder
+                                    .build_int_add(n1, n2, "add_result")?;
                             stack.push((result_ty, BasicValueEnum::IntValue(result)));
                         }
                         (BasicValueEnum::FloatValue(n1), BasicValueEnum::FloatValue(n2)) => {
                             let result =
-                                compiler_context.builder.build_float_add(n1, n2, "add_result")?;
+                                compiler_context
+                                    .builder
+                                    .build_float_add(n1, n2, "add_result")?;
                             stack.push((result_ty, BasicValueEnum::FloatValue(result)));
                         }
                         _ => return Err(CompilerError::UnexpectedType),
@@ -391,12 +405,16 @@ pub fn builtins_functions<'ctx>(
                     match (arg2.1, arg1.1) {
                         (BasicValueEnum::IntValue(n1), BasicValueEnum::IntValue(n2)) => {
                             let result =
-                                compiler_context.builder.build_int_sub(n1, n2, "sub_result")?;
+                                compiler_context
+                                    .builder
+                                    .build_int_sub(n1, n2, "sub_result")?;
                             stack.push((result_ty, BasicValueEnum::IntValue(result)));
                         }
                         (BasicValueEnum::FloatValue(n1), BasicValueEnum::FloatValue(n2)) => {
                             let result =
-                                compiler_context.builder.build_float_sub(n1, n2, "sub_result")?;
+                                compiler_context
+                                    .builder
+                                    .build_float_sub(n1, n2, "sub_result")?;
                             stack.push((result_ty, BasicValueEnum::FloatValue(result)));
                         }
                         _ => return Err(CompilerError::UnexpectedType),
@@ -419,12 +437,16 @@ pub fn builtins_functions<'ctx>(
                     match (arg1.1, arg2.1) {
                         (BasicValueEnum::IntValue(n1), BasicValueEnum::IntValue(n2)) => {
                             let result =
-                                compiler_context.builder.build_int_mul(n1, n2, "mul_result")?;
+                                compiler_context
+                                    .builder
+                                    .build_int_mul(n1, n2, "mul_result")?;
                             stack.push((result_ty, BasicValueEnum::IntValue(result)));
                         }
                         (BasicValueEnum::FloatValue(n1), BasicValueEnum::FloatValue(n2)) => {
                             let result =
-                                compiler_context.builder.build_float_mul(n1, n2, "mul_result")?;
+                                compiler_context
+                                    .builder
+                                    .build_float_mul(n1, n2, "mul_result")?;
                             stack.push((result_ty, BasicValueEnum::FloatValue(result)));
                         }
                         _ => return Err(CompilerError::UnexpectedType),
@@ -449,19 +471,25 @@ pub fn builtins_functions<'ctx>(
                     match (arg2.1, arg1.1) {
                         (BasicValueEnum::IntValue(n1), BasicValueEnum::IntValue(n2)) => {
                             let result = if signed {
-                                compiler_context
-                                    .builder
-                                    .build_int_signed_div(n1, n2, "div_result")?
+                                compiler_context.builder.build_int_signed_div(
+                                    n1,
+                                    n2,
+                                    "div_result",
+                                )?
                             } else {
-                                compiler_context
-                                    .builder
-                                    .build_int_unsigned_div(n1, n2, "div_result")?
+                                compiler_context.builder.build_int_unsigned_div(
+                                    n1,
+                                    n2,
+                                    "div_result",
+                                )?
                             };
                             stack.push((result_ty, BasicValueEnum::IntValue(result)));
                         }
                         (BasicValueEnum::FloatValue(n1), BasicValueEnum::FloatValue(n2)) => {
                             let result =
-                                compiler_context.builder.build_float_div(n1, n2, "div_result")?;
+                                compiler_context
+                                    .builder
+                                    .build_float_div(n1, n2, "div_result")?;
                             stack.push((result_ty, BasicValueEnum::FloatValue(result)));
                         }
                         _ => return Err(CompilerError::UnexpectedType),
@@ -530,7 +558,9 @@ fn ffi_builtins<'ctx>() -> Vec<InternalFunction<'ctx>> {
                     let to_cstr = compiler_context
                         .module
                         .get_function("clem_string_to_cstr")
-                        .ok_or(CompilerError::GetFunctionError("clem_string_to_cstr".into()))?;
+                        .ok_or(CompilerError::GetFunctionError(
+                            "clem_string_to_cstr".into(),
+                        ))?;
                     let buffer = compiler_context
                         .builder
                         .build_call(to_cstr, &[value.1.into()], "to_cstr")?
@@ -555,7 +585,9 @@ fn ffi_builtins<'ctx>() -> Vec<InternalFunction<'ctx>> {
                     let from_cstr = compiler_context
                         .module
                         .get_function("clem_string_from_cstr")
-                        .ok_or(CompilerError::GetFunctionError("clem_string_from_cstr".into()))?;
+                        .ok_or(CompilerError::GetFunctionError(
+                            "clem_string_from_cstr".into(),
+                        ))?;
                     let list = compiler_context
                         .builder
                         .build_call(from_cstr, &[value.1.into()], "from_cstr")?
@@ -1773,9 +1805,13 @@ fn widen_cast<'ctx>(
                 let i64_type = compiler_context.context.i64_type();
                 let v = value.1.into_int_value();
                 let extended = if signed {
-                    compiler_context.builder.build_int_s_extend(v, i64_type, "sext")?
+                    compiler_context
+                        .builder
+                        .build_int_s_extend(v, i64_type, "sext")?
                 } else {
-                    compiler_context.builder.build_int_z_extend(v, i64_type, "zext")?
+                    compiler_context
+                        .builder
+                        .build_int_z_extend(v, i64_type, "zext")?
                 };
                 stack.push((
                     UnitType::Literal(LiteralType::Number(pushed.clone())),
@@ -1803,15 +1839,10 @@ fn is_signed_number(ty: &UnitType) -> bool {
     matches!(
         ty,
         UnitType::Literal(LiteralType::Number(
-            NumberType::I8
-                | NumberType::I16
-                | NumberType::I32
-                | NumberType::I64
-                | NumberType::I128
+            NumberType::I8 | NumberType::I16 | NumberType::I32 | NumberType::I64 | NumberType::I128
         ))
     )
 }
-
 
 fn pop2_push1<'ctx>(
     pop_types: &[UnitType],

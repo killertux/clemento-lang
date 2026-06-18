@@ -422,12 +422,16 @@ impl<'a> Parser<'a> {
         };
 
         let mut var_types = Vec::new();
-        if self.tokens.next_if(|token| {
-            token
-                .as_ref()
-                .map(|token| token.token_type == TokenType::LeftChevron)
-                .unwrap_or(false)
-        }).is_some() {
+        if self
+            .tokens
+            .next_if(|token| {
+                token
+                    .as_ref()
+                    .map(|token| token.token_type == TokenType::LeftChevron)
+                    .unwrap_or(false)
+            })
+            .is_some()
+        {
             loop {
                 let symbol = self
                     .tokens
@@ -504,12 +508,16 @@ impl<'a> Parser<'a> {
             ));
         };
         let mut fields: Vec<(String, UnitType)> = Vec::new();
-        if self.tokens.next_if(|token| {
-            token
-                .as_ref()
-                .map(|token| token.token_type == TokenType::LeftParen)
-                .unwrap_or(false)
-        }).is_some() {
+        if self
+            .tokens
+            .next_if(|token| {
+                token
+                    .as_ref()
+                    .map(|token| token.token_type == TokenType::LeftParen)
+                    .unwrap_or(false)
+            })
+            .is_some()
+        {
             loop {
                 let symbol = self
                     .tokens
@@ -834,7 +842,10 @@ impl<'a> Parser<'a> {
                         }
                         TokenType::Char(c) => elements.push(Pattern::Char(c)),
                         other => {
-                            return Err(ParserError::UnexpectedToken(other, element_token.position));
+                            return Err(ParserError::UnexpectedToken(
+                                other,
+                                element_token.position,
+                            ));
                         }
                     }
                 }
@@ -870,7 +881,10 @@ impl<'a> Parser<'a> {
                     };
                     tail = Some(name);
                 }
-                Ok((desugar_list_pattern(&elements, tail.as_deref()), token.position))
+                Ok((
+                    desugar_list_pattern(&elements, tail.as_deref()),
+                    token.position,
+                ))
             }
             other => Err(ParserError::UnexpectedToken(other, token.position)),
         }
@@ -1013,7 +1027,6 @@ fn assert_token_type(token: &Token, expected_type: TokenType) -> Result<(), Pars
         ))
     }
 }
-
 
 impl<'a> Iterator for Parser<'a> {
     type Item = Result<AstNode, ParserError>;
@@ -1821,7 +1834,10 @@ mod tests {
 
     #[test]
     fn list_pattern_tail_only_binds_whole_list() {
-        assert_eq!(first_match_pattern("match { [... all] -> 1i64 }"), bind("all"));
+        assert_eq!(
+            first_match_pattern("match { [... all] -> 1i64 }"),
+            bind("all")
+        );
     }
 
     #[test]

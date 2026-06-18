@@ -360,7 +360,9 @@ impl NumberTypeHint {
     ) -> Result<IntegerNumber, LexerError> {
         let err = || LexerError::InvalidNumber(original.to_string(), position.clone());
         Ok(match self {
-            NumberTypeHint::U8 => IntegerNumber::U8(u8::from_str_radix(digits, radix).map_err(|_| err())?),
+            NumberTypeHint::U8 => {
+                IntegerNumber::U8(u8::from_str_radix(digits, radix).map_err(|_| err())?)
+            }
             NumberTypeHint::U16 => {
                 IntegerNumber::U16(u16::from_str_radix(digits, radix).map_err(|_| err())?)
             }
@@ -373,7 +375,9 @@ impl NumberTypeHint {
             NumberTypeHint::U128 => {
                 IntegerNumber::U128(u128::from_str_radix(digits, radix).map_err(|_| err())?)
             }
-            NumberTypeHint::I8 => IntegerNumber::I8(i8::from_str_radix(digits, radix).map_err(|_| err())?),
+            NumberTypeHint::I8 => {
+                IntegerNumber::I8(i8::from_str_radix(digits, radix).map_err(|_| err())?)
+            }
             NumberTypeHint::I16 => {
                 IntegerNumber::I16(i16::from_str_radix(digits, radix).map_err(|_| err())?)
             }

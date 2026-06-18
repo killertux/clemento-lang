@@ -22,10 +22,7 @@ const CLEM_HEADER: &str = include_str!("clem.h");
 /// In addition to the always-linked runtime, this links in any FFI glue:
 ///   - a sibling C file (`foo.clem` -> `foo.c`), if present, and
 ///   - any extra C sources passed on the command line (`-c`/`--c-source`).
-fn compile_and_link(
-    path: impl AsRef<Path>,
-    c_sources: &[PathBuf],
-) -> Result<PathBuf, DriverError> {
+fn compile_and_link(path: impl AsRef<Path>, c_sources: &[PathBuf]) -> Result<PathBuf, DriverError> {
     // Resolve the sibling C glue file (`foo.clem` -> `foo.c`) before compiling,
     // since `compile` rewrites the path's extension.
     let sibling_c = path.as_ref().with_extension("c");
@@ -86,7 +83,10 @@ pub fn run(path: impl AsRef<Path>, c_sources: &[PathBuf]) -> Result<ExitCode, Dr
 }
 
 /// Compiles and links the program without running it.
-pub fn compile_only(path: impl AsRef<Path>, c_sources: &[PathBuf]) -> Result<ExitCode, DriverError> {
+pub fn compile_only(
+    path: impl AsRef<Path>,
+    c_sources: &[PathBuf],
+) -> Result<ExitCode, DriverError> {
     compile_and_link(path, c_sources)?;
     Ok(ExitCode::SUCCESS)
 }

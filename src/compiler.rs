@@ -225,10 +225,7 @@ impl<'ctx> CompilerContext<'ctx> {
                     self.context.append_basic_block(current_function, "merge");
                 for (index, _) in ty.variants.iter().enumerate() {
                     let block = self.context.append_basic_block(current_function, "variant");
-                    blocks.push((
-                        self.context.i8_type().const_int(index as u64, false),
-                        block,
-                    ));
+                    blocks.push((self.context.i8_type().const_int(index as u64, false), block));
                 }
                 self.builder
                     .build_switch(variant, variant_merge_block, &blocks)?;
@@ -688,9 +685,7 @@ impl<'ctx> CompilerContext<'ctx> {
         if symbol_name == "main" {
             let function_name = "main";
             let function_type = self.context.i32_type().fn_type(&[], false);
-            let function = self
-                .module
-                .add_function(function_name, function_type, None);
+            let function = self.module.add_function(function_name, function_type, None);
             let new_scope = Scope::with_parent(cloned_scope);
 
             let entry = self.context.append_basic_block(function, "entry");
@@ -977,11 +972,13 @@ impl<'ctx> CompilerContext<'ctx> {
         }
     }
 
-
     /// Writes a Unicode scalar (`cp`, an i32 code point) to stdout as UTF-8,
     /// emitting 1–4 bytes via `putchar`. This is the one string-output primitive;
     /// the stdlib walks a `List<Char>` calling `char::print` for each element.
-    pub fn emit_print_char(&self, cp: inkwell::values::IntValue<'ctx>) -> Result<(), CompilerError> {
+    pub fn emit_print_char(
+        &self,
+        cp: inkwell::values::IntValue<'ctx>,
+    ) -> Result<(), CompilerError> {
         let i32_type = self.context.i32_type();
         let putchar = self
             .module
@@ -1004,22 +1001,22 @@ impl<'ctx> CompilerContext<'ctx> {
 
         let c = |v: u64| i32_type.const_int(v, false);
         // `cp >> shift` (logical) then `low6 | mask`, producing a continuation/lead byte.
-        let shifted = |cp: inkwell::values::IntValue<'ctx>, shift: u64| -> Result<_, CompilerError> {
-            Ok(self
-                .builder
-                .build_right_shift(cp, c(shift), false, "sh")?)
-        };
+        let shifted =
+            |cp: inkwell::values::IntValue<'ctx>, shift: u64| -> Result<_, CompilerError> {
+                Ok(self.builder.build_right_shift(cp, c(shift), false, "sh")?)
+            };
         let put = |byte: inkwell::values::IntValue<'ctx>| -> Result<(), CompilerError> {
-            self.builder.build_call(putchar, &[byte.into()], "putchar")?;
+            self.builder
+                .build_call(putchar, &[byte.into()], "putchar")?;
             Ok(())
         };
         let or = |a, b, name| self.builder.build_or(a, b, name);
         let and = |a, b, name| self.builder.build_and(a, b, name);
 
         // cp < 0x80 ?
-        let lt_80 = self
-            .builder
-            .build_int_compare(inkwell::IntPredicate::ULT, cp, c(0x80), "lt80")?;
+        let lt_80 =
+            self.builder
+                .build_int_compare(inkwell::IntPredicate::ULT, cp, c(0x80), "lt80")?;
         self.builder.build_conditional_branch(lt_80, one, multi)?;
 
         // 1-byte: the code point itself.
@@ -1028,10 +1025,11 @@ impl<'ctx> CompilerContext<'ctx> {
         self.builder.build_unconditional_branch(done)?;
 
         self.builder.position_at_end(multi);
-        let lt_800 = self
-            .builder
-            .build_int_compare(inkwell::IntPredicate::ULT, cp, c(0x800), "lt800")?;
-        self.builder.build_conditional_branch(lt_800, two, three_plus)?;
+        let lt_800 =
+            self.builder
+                .build_int_compare(inkwell::IntPredicate::ULT, cp, c(0x800), "lt800")?;
+        self.builder
+            .build_conditional_branch(lt_800, two, three_plus)?;
 
         // 2-byte: 110xxxxx 10xxxxxx
         self.builder.position_at_end(two);
@@ -1040,10 +1038,14 @@ impl<'ctx> CompilerContext<'ctx> {
         self.builder.build_unconditional_branch(done)?;
 
         self.builder.position_at_end(three_plus);
-        let lt_10000 = self
-            .builder
-            .build_int_compare(inkwell::IntPredicate::ULT, cp, c(0x10000), "lt10000")?;
-        self.builder.build_conditional_branch(lt_10000, three, four)?;
+        let lt_10000 = self.builder.build_int_compare(
+            inkwell::IntPredicate::ULT,
+            cp,
+            c(0x10000),
+            "lt10000",
+        )?;
+        self.builder
+            .build_conditional_branch(lt_10000, three, four)?;
 
         // 3-byte: 1110xxxx 10xxxxxx 10xxxxxx
         self.builder.position_at_end(three);
@@ -1082,7 +1084,10 @@ impl<'ctx> CompilerContext<'ctx> {
         module_path: &[String],
         merge_block: inkwell::basic_block::BasicBlock<'ctx>,
         default_block: inkwell::basic_block::BasicBlock<'ctx>,
-        values_and_blocks: &mut Vec<(Vec<(UnitType, BasicValueEnum<'ctx>)>, inkwell::basic_block::BasicBlock<'ctx>)>,
+        values_and_blocks: &mut Vec<(
+            Vec<(UnitType, BasicValueEnum<'ctx>)>,
+            inkwell::basic_block::BasicBlock<'ctx>,
+        )>,
         // Tail position of the enclosing match: leaf arm bodies inherit it so a
         // self-tail-call inside an arm lowers to a loop back-edge.
         outer_tail: bool,
@@ -1119,7 +1124,12 @@ impl<'ctx> CompilerContext<'ctx> {
             let n_push_types = first.body.type_definition.push_types.len();
             let mut temp_stack = stack.clone();
             self.tail_position = outer_tail;
-            self.compile_ast(scope, &mut temp_stack, first.body.clone(), module_path.to_vec())?;
+            self.compile_ast(
+                scope,
+                &mut temp_stack,
+                first.body.clone(),
+                module_path.to_vec(),
+            )?;
             // Skip the merge edge if a tail-call already terminated this arm with a
             // back-edge to the loop header.
             if !self.current_block_terminated() {
@@ -1151,7 +1161,11 @@ impl<'ctx> CompilerContext<'ctx> {
 
         // Discriminate on column `col` (a custom-typed value).
         let (col_ty, col_value) = value_columns[col].clone();
-        let UnitType::Custom { name, generic_types } = &col_ty else {
+        let UnitType::Custom {
+            name,
+            generic_types,
+        } = &col_ty
+        else {
             return Err(CompilerError::UnsupportedPattern);
         };
         let custom_type = self
@@ -1213,7 +1227,10 @@ impl<'ctx> CompilerContext<'ctx> {
             &switch_arms
                 .iter()
                 .map(|(index, _, block)| {
-                    (self.context.i8_type().const_int(*index as u64, false), *block)
+                    (
+                        self.context.i8_type().const_int(*index as u64, false),
+                        *block,
+                    )
                 })
                 .collect::<Vec<_>>(),
         )?;
@@ -1308,7 +1325,10 @@ impl<'ctx> CompilerContext<'ctx> {
         module_path: &[String],
         merge_block: inkwell::basic_block::BasicBlock<'ctx>,
         default_block: inkwell::basic_block::BasicBlock<'ctx>,
-        values_and_blocks: &mut Vec<(Vec<(UnitType, BasicValueEnum<'ctx>)>, inkwell::basic_block::BasicBlock<'ctx>)>,
+        values_and_blocks: &mut Vec<(
+            Vec<(UnitType, BasicValueEnum<'ctx>)>,
+            inkwell::basic_block::BasicBlock<'ctx>,
+        )>,
         outer_tail: bool,
     ) -> Result<(), CompilerError> {
         let (col_ty, col_value) = value_columns[col].clone();
@@ -1319,9 +1339,7 @@ impl<'ctx> CompilerContext<'ctx> {
             let mut patterns = row.patterns.clone();
             let removed = patterns.remove(col);
             let mut bindings = row.bindings.clone();
-            if bind_value
-                && let Pattern::Wildcard(Some(name)) = removed
-            {
+            if bind_value && let Pattern::Wildcard(Some(name)) = removed {
                 bindings.push((name, (col_ty.clone(), col_value)));
             }
             MatchRow {
@@ -1347,9 +1365,7 @@ impl<'ctx> CompilerContext<'ctx> {
             .ok_or(CompilerError::IfWithoutFunction)?
             .get_parent()
             .ok_or(CompilerError::IfWithoutFunction)?;
-        let switch_default = self
-            .context
-            .append_basic_block(function, "lit_default");
+        let switch_default = self.context.append_basic_block(function, "lit_default");
 
         let mut arms = Vec::new();
         for &lit in &literals {
@@ -1359,10 +1375,7 @@ impl<'ctx> CompilerContext<'ctx> {
         self.builder.build_switch(
             scrutinee,
             switch_default,
-            &arms
-                .iter()
-                .map(|(c, b, _)| (*c, *b))
-                .collect::<Vec<_>>(),
+            &arms.iter().map(|(c, b, _)| (*c, *b)).collect::<Vec<_>>(),
         )?;
 
         for (_, block, lit) in &arms {
@@ -1663,12 +1676,16 @@ impl<'ctx> CompilerContext<'ctx> {
         let base_size = base.size_of().expect("sized");
 
         let build_empty = || -> Result<PointerValue<'ctx>, CompilerError> {
-            let total =
-                self.builder
-                    .build_int_add(base_size, empty_struct.size_of().expect("sized"), "sz")?;
+            let total = self.builder.build_int_add(
+                base_size,
+                empty_struct.size_of().expect("sized"),
+                "sz",
+            )?;
             let p = self.build_pool_alloc(total)?;
-            self.builder
-                .build_store(self.builder.build_struct_gep(base, p, 0, "rc")?, i64_type.const_int(1, false))?;
+            self.builder.build_store(
+                self.builder.build_struct_gep(base, p, 0, "rc")?,
+                i64_type.const_int(1, false),
+            )?;
             self.builder.build_store(
                 self.builder.build_struct_gep(base, p, 1, "variant")?,
                 i8_type.const_int(empty_index as u64, false),
@@ -1678,22 +1695,30 @@ impl<'ctx> CompilerContext<'ctx> {
         let build_cons = |next: PointerValue<'ctx>,
                           element: inkwell::values::IntValue<'ctx>|
          -> Result<PointerValue<'ctx>, CompilerError> {
-            let total =
-                self.builder
-                    .build_int_add(base_size, list_struct.size_of().expect("sized"), "sz")?;
+            let total = self.builder.build_int_add(
+                base_size,
+                list_struct.size_of().expect("sized"),
+                "sz",
+            )?;
             let p = self.build_pool_alloc(total)?;
-            self.builder
-                .build_store(self.builder.build_struct_gep(base, p, 0, "rc")?, i64_type.const_int(1, false))?;
+            self.builder.build_store(
+                self.builder.build_struct_gep(base, p, 0, "rc")?,
+                i64_type.const_int(1, false),
+            )?;
             self.builder.build_store(
                 self.builder.build_struct_gep(base, p, 1, "variant")?,
                 i8_type.const_int(list_index as u64, false),
             )?;
             let payload = self.builder.build_struct_gep(base, p, 2, "payload")?;
             // Field order matches the variant declaration `List(next, element)`.
-            self.builder
-                .build_store(self.builder.build_struct_gep(list_struct, payload, 0, "next")?, next)?;
             self.builder.build_store(
-                self.builder.build_struct_gep(list_struct, payload, 1, "element")?,
+                self.builder
+                    .build_struct_gep(list_struct, payload, 0, "next")?,
+                next,
+            )?;
+            self.builder.build_store(
+                self.builder
+                    .build_struct_gep(list_struct, payload, 1, "element")?,
                 element,
             )?;
             Ok(p)
@@ -1718,7 +1743,10 @@ impl<'ctx> CompilerContext<'ctx> {
             .ok_or(CompilerError::IfWithoutFunction)?
             .get_parent()
             .ok_or(CompilerError::IfWithoutFunction)?;
-        let entry = self.builder.get_insert_block().ok_or(CompilerError::IfWithoutFunction)?;
+        let entry = self
+            .builder
+            .get_insert_block()
+            .ok_or(CompilerError::IfWithoutFunction)?;
         let cond = self.context.append_basic_block(function, "decode_cond");
         let body = self.context.append_basic_block(function, "decode_body");
         let done = self.context.append_basic_block(function, "decode_done");
@@ -1731,18 +1759,35 @@ impl<'ctx> CompilerContext<'ctx> {
         acc_phi.add_incoming(&[(&acc0 as &dyn BasicValue, entry)]);
         let i_val = i_phi.as_basic_value().into_int_value();
         let acc_val = acc_phi.as_basic_value().into_pointer_value();
-        let positive =
-            self.builder
-                .build_int_compare(inkwell::IntPredicate::UGT, i_val, i64_type.const_zero(), "pos")?;
-        self.builder.build_conditional_branch(positive, body, done)?;
+        let positive = self.builder.build_int_compare(
+            inkwell::IntPredicate::UGT,
+            i_val,
+            i64_type.const_zero(),
+            "pos",
+        )?;
+        self.builder
+            .build_conditional_branch(positive, body, done)?;
 
         self.builder.position_at_end(body);
-        let idx = self.builder.build_int_sub(i_val, i64_type.const_int(1, false), "idx")?;
-        let char_ptr = unsafe { self.builder.build_gep(i8_type, buffer, &[idx], "char_ptr")? };
-        let byte = self.builder.build_load(i8_type, char_ptr, "byte")?.into_int_value();
-        let code_point = self.builder.build_int_z_extend(byte, i32_type, "code_point")?;
+        let idx = self
+            .builder
+            .build_int_sub(i_val, i64_type.const_int(1, false), "idx")?;
+        let char_ptr = unsafe {
+            self.builder
+                .build_gep(i8_type, buffer, &[idx], "char_ptr")?
+        };
+        let byte = self
+            .builder
+            .build_load(i8_type, char_ptr, "byte")?
+            .into_int_value();
+        let code_point = self
+            .builder
+            .build_int_z_extend(byte, i32_type, "code_point")?;
         let new_acc = build_cons(acc_val, code_point)?;
-        let body_end = self.builder.get_insert_block().ok_or(CompilerError::IfWithoutFunction)?;
+        let body_end = self
+            .builder
+            .get_insert_block()
+            .ok_or(CompilerError::IfWithoutFunction)?;
         i_phi.add_incoming(&[(&idx as &dyn BasicValue, body_end)]);
         acc_phi.add_incoming(&[(&new_acc as &dyn BasicValue, body_end)]);
         self.builder.build_unconditional_branch(cond)?;
@@ -1759,7 +1804,10 @@ impl<'ctx> CompilerContext<'ctx> {
 fn substitute_unit(ty: &UnitType, generics_map: &HashMap<VarType, UnitType>) -> UnitType {
     match ty {
         UnitType::Var(var) => generics_map.get(var).cloned().unwrap_or_else(|| ty.clone()),
-        UnitType::Custom { name, generic_types } => UnitType::Custom {
+        UnitType::Custom {
+            name,
+            generic_types,
+        } => UnitType::Custom {
             name: name.clone(),
             generic_types: generic_types
                 .iter()
@@ -1846,9 +1894,10 @@ fn specialize_rows<'ctx>(
     let mut out = Vec::new();
     for row in rows {
         let (sub, extra_binding) = match &row.patterns[col] {
-            Pattern::Variant { variant_name, fields }
-                if variant_name.last().map(|s| s.as_str()) == Some(constructor) =>
-            {
+            Pattern::Variant {
+                variant_name,
+                fields,
+            } if variant_name.last().map(|s| s.as_str()) == Some(constructor) => {
                 (variant_sub_patterns(variant, fields), None)
             }
             Pattern::Wildcard(name) => (
@@ -2057,16 +2106,10 @@ impl<'ctx> Scope<'ctx> {
                 {
                     return from_definitions;
                 }
-                if let Some(from_definitions) = inner
-                    .external_definitions
-                    .get(&last)
-                    .cloned().map(|_| call_function(
-                            context,
-                            stack,
-                            last.clone(),
-                            last.clone(),
-                            ty.clone(),
-                        ))
+                if let Some(from_definitions) =
+                    inner.external_definitions.get(&last).cloned().map(|_| {
+                        call_function(context, stack, last.clone(), last.clone(), ty.clone())
+                    })
                 {
                     return from_definitions;
                 }
@@ -2262,4 +2305,3 @@ fn match_types(left: &[UnitType], right: &[UnitType]) -> bool {
     }
     true
 }
-

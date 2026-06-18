@@ -17,9 +17,7 @@ use unify::{
 use crate::{
     lexer::{IntegerNumber, Number, Position},
     parser::{AstNode, AstNodeType, Case, FieldPattern, Import, Pattern},
-    types::{
-        CustomType, LiteralType, NumberType, Type, UnitType, VarType, VarTypeToCharContainer,
-    },
+    types::{CustomType, LiteralType, NumberType, Type, UnitType, VarType, VarTypeToCharContainer},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -311,7 +309,7 @@ impl TypeChecker {
                     // We use this to allow recursive types. We should probably create a better implementation latter
                     let ty = self.replace_custom_type(scope, ty.clone())?;
                     scope.insert_definition(symbol.clone(), ty, is_private);
-                    
+
                     self.infer_type_definition(scope, Vec::new(), *body, module_path)?
                 } else {
                     let body = self.infer_type_definition(scope, Vec::new(), *body, module_path)?;
@@ -618,7 +616,8 @@ impl TypeChecker {
                         pattern_body_type
                             .clone()
                             .map(|mut t| {
-                                t.pop_types.extend_from_slice(std::slice::from_ref(&match_type));
+                                t.pop_types
+                                    .extend_from_slice(std::slice::from_ref(&match_type));
                                 t.pop_types
                             })
                             .unwrap_or(vec![match_type]),
@@ -629,10 +628,7 @@ impl TypeChecker {
             UnitType::Custom { .. } => {
                 let mut result_cases = Vec::with_capacity(cases.len());
                 for case in cases.clone().into_iter() {
-                    if !matches!(
-                        case.pattern,
-                        Pattern::Variant { .. } | Pattern::Wildcard(_)
-                    ) {
+                    if !matches!(case.pattern, Pattern::Variant { .. } | Pattern::Wildcard(_)) {
                         return Err(TypeCheckerError::InvalidPatternForType(
                             Box::new(match_type.clone()),
                             Box::new(case.pattern.clone()),
@@ -672,9 +668,13 @@ impl TypeChecker {
                     pattern_body_type = Some(body_type.type_definition);
                 }
                 // Exhaustiveness: a fresh catch-all arm must be redundant (usefulness check).
-                let top_patterns: Vec<Pattern> =
-                    cases.iter().map(|c| c.pattern.clone()).collect();
-                if pattern_is_useful(&self.type_definitions, &top_patterns, &match_type, &position)? {
+                let top_patterns: Vec<Pattern> = cases.iter().map(|c| c.pattern.clone()).collect();
+                if pattern_is_useful(
+                    &self.type_definitions,
+                    &top_patterns,
+                    &match_type,
+                    &position,
+                )? {
                     return Err(TypeCheckerError::NonExhaustiveMatch(position.clone()));
                 }
                 Ok(AstNodeWithType {
@@ -684,7 +684,8 @@ impl TypeChecker {
                         pattern_body_type
                             .clone()
                             .map(|mut t| {
-                                t.pop_types.extend_from_slice(std::slice::from_ref(&match_type));
+                                t.pop_types
+                                    .extend_from_slice(std::slice::from_ref(&match_type));
                                 t.pop_types
                             })
                             .unwrap_or(vec![match_type]),
@@ -696,7 +697,6 @@ impl TypeChecker {
         }
     }
 }
-
 
 /// Ensures every arm of a `match` produces the same stack effect. The first
 /// arm seeds `pattern_body_type`; later arms must match it.
@@ -755,10 +755,7 @@ fn bind_pattern(
             variant_name,
             fields,
         } => {
-            let variant = variant_name
-                .last()
-                .map(|s| s.as_str())
-                .unwrap_or_default();
+            let variant = variant_name.last().map(|s| s.as_str()).unwrap_or_default();
             let (field_order, field_types) =
                 variant_fields_of(type_definitions, ty, variant, position)?;
             for field in fields {
@@ -789,8 +786,15 @@ fn variant_fields_of(
     variant: &str,
     position: &Position,
 ) -> Result<(Vec<String>, Vec<UnitType>), TypeCheckerError> {
-    let UnitType::Custom { name, generic_types } = ty else {
-        return Err(TypeCheckerError::InvalidMatchType(ty.clone(), position.clone()));
+    let UnitType::Custom {
+        name,
+        generic_types,
+    } = ty
+    else {
+        return Err(TypeCheckerError::InvalidMatchType(
+            ty.clone(),
+            position.clone(),
+        ));
     };
     let custom_type = type_definitions
         .get(name)
@@ -860,9 +864,10 @@ fn specialize_matrix(
     for row in matrix {
         let (head, rest) = row.split_first().expect("matrix rows are non-empty");
         match head {
-            Pattern::Variant { variant_name, fields }
-                if variant_name.last().map(|s| s.as_str()) == Some(variant) =>
-            {
+            Pattern::Variant {
+                variant_name,
+                fields,
+            } if variant_name.last().map(|s| s.as_str()) == Some(variant) => {
                 let mut new_row = sub_patterns_in_order(fields, field_order);
                 new_row.extend_from_slice(rest);
                 out.push(new_row);
@@ -903,7 +908,10 @@ fn is_useful(
     }
     let t0 = &types[0];
     match &q[0] {
-        Pattern::Variant { variant_name, fields } => {
+        Pattern::Variant {
+            variant_name,
+            fields,
+        } => {
             let variant = variant_name.last().map(|s| s.as_str()).unwrap_or_default();
             let (field_order, field_types) =
                 variant_fields_of(type_definitions, t0, variant, position)?;
@@ -925,8 +933,11 @@ fn is_useful(
                     let custom_type = type_definitions
                         .get(name)
                         .ok_or_else(|| TypeCheckerError::TypeNotFound(name.clone()))?;
-                    let all: Vec<String> =
-                        custom_type.variants.iter().map(|(n, _)| n.clone()).collect();
+                    let all: Vec<String> = custom_type
+                        .variants
+                        .iter()
+                        .map(|(n, _)| n.clone())
+                        .collect();
                     let present: HashSet<String> = matrix
                         .iter()
                         .filter_map(|row| match row.first() {
@@ -1110,11 +1121,7 @@ impl TypeScope {
             1 => {
                 let inner = self.inner.borrow();
                 let last = name.last().expect("We checked for the name size").clone();
-                if let Some(from_definitions) = inner
-                    .type_definitions
-                    .get(&last)
-                    .cloned()
-                {
+                if let Some(from_definitions) = inner.type_definitions.get(&last).cloned() {
                     return Some(from_definitions);
                 }
                 if let Some(imported_functions) = inner.imported_functions.get(&last) {
@@ -1817,7 +1824,10 @@ def main {
         let err = parse_and_type_check(contents, false)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("Non-exhaustive"), "expected non-exhaustive, got: {err}");
+        assert!(
+            err.contains("Non-exhaustive"),
+            "expected non-exhaustive, got: {err}"
+        );
     }
 
     #[test]
@@ -1834,7 +1844,10 @@ def main {
         let err = parse_and_type_check(contents, false)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("Non-exhaustive"), "expected non-exhaustive, got: {err}");
+        assert!(
+            err.contains("Non-exhaustive"),
+            "expected non-exhaustive, got: {err}"
+        );
     }
 
     #[test]
@@ -1863,7 +1876,10 @@ def main {
         let err = parse_and_type_check(contents, false)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("Non-exhaustive"), "expected non-exhaustive, got: {err}");
+        assert!(
+            err.contains("Non-exhaustive"),
+            "expected non-exhaustive, got: {err}"
+        );
     }
 
     #[test]

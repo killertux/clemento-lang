@@ -186,13 +186,11 @@ pub(super) fn validate_types_and_return_variable_substitution(
                     ));
                 }
 
-                variable_substitution.extend(
-                    validate_types_and_return_variable_substitution(
-                        generic_types1,
-                        generic_types2,
-                        position.clone(),
-                    )?,
-                );
+                variable_substitution.extend(validate_types_and_return_variable_substitution(
+                    generic_types1,
+                    generic_types2,
+                    position.clone(),
+                )?);
             }
             (UnitType::Type(ty1), UnitType::Type(ty2)) => {
                 if ty1 != ty2 {
