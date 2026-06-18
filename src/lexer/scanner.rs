@@ -36,6 +36,9 @@ impl<'a> Lexer<'a> {
             Some(']') => Ok(Some(self.create_token_here(TokenType::RightBracket))),
             Some('<') => Ok(Some(self.create_token_here(TokenType::LeftChevron))),
             Some('>') => Ok(Some(self.create_token_here(TokenType::RightChevron))),
+            // `\` introduces a function value: `\name` (reference) or `\{ ... }`
+            // (anonymous quotation). It is always its own token.
+            Some('\\') => Ok(Some(self.create_token_here(TokenType::Backslash))),
             Some('/') if self.input.peek().is_some_and(|c| *c == '/') => {
                 self.lex_single_line_comment()
             }
@@ -463,7 +466,7 @@ impl NumberTypeHint {
 }
 
 fn is_separator(c: &char) -> bool {
-    c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>')
+    c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '\\')
 }
 
 impl<'a> Iterator for Lexer<'a> {

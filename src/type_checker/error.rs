@@ -38,4 +38,6 @@ pub enum TypeCheckerError {
     FieldNotFoundInVariant(String, String),
     #[error("Non-exhaustive match at {0}")]
     NonExhaustiveMatch(Position),
+    #[error("`apply` expects a function value on top of the stack at {0}, but got {1}")]
+    ApplyOnNonFunction(Position, String),
 }

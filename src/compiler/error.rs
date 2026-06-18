@@ -44,4 +44,12 @@ pub enum CompilerError {
     TypeNotInScope,
     #[error("Variant {0} not found in custom type")]
     VariantNotFound(String),
+    #[error(
+        "Cannot take a reference to `{0}`: only user `def`s can be used as function values (builtins and constructors emit inline code)"
+    )]
+    CannotReferenceFunction(String),
+    #[error(
+        "Cannot determine a concrete type for function value `{0}`: its type still has unresolved type variables. Apply it (or annotate it) so its type can be inferred."
+    )]
+    UnresolvedFunctionValue(String),
 }

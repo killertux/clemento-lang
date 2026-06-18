@@ -10,7 +10,7 @@ mod unify;
 
 pub use error::TypeCheckerError;
 use unify::{
-    replace_custom_unit_type, substitute_types, substitute_unit_type,
+    apply_substitution, replace_custom_unit_type, substitute_types, substitute_unit_type,
     validate_types_and_return_variable_substitution,
 };
 
@@ -19,6 +19,89 @@ use crate::{
     parser::{AstNode, AstNodeType, Case, FieldPattern, Import, Pattern},
     types::{CustomType, LiteralType, NumberType, Type, UnitType, VarType, VarTypeToCharContainer},
 };
+
+/// Replaces every type variable in `ty` with a fresh one, consistently (the same
+/// source variable maps to the same fresh variable via `remap`). Used so each
+/// occurrence of a function-value reference gets independent variables — two
+/// `\dup` references must not share `a`, or applying them at different types
+/// would spuriously conflict.
+fn freshen_type(ty: &Type, remap: &mut HashMap<VarType, VarType>) -> Type {
+    Type::new(
+        ty.pop_types
+            .iter()
+            .map(|u| freshen_unit(u, remap))
+            .collect(),
+        ty.push_types
+            .iter()
+            .map(|u| freshen_unit(u, remap))
+            .collect(),
+    )
+}
+
+fn freshen_unit(unit: &UnitType, remap: &mut HashMap<VarType, VarType>) -> UnitType {
+    match unit {
+        UnitType::Var(var) => UnitType::Var(
+            remap
+                .entry(var.clone())
+                .or_insert_with(VarType::new)
+                .clone(),
+        ),
+        UnitType::Custom {
+            name,
+            generic_types,
+        } => UnitType::Custom {
+            name: name.clone(),
+            generic_types: generic_types
+                .iter()
+                .map(|g| freshen_unit(g, remap))
+                .collect(),
+        },
+        UnitType::Type(inner) => UnitType::Type(freshen_type(inner, remap)),
+        UnitType::Literal(_) => unit.clone(),
+    }
+}
+
+/// Rewrites every `type_definition` in an AST subtree with `subst`, recursing
+/// into nested blocks/quotations/match arms. Used to back-substitute the
+/// apply-site bindings into a definition body (and to freshen quotation bodies).
+fn apply_subst_to_node(node: &mut AstNodeWithType, subst: &HashMap<VarType, UnitType>) {
+    node.type_definition = apply_substitution(subst, node.type_definition.clone());
+    match &mut node.node_type {
+        AstNodeType::Block(nodes) | AstNodeType::Quotation(nodes) => {
+            for n in nodes {
+                apply_subst_to_node(n, subst);
+            }
+        }
+        AstNodeType::Match(cases) => {
+            for case in cases {
+                apply_subst_to_node(&mut case.body, subst);
+            }
+        }
+        AstNodeType::Definition { body, .. } => apply_subst_to_node(body, subst),
+        _ => {}
+    }
+}
+
+/// Closes transitive chains in a substitution (`a -> b`, `b -> I64` becomes
+/// `a -> I64`) so a single back-substitution pass fully concretizes. Capped to
+/// avoid looping on `a -> b`, `b -> a` cycles.
+fn resolve_substitution(map: &mut HashMap<VarType, UnitType>) {
+    for _ in 0..map.len() + 1 {
+        let mut changed = false;
+        let keys: Vec<VarType> = map.keys().cloned().collect();
+        for key in keys {
+            let value = map.get(&key).cloned().expect("key came from the map");
+            let resolved = substitute_unit_type(map, value.clone());
+            if resolved != value {
+                map.insert(key, resolved);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AstNodeWithType {
@@ -50,6 +133,12 @@ impl AstNodeWithType {
 pub struct TypeChecker {
     imports: HashMap<String, TypeScope>,
     type_definitions: HashMap<Vec<String>, CustomType>,
+    /// Accumulates the type-variable bindings discovered while checking the
+    /// current definition's body (mostly at `apply` sites). After the body is
+    /// checked it is back-substituted into the body so function-value
+    /// references/quotations whose concrete type is pinned only by a downstream
+    /// `apply` become concrete. Saved/restored per definition.
+    function_value_subst: HashMap<VarType, UnitType>,
 }
 
 impl TypeChecker {
@@ -57,6 +146,7 @@ impl TypeChecker {
         Self {
             imports: HashMap::new(),
             type_definitions: HashMap::new(),
+            function_value_subst: HashMap::new(),
         }
     }
 
@@ -259,6 +349,44 @@ impl TypeChecker {
                     substitute_types(&type_stack, type_definition, node.position.clone())?,
                 ))
             }
+            // `apply` is a builtin whose stack effect depends on the function
+            // value sitting on top of the stack, so it cannot be an ordinary
+            // fixed-signature definition: pop the function value, then apply its
+            // own signature (pop its inputs, push its outputs).
+            AstNodeType::Symbol(symbol) if symbol == "apply" => {
+                let Some(UnitType::Type(sig)) = type_stack.last().cloned() else {
+                    let got = type_stack
+                        .last()
+                        .map(|t| t.to_string())
+                        .unwrap_or_else(|| "an empty stack".to_string());
+                    return Err(TypeCheckerError::ApplyOnNonFunction(
+                        node.position.clone(),
+                        got,
+                    ));
+                };
+                // The function value occupies the top of the stack; its inputs
+                // sit just below it. Unify the function's input types against
+                // those actual values — this is what pins a polymorphic function
+                // value's type (e.g. `\dup` applied to an I64 binds `a := I64`).
+                // We intentionally do NOT unify the function value against itself
+                // (that yields only useless `v := v` self-bindings).
+                let args = &type_stack[..type_stack.len() - 1];
+                let subst = validate_types_and_return_variable_substitution(
+                    args,
+                    &sig.pop_types,
+                    node.position.clone(),
+                )?;
+                self.function_value_subst.extend(subst.clone());
+
+                let mut pop_types = sig.pop_types.clone();
+                pop_types.push(UnitType::Type(sig.clone()));
+                let apply_ty = Type::new(pop_types, sig.push_types.clone());
+                Ok(AstNodeWithType::new(
+                    AstNodeType::Symbol(symbol),
+                    node.position.clone(),
+                    apply_substitution(&subst, apply_ty),
+                ))
+            }
             AstNodeType::Symbol(symbol) => {
                 let type_definition = scope.get_definition(vec![symbol.clone()], false).ok_or(
                     TypeCheckerError::SymbolNotFound(symbol.clone(), node.position.clone(), {
@@ -300,12 +428,73 @@ impl TypeChecker {
                     substitute_types(&type_stack, ty, node.position.clone())?,
                 ))
             }
+            AstNodeType::FunctionRef(symbol) => {
+                let sig = scope.get_definition(symbol.clone(), false).ok_or(
+                    TypeCheckerError::SymbolNotFound(symbol.join("::"), node.position.clone(), {
+                        let mut var_t_container = VarTypeToCharContainer::new();
+                        format!(
+                            "<...{}>",
+                            type_stack[type_stack.len().saturating_sub(5)..]
+                                .iter()
+                                .map(|t| t.to_consistent_string(&mut var_t_container))
+                                .collect::<Vec<String>>()
+                                .join(",")
+                        )
+                    }),
+                )?;
+                // Give this occurrence its own type variables; if the reference
+                // is generic its concrete type is resolved later from the
+                // `apply` sites that consume it (or from monomorphization of the
+                // enclosing generic definition).
+                let mut remap = HashMap::new();
+                let sig = freshen_type(&sig, &mut remap);
+                Ok(AstNodeWithType::new(
+                    AstNodeType::FunctionRef(symbol),
+                    node.position.clone(),
+                    Type::new(vec![], vec![UnitType::Type(sig)]),
+                ))
+            }
+            AstNodeType::Quotation(nodes) => {
+                // A quotation is type-checked against an EMPTY stack: its inputs
+                // are inferred from its own body (under-flowed operands become
+                // parameters), never borrowed from the ambient stack.
+                let mut quotation_scope = TypeScope::with_parent(scope.clone());
+                let (sig, mut nodes) = self.type_check_block(
+                    &mut quotation_scope,
+                    Vec::new(),
+                    nodes,
+                    false,
+                    module_path,
+                )?;
+                // Freshen the inferred variables (consistently across the sig and
+                // the body) so two quotation occurrences don't alias variables,
+                // and so variables bound by unrelated calls don't leak in.
+                let mut remap = HashMap::new();
+                let sig = freshen_type(&sig, &mut remap);
+                let remap: HashMap<VarType, UnitType> = remap
+                    .into_iter()
+                    .map(|(from, to)| (from, UnitType::Var(to)))
+                    .collect();
+                if !remap.is_empty() {
+                    for node in &mut nodes {
+                        apply_subst_to_node(node, &remap);
+                    }
+                }
+                Ok(AstNodeWithType::new(
+                    AstNodeType::Quotation(nodes),
+                    node.position.clone(),
+                    Type::new(vec![], vec![UnitType::Type(sig)]),
+                ))
+            }
             AstNodeType::Definition {
                 name: symbol,
                 is_private,
                 body,
             } => {
-                let body = if let Some(ty) = body.type_definition.as_ref() {
+                // Each definition body has its own pool of function-value
+                // bindings; save the enclosing one (definitions can nest).
+                let saved_subst = std::mem::take(&mut self.function_value_subst);
+                let mut body = if let Some(ty) = body.type_definition.as_ref() {
                     // We use this to allow recursive types. We should probably create a better implementation latter
                     let ty = self.replace_custom_type(scope, ty.clone())?;
                     scope.insert_definition(symbol.clone(), ty, is_private);
@@ -320,6 +509,14 @@ impl TypeChecker {
                     );
                     body
                 };
+                // Back-substitute the bindings discovered from `apply`/call sites
+                // into the body, concretizing function-value references and
+                // quotations whose type was only pinned downstream.
+                let mut subst = std::mem::replace(&mut self.function_value_subst, saved_subst);
+                if !subst.is_empty() {
+                    resolve_substitution(&mut subst);
+                    apply_subst_to_node(&mut body, &subst);
+                }
                 Ok(AstNodeWithType::new(
                     AstNodeType::Definition {
                         name: symbol,
@@ -1513,6 +1710,143 @@ def main {
             result,
             "Invalid match body at 4:20. Expected ( -> std::list::List<Char>) but got ( -> I64)"
         );
+    }
+
+    #[test]
+    fn function_ref_and_apply_type_check() {
+        let contents = r#"
+            import std::number::i64
+
+            def double (I64 -> I64) { 2i64 i64::* }
+            def test (I64 -> I64) { \double apply }
+        "#;
+        let result = parse_and_type_check(contents, false);
+        assert!(result.is_ok(), "{:?}", result);
+    }
+
+    #[test]
+    fn quotation_infers_function_type() {
+        let contents = r#"
+            import std::number::i64
+
+            def test (I64 -> I64) { \{ 1i64 i64::+ } apply }
+        "#;
+        let result = parse_and_type_check(contents, false);
+        assert!(result.is_ok(), "{:?}", result);
+    }
+
+    #[test]
+    fn quotation_under_flow_infers_inputs() {
+        // `\{ 1i64 i64::+ }` under-flows by one operand, which becomes its input:
+        // the quotation has type `(I64 -> I64)`, inferred against an empty stack
+        // (not the ambient one).
+        let contents = r#"
+            import std::number::i64
+
+            def test { \{ 1i64 i64::+ } }
+        "#;
+        let result = parse_and_type_check(contents, false).expect("type checks");
+        assert!(
+            result.contains("(I64 -> I64)"),
+            "expected the quotation to infer (I64 -> I64): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn builtin_reference_type_checks() {
+        // `\i64::+` references a builtin as a value; applying it consumes two I64.
+        let contents = r#"
+            import std::number::i64
+
+            def test (I64 I64 -> I64) { \i64::+ apply }
+        "#;
+        let result = parse_and_type_check(contents, false);
+        assert!(result.is_ok(), "{:?}", result);
+    }
+
+    #[test]
+    fn generic_higher_order_def_type_checks() {
+        // A generic higher-order def: takes a value and a function over it.
+        let contents = r#"
+            import std::number::i64
+
+            def double (I64 -> I64) { 2i64 i64::* }
+            def with (a (a -> a) -> a) { apply }
+            def test (I64 -> I64) { \double with }
+        "#;
+        let result = parse_and_type_check(contents, false);
+        assert!(result.is_ok(), "{:?}", result);
+    }
+
+    #[test]
+    fn generic_def_constructs_generic_value() {
+        // A generic definition that builds a generic value with the nullary
+        // (`Empty`) and binary (`List`) constructors.
+        let contents = r#"
+            import std::list
+
+            def copy (list::List<a> -> list::List<a>) {
+                match {
+                    [] -> { list::Empty }
+                    [head ... tail] -> { tail copy head list::List }
+                }
+            }
+        "#;
+        let result = parse_and_type_check(contents, false);
+        assert!(result.is_ok(), "{:?}", result);
+    }
+
+    #[test]
+    fn generic_higher_order_map_type_checks() {
+        // Generic construction together with a function-value parameter and
+        // `apply` — this is the case the function-type self-binding fix unblocked.
+        let contents = r#"
+            import std::list
+            import std::stack(swap dup drop)
+
+            def map (list::List<a> (a -> a) -> list::List<a>) {
+                swap
+                match {
+                    [] -> { drop list::Empty }
+                    [head ... tail] -> {
+                        dup tail swap map
+                        swap head swap apply
+                        list::List
+                    }
+                }
+            }
+        "#;
+        let result = parse_and_type_check(contents, false);
+        assert!(result.is_ok(), "{:?}", result);
+    }
+
+    #[test]
+    fn apply_on_non_function_fails() {
+        let contents = r#"
+            def test (I64 -> I64) { apply }
+        "#;
+        let result = parse_and_type_check(contents, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            result.contains("`apply` expects a function value"),
+            "unexpected error: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn polymorphic_function_value_resolves_from_apply() {
+        // `\dup` is generic (`a -> a a`); applying it to an I64 pins it.
+        let contents = r#"
+            import std::stack
+            import std::number::i64
+
+            def test (I64 -> I64 I64) { \stack::dup apply }
+        "#;
+        let result = parse_and_type_check(contents, false);
+        assert!(result.is_ok(), "{:?}", result);
     }
 
     #[test]
