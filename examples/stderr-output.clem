@@ -1,0 +1,12 @@
+import std::list
+import std::io(println eprintln)
+
+// `println` writes to stdout; `eprintln` writes the same kind of String to
+// stderr. The example test harness only captures stdout, so only the stdout
+// lines appear in the expected output — the diagnostics on stderr are kept
+// out of the program's normal output, exactly as intended.
+def main {
+    "normal output" println
+    "diagnostic on stderr" eprintln
+    "more normal output" println
+}

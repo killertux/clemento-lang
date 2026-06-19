@@ -1217,11 +1217,22 @@ impl<'ctx> CompilerContext<'ctx> {
         &self,
         cp: inkwell::values::IntValue<'ctx>,
     ) -> Result<(), CompilerError> {
+        self.emit_print_char_with(cp, "putchar")
+    }
+
+    /// As [`emit_print_char`], but emits each UTF-8 byte through the named libc
+    /// per-byte writer (`putchar` for stdout, `clem_putchar_err` for stderr).
+    /// Both have signature `i32 (i32)`.
+    pub fn emit_print_char_with(
+        &self,
+        cp: inkwell::values::IntValue<'ctx>,
+        put_function: &str,
+    ) -> Result<(), CompilerError> {
         let i32_type = self.context.i32_type();
         let putchar = self
             .module
-            .get_function("putchar")
-            .ok_or(CompilerError::GetFunctionError("putchar".into()))?;
+            .get_function(put_function)
+            .ok_or_else(|| CompilerError::GetFunctionError(put_function.into()))?;
         let function = self
             .builder
             .get_insert_block()

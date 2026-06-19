@@ -1,7 +1,6 @@
 import std::list
 import std::char
 
-// A String is a List<Char>; print walks it, emitting each char as UTF-8.
 def print (String ->) {
     match {
         [] -> {}
@@ -11,4 +10,15 @@ def print (String ->) {
 
 def println (String ->) {
     print 10u32 char::from_code_point char::print
+}
+
+def eprint (String ->) {
+    match {
+        [] -> {}
+        [head ... tail] -> { head char::print_err tail eprint }
+    }
+}
+
+def eprintln (String ->) {
+    eprint 10u32 char::from_code_point char::print_err
 }
