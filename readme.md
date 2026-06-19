@@ -149,3 +149,32 @@ Importing is done using the `import` keyword. For example:
 import std::math
 import std::*
 ```
+
+A module path like `std::math` maps to the file `std/math.clem`. Modules are looked up **relative
+to the current directory first**, then in each directory passed with `-L`/`--search-path`, in the
+order given. This lets you keep the standard library somewhere other than the working directory:
+
+```sh
+clemento-lang run -p app.clem -L /path/to/clem-stdlib -L ./vendor
+```
+
+### FFI (linking C code)
+
+External functions are declared with `defx` and implemented in C. Three sources of C glue are
+compiled and linked automatically:
+
+* a sibling `<name>.c` next to the program file (`app.clem` → `app.c`);
+* a sibling `<name>.c` next to **any imported module**, resolved through the same search paths
+  (`std/ffi.clem` → `std/ffi.c`) — so a module can ship its own C implementation; and
+* any files passed explicitly with `-c`/`--c-source`.
+
+C glue can `#include "clem.h"` for the FFI marshalling helpers. Duplicate sources (reached via more
+than one of the routes above) are linked only once.
+
+### Build flags
+
+Extra arguments can be forwarded verbatim to `clang` with `--clang-arg` (repeatable):
+
+```sh
+clemento-lang compile -p app.clem --clang-arg -lm --clang-arg -g
+```

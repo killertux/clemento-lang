@@ -14,6 +14,7 @@
 
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #define ALIGN 8                 // our fields are <= 8-aligned (i64, ptr, i32)
@@ -120,6 +121,14 @@ uint8_t clem_tag(const void *node) {
 
 void *clem_payload(void *node) {
     return (char *)node + HEADER_SIZE;
+}
+
+// Write a single byte to stderr. The generated code prints to stdout via the
+// libc `putchar`; this mirrors it for stderr without depending on the `stderr`
+// symbol's name/ABI (it is a macro — e.g. `__stderrp` on macOS), which the
+// emitted IR can't portably reference.
+int clem_putchar_err(int c) {
+    return putc(c, stderr);
 }
 
 // List<Char> payload accessors, used by the string helpers below.

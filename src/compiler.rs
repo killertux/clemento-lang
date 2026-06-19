@@ -67,12 +67,24 @@ struct TailContext<'ctx> {
     loop_header: inkwell::basic_block::BasicBlock<'ctx>,
 }
 
-pub fn compile(file: impl AsRef<Path>) -> Result<PathBuf, CompilerError> {
+/// Compiles a `.clem` source file to LLVM IR, returning the path to the emitted
+/// `.ll` file along with any FFI C glue files discovered while resolving imports
+/// (a sibling `<name>.c` next to each resolved module). The caller links those.
+pub fn compile(
+    file: impl AsRef<Path>,
+    search_paths: &[PathBuf],
+) -> Result<(PathBuf, Vec<PathBuf>), CompilerError> {
     let path_as_string = file.as_ref().display().to_string();
     let file_content = read_to_string(file.as_ref())?;
 
-    let program = Parser::new_from_file(&file_content, path_as_string)
-        .collect::<Result<Vec<AstNode>, ParserError>>()?;
+    let c_sources = Rc::new(RefCell::new(Vec::new()));
+    let program = Parser::new_from_file_with(
+        &file_content,
+        path_as_string,
+        Rc::from(search_paths.to_vec()),
+        c_sources.clone(),
+    )
+    .collect::<Result<Vec<AstNode>, ParserError>>()?;
     let program = TypeChecker::new().type_check(
         AstNode {
             node_type: AstNodeType::Block(program),
@@ -95,7 +107,10 @@ pub fn compile(file: impl AsRef<Path>) -> Result<PathBuf, CompilerError> {
         .module
         .print_to_file(&output_path)
         .map_err(|err| CompilerError::WriteLLVMError(err.to_string()))?;
-    Ok(output_path)
+    let discovered_c_sources = Rc::try_unwrap(c_sources)
+        .map(RefCell::into_inner)
+        .unwrap_or_else(|rc| rc.borrow().clone());
+    Ok((output_path, discovered_c_sources))
 }
 
 impl<'ctx> CompilerContext<'ctx> {
@@ -1202,11 +1217,22 @@ impl<'ctx> CompilerContext<'ctx> {
         &self,
         cp: inkwell::values::IntValue<'ctx>,
     ) -> Result<(), CompilerError> {
+        self.emit_print_char_with(cp, "putchar")
+    }
+
+    /// As [`emit_print_char`], but emits each UTF-8 byte through the named libc
+    /// per-byte writer (`putchar` for stdout, `clem_putchar_err` for stderr).
+    /// Both have signature `i32 (i32)`.
+    pub fn emit_print_char_with(
+        &self,
+        cp: inkwell::values::IntValue<'ctx>,
+        put_function: &str,
+    ) -> Result<(), CompilerError> {
         let i32_type = self.context.i32_type();
         let putchar = self
             .module
-            .get_function("putchar")
-            .ok_or(CompilerError::GetFunctionError("putchar".into()))?;
+            .get_function(put_function)
+            .ok_or_else(|| CompilerError::GetFunctionError(put_function.into()))?;
         let function = self
             .builder
             .get_insert_block()

@@ -44,6 +44,10 @@ pub fn builtins_functions<'ctx>(
             .i32_type()
             .fn_type(&[context.context.i32_type().into()], false);
         context.module.add_function("putchar", putchar_type, None);
+        // `putchar`'s stderr counterpart (linked from clem_runtime.c); same signature.
+        context
+            .module
+            .add_function("clem_putchar_err", putchar_type, None);
         // Slab-pool allocator runtime (linked from clem_runtime.c).
         let clem_alloc_type = ptr_type.fn_type(&[context.context.i64_type().into()], false);
         context
@@ -149,6 +153,20 @@ pub fn builtins_functions<'ctx>(
                      -> Result<(), CompilerError> {
                         let value = stack.pop().ok_or(CompilerError::StackUnderflow)?;
                         compiler_context.emit_print_char(value.1.into_int_value())?;
+                        Ok(())
+                    },
+                ) as BoxDefinitionType<'ctx>),
+            },
+            InternalFunction {
+                name: "print_err".into(),
+                ty: Type::new(vec![UnitType::Literal(LiteralType::Char)], vec![]),
+                function: Rc::new(Box::new(
+                    |compiler_context: &mut CompilerContext<'ctx>,
+                     stack: &mut Stack<'ctx>|
+                     -> Result<(), CompilerError> {
+                        let value = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                        compiler_context
+                            .emit_print_char_with(value.1.into_int_value(), "clem_putchar_err")?;
                         Ok(())
                     },
                 ) as BoxDefinitionType<'ctx>),
