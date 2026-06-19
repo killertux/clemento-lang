@@ -1,7 +1,9 @@
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     iter::Peekable,
     path::PathBuf,
+    rc::Rc,
 };
 
 mod ast;
@@ -16,6 +18,14 @@ use crate::types::{LiteralType, NumberType, Type, UnitType, VarType};
 pub struct Parser<'a> {
     tokens: Peekable<Lexer<'a>>,
     imports: HashSet<String>,
+    /// Directories searched (in order, after the current directory) when
+    /// resolving imported modules. Shared with the child parsers spawned while
+    /// resolving each import.
+    search_paths: Rc<[PathBuf]>,
+    /// FFI C glue files discovered while resolving imports (a sibling `<name>.c`
+    /// next to a resolved module). Shared with child parsers so a single list
+    /// accumulates across the whole import graph; the driver links them all.
+    c_sources: Rc<RefCell<Vec<PathBuf>>>,
 }
 
 impl<'a> Parser<'a> {
@@ -26,15 +36,36 @@ impl<'a> Parser<'a> {
         Self {
             tokens,
             imports: HashSet::new(),
+            search_paths: Rc::from(Vec::new()),
+            c_sources: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
+    #[allow(dead_code)]
     pub fn new_from_file(input: &'a str, path: String) -> Self {
+        Self::new_from_file_with(
+            input,
+            path,
+            Rc::from(Vec::new()),
+            Rc::new(RefCell::new(Vec::new())),
+        )
+    }
+
+    /// Like [`new_from_file`], but threads the import search paths and the shared
+    /// FFI C-source collector (so recursively-parsed imports share both).
+    pub fn new_from_file_with(
+        input: &'a str,
+        path: String,
+        search_paths: Rc<[PathBuf]>,
+        c_sources: Rc<RefCell<Vec<PathBuf>>>,
+    ) -> Self {
         let lexer = Lexer::new(input, Some(path));
         let tokens = lexer.peekable();
         Self {
             tokens,
             imports: HashSet::new(),
+            search_paths,
+            c_sources,
         }
     }
 
@@ -379,7 +410,14 @@ impl<'a> Parser<'a> {
             alias: alias.unwrap_or(name),
         };
 
-        let node = crate::imports::resolve_import(&mut self.imports, name, functions, &path)?;
+        let node = crate::imports::resolve_import(
+            &mut self.imports,
+            name,
+            functions,
+            &path,
+            &self.search_paths,
+            &self.c_sources,
+        )?;
 
         Ok(Some(AstNode {
             node_type: AstNodeType::Import(symbol, Box::new(node)),

@@ -17,8 +17,18 @@ mod types;
 
 fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     match Args::parse().command {
-        Commands::Run { path, c_sources } => driver::run(path, &c_sources),
-        Commands::Compile { path, c_sources } => driver::compile_only(path, &c_sources),
-        Commands::TypePrinter { path } => driver::print_types(path),
+        Commands::Run {
+            path,
+            c_sources,
+            search_paths,
+            clang_args,
+        } => driver::run(path, &c_sources, &search_paths, &clang_args),
+        Commands::Compile {
+            path,
+            c_sources,
+            search_paths,
+            clang_args,
+        } => driver::compile_only(path, &c_sources, &search_paths, &clang_args),
+        Commands::TypePrinter { path, search_paths } => driver::print_types(path, &search_paths),
     }
 }

@@ -163,8 +163,14 @@ impl TypeChecker {
             )));
         };
 
-        let (block_type_check_result, nodes_with_types) =
-            self.type_check_block(&mut scope, Vec::new(), nodes, check_for_main, module_path)?;
+        let (block_type_check_result, nodes_with_types) = self.type_check_block(
+            &mut scope,
+            Vec::new(),
+            nodes,
+            check_for_main,
+            module_path,
+            false,
+        )?;
         if block_type_check_result != Type::empty() {
             return Err(TypeCheckerError::InvalidModuleDefinition(Box::new(
                 block_type_check_result,
@@ -187,10 +193,28 @@ impl TypeChecker {
         program: Vec<AstNode>,
         check_for_main: bool,
         module_path: Vec<String>,
+        // When true, bindings learned across the block are applied back to its
+        // inferred signature so under-flowed inputs are resolved to concrete
+        // types. Only quotations need this (their inferred signature *is* a
+        // first-class value type that must not leak free variables); ordinary
+        // blocks leave it off, because `match`-arm consistency compares arm
+        // types by exact equality and relies on inputs keeping their original
+        // (alpha-equivalent) variables across arms.
+        resolve_inferred_inputs: bool,
     ) -> Result<(Type, Vec<AstNodeWithType>), TypeCheckerError> {
         let mut node_results = Vec::new();
         let mut pop_type_stack: Vec<UnitType> = Vec::new();
         let mut local_stack: Vec<UnitType> = Vec::new();
+        // Bindings learned across the whole block. A word can constrain a type
+        // variable that an earlier word introduced as an inferred input (e.g.
+        // `\{ dup from_cstr }`: `dup` under-flows, making its operand an input
+        // variable, then `from_cstr` pins that variable to `CStr`). We collect
+        // every such binding and apply it once to the block's signature at the
+        // end, so inferred inputs are resolved instead of leaking out as free
+        // variables. We deliberately do NOT rewrite the working stacks mid-loop:
+        // that would change variable identities the rest of inference (notably
+        // `match`-arm consistency) relies on.
+        let mut accumulated_subst: HashMap<VarType, UnitType> = HashMap::new();
         for node in program {
             let node =
                 self.infer_type_definition(scope, type_stack.clone(), node, module_path.clone())?;
@@ -205,6 +229,13 @@ impl TypeChecker {
                 pop_type_stack = [new_types.to_vec(), pop_type_stack.clone()].concat();
                 local_stack = [new_types.to_vec(), local_stack.clone()].concat();
             }
+            if resolve_inferred_inputs {
+                accumulated_subst.extend(validate_types_and_return_variable_substitution(
+                    &type_stack,
+                    &type_definition.pop_types,
+                    node.position.clone(),
+                )?);
+            }
             let push_types =
                 substitute_types(&type_stack, type_definition.clone(), node.position.clone())?
                     .push_types;
@@ -214,6 +245,21 @@ impl TypeChecker {
             local_stack.extend(push_types);
             node_results.push(node);
         }
+        let (pop_type_stack, local_stack) = if resolve_inferred_inputs {
+            resolve_substitution(&mut accumulated_subst);
+            (
+                pop_type_stack
+                    .into_iter()
+                    .map(|ty| substitute_unit_type(&accumulated_subst, ty))
+                    .collect(),
+                local_stack
+                    .into_iter()
+                    .map(|ty| substitute_unit_type(&accumulated_subst, ty))
+                    .collect(),
+            )
+        } else {
+            (pop_type_stack, local_stack)
+        };
 
         if check_for_main && let Some(main) = scope.get_definition(vec!["main".to_string()], false)
         {
@@ -421,6 +467,7 @@ impl TypeChecker {
                     nodes,
                     false,
                     module_path,
+                    false,
                 )?;
                 Ok(AstNodeWithType::new(
                     AstNodeType::Block(nodes),
@@ -465,6 +512,9 @@ impl TypeChecker {
                     nodes,
                     false,
                     module_path,
+                    // Resolve under-flowed inputs to concrete types so the
+                    // quotation's value type carries no free variables.
+                    true,
                 )?;
                 // Freshen the inferred variables (consistently across the sig and
                 // the body) so two quotation occurrences don't alias variables,
@@ -1751,6 +1801,56 @@ def main {
             "expected the quotation to infer (I64 -> I64): {}",
             result
         );
+    }
+
+    #[test]
+    fn quotation_input_resolved_from_later_body_word() {
+        // A quotation whose under-flowed input is only pinned to a concrete type
+        // by a *later* word in its body must still infer a closed type — no free
+        // variable may leak. Here `dup` under-flows (introducing an input
+        // variable) and `swap`/`free_cstr` later constrain it to `CStr`, so the
+        // quotation is `(CStr -> String)`.
+        let contents = r#"
+            import std::stack(dup swap)
+            import std::list
+
+            defx from_cstr (CStr -> String)
+            defx free_cstr (CStr ->)
+
+            def test { \{ dup from_cstr swap free_cstr } }
+        "#;
+        let result = parse_and_type_check(contents, false).expect("type checks");
+        assert!(
+            result.contains("(CStr -> "),
+            "expected the quotation's input to resolve to CStr, not a free var: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn quotation_with_late_resolved_input_passed_to_generic_higher_order() {
+        // The same quotation, handed to a *generic* higher-order definition that
+        // applies it internally. The quotation must already carry a concrete
+        // type here (the `apply` is inside `with`, generic over its own var, so
+        // it can't pin the quotation's input). Regression for the
+        // "unresolved type variables" codegen error.
+        let contents = r#"
+            import std::stack(dup swap)
+            import std::list
+
+            defx mkcstr ( -> CStr)
+            defx from_cstr (CStr -> String)
+            defx free_cstr (CStr ->)
+            defx use_str (String ->)
+
+            def with (a (a -> b) -> b) { apply }
+
+            def main ( -> ) {
+                mkcstr \{ dup from_cstr swap free_cstr } with use_str
+            }
+        "#;
+        let result = parse_and_type_check(contents, false);
+        assert!(result.is_ok(), "{:?}", result);
     }
 
     #[test]
