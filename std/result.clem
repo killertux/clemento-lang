@@ -4,7 +4,7 @@ type Result<a b> {
     Ok(value a) Err(error b)
 }
 
-def map (Result<a b> (a -> c) -> Result<c b>) {
+def map (Result<a b> (a -> c) -> Result<c b>) \{
     swap match {
         Ok(value) -> { value swap apply Ok }
         Err(error) -> { drop error Err }

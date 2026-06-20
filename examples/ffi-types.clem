@@ -10,14 +10,14 @@ defx is_even (I64 -> boolean::Boolean)
 defx safe_div (I64 I64 -> option::Option<I64>)
 defx range (I64 -> list::List<I64>)
 
-def print_parity (boolean::Boolean -> ) {
+def print_parity (boolean::Boolean -> ) \{
     match {
         True -> { "even" println }
         False -> { "odd" println }
     }
 }
 
-def print_div (option::Option<I64> -> ) {
+def print_div (option::Option<I64> -> ) \{
     match {
         option::Some(value) -> { value to_string println }
         option::None -> { "undefined" println }
@@ -25,14 +25,13 @@ def print_div (option::Option<I64> -> ) {
 }
 
 // Sum a List<I64> by recursing on the tail.
-def sum (list::List<I64> -> I64) {
+def sum (list::List<I64> -> I64) \{
     match {
         list::Empty -> 0
         list::List(element next) -> { next sum element + }
     }
 }
 
-def main {
     7 is_even print_parity         // odd
     10 is_even print_parity        // even
 
@@ -40,4 +39,3 @@ def main {
     1 0 safe_div print_div         // undefined
 
     5 range sum to_string println  // 15
-}

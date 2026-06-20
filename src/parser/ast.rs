@@ -13,6 +13,12 @@ pub enum AstNodeType<T> {
     Definition {
         name: String,
         is_private: bool,
+        /// `true` for a lazy function def (`def f \{ ... }` / `def f \g`):
+        /// referencing the name runs the body. `false` for an eager value def
+        /// (`def x { ... }`): the body runs once and its result is captured into
+        /// the name. The parser unwraps the `\` of a lazy body into the `body`
+        /// (a `Block`), recording the distinction here.
+        is_lazy: bool,
         body: Box<T>,
     },
     ExternalDefinition(String, Type),
@@ -29,6 +35,21 @@ pub enum AstNodeType<T> {
         variants: Vec<(String, Vec<(String, UnitType)>)>,
     },
     Match(Vec<Case<T>>),
+}
+
+impl<T> AstNodeType<T> {
+    /// Whether a definition body of this shape is a *lazy function* rather than
+    /// an *eager value binding*. A body that is a bare function value — `\name`
+    /// (`FunctionRef`) or `\{ ... }` (`Quotation`) — defines a callable function
+    /// (referencing the name runs it). Any other body is evaluated eagerly and
+    /// its result captured into the name. See the eager/lazy `def` split in the
+    /// type checker and compiler.
+    pub fn is_lazy_body(&self) -> bool {
+        matches!(
+            self,
+            AstNodeType::FunctionRef(_) | AstNodeType::Quotation(_)
+        )
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -123,12 +144,14 @@ where
             AstNodeType::Definition {
                 name: symbol,
                 is_private,
+                is_lazy,
                 body,
             } => {
-                if *is_private {
-                    writeln!(f, "defp {} {}", symbol, body)
+                let keyword = if *is_private { "defp" } else { "def" };
+                if *is_lazy {
+                    writeln!(f, "{} {} \\{{ {} }}", keyword, symbol, body)
                 } else {
-                    writeln!(f, "def {} {}", symbol, body)
+                    writeln!(f, "{} {} {}", keyword, symbol, body)
                 }
             }
             AstNodeType::ExternalDefinition(symbol, ty) => writeln!(f, "defx {} {}", symbol, ty),

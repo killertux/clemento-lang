@@ -9,12 +9,12 @@ defx * (I8 I8 -> I8)
 defx / (I8 I8 -> I8)
 defx % (I8 I8 -> I8)
 defx to_i64 (I8 -> I64)
-def to_string (I8 -> String) { to_i64 i64::to_string }
+def to_string (I8 -> String) \{ to_i64 i64::to_string }
 defx gt (I8 I8 -> Boolean)
 defx lt (I8 I8 -> Boolean)
 defx = (I8 I8 -> Boolean)
 defx != (I8 I8 -> Boolean)
 
-def abs (I8 -> I8) {
+def abs (I8 -> I8) \{
     dup 0i8 lt match { boolean::True -> { -1i8 * } boolean::False -> touch }
 }

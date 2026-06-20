@@ -172,10 +172,46 @@ impl<'a> Parser<'a> {
         let body = self
             .parse()?
             .ok_or(ParserError::UnexpectedEndOfInput(name_token.position))?;
+        // A `\`-body marks a lazy function def; any other body is an eager value
+        // def. Unwrap the `\` here so the rest of the pipeline sees a uniform
+        // block body and only `is_lazy` carries the distinction:
+        //   `def f \{ a b }` -> Block([a b]),  `def f \g` -> Block([g]).
+        let is_lazy = body.node_type.is_lazy_body();
+        let body = if is_lazy {
+            let AstNode {
+                node_type,
+                position: body_position,
+                type_definition,
+            } = body;
+            let nodes = match node_type {
+                AstNodeType::Quotation(nodes) => nodes,
+                AstNodeType::FunctionRef(path) => {
+                    let call = if path.len() == 1 {
+                        AstNodeType::Symbol(path.into_iter().next().expect("len == 1"))
+                    } else {
+                        AstNodeType::SymbolWithPath(path)
+                    };
+                    vec![AstNode {
+                        node_type: call,
+                        position: body_position.clone(),
+                        type_definition: None,
+                    }]
+                }
+                _ => unreachable!("is_lazy_body is only true for Quotation/FunctionRef"),
+            };
+            AstNode {
+                node_type: AstNodeType::Block(nodes),
+                position: body_position,
+                type_definition,
+            }
+        } else {
+            body
+        };
         Ok(Some(AstNode {
             node_type: AstNodeType::Definition {
                 name,
                 is_private,
+                is_lazy,
                 body: Box::new(body),
             },
             position,
@@ -1233,6 +1269,7 @@ mod tests {
                 node_type: AstNodeType::Definition {
                     name: String::from("pi"),
                     is_private: false,
+                    is_lazy: false,
                     body: Box::new(AstNode {
                         node_type: AstNodeType::Number(Number::Float("3.14".into())),
                         position: Position::new(1, 8, None),
@@ -1255,6 +1292,7 @@ mod tests {
                 node_type: AstNodeType::Definition {
                     name: String::from("pi"),
                     is_private: true,
+                    is_lazy: false,
                     body: Box::new(AstNode {
                         node_type: AstNodeType::Number(Number::Float("3.14".into())),
                         position: Position::new(1, 9, None),

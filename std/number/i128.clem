@@ -18,12 +18,12 @@ defx lt (I128 I128 -> Boolean)
 defx = (I128 I128 -> Boolean)
 defx != (I128 I128 -> Boolean)
 
-def abs (I128 -> I128) {
+def abs (I128 -> I128) \{
     dup 0i128 lt match { boolean::True -> { -1i128 * } boolean::False -> { touch } }
 }
 
-def to_string (I128 -> String) {
-    defp inner_to_string (String I128 -> String) {
+def to_string (I128 -> String) \{
+    defp inner_to_string (String I128 -> String) \{
         dup
         10i128 /
         swap 10i8 %i8 i8::abs i8::to_string

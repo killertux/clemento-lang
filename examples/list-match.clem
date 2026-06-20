@@ -4,7 +4,7 @@ import std::string
 import std::number::i64
 
 // Recursion through `[]` and `[head ... tail]`.
-def sum (list::List<I64> -> I64) {
+def sum (list::List<I64> -> I64) \{
     match {
         [] -> 0i64
         [head ... tail] -> { tail sum head i64::+ }
@@ -12,7 +12,7 @@ def sum (list::List<I64> -> I64) {
 }
 
 // Exact-length and multi-element + tail arms.
-def describe (list::List<I64> -> String) {
+def describe (list::List<I64> -> String) \{
     match {
         [] -> "empty"
         [only] -> "one"
@@ -22,14 +22,13 @@ def describe (list::List<I64> -> String) {
 }
 
 // String elements exercise reference counting.
-def join (list::List<String> -> String) {
+def join (list::List<String> -> String) \{
     match {
         [] -> ""
         [head ... tail] -> { head tail join string::concat }
     }
 }
 
-def main {
     [1i64 2i64 3i64 4i64] sum i64::to_string io::println
 
     [1i64] describe io::println
@@ -37,4 +36,3 @@ def main {
     [1i64 2i64 3i64] describe io::println
 
     ["a" "b" "c"] join io::println
-}

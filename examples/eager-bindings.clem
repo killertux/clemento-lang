@@ -1,0 +1,33 @@
+import std::list
+import std::io(println)
+import std::number::i64(+ * to_string)
+import std::string(concat)
+import std::stack(touch)
+
+// Eager value defs (`def name { ... }`, no `\`) run their body once against the
+// current stack and bind the result to the name; referencing the name re-pushes
+// it. Functions keep the `\` form.
+
+// A local let-binding that consumes the function's input, then is used twice.
+def quad (I64 -> I64) \{
+    def doubled { 2i64 * }   // consumes the input, binds input*2
+    doubled doubled +        // (input*2) + (input*2) = input*4
+}
+
+// A multi-output eager binding: `pair` captures two values; referencing it
+// pushes both.
+def sum_pair ( -> I64) \{
+    def pair { 1i64 2i64 }
+    pair +
+}
+
+// A String (heap/refcounted) let-binding referenced twice: each reference
+// pushes a cloned copy and the binding is released when the body scope exits.
+def doubled_str (String -> String) \{
+    def s { touch }
+    s s concat
+}
+
+5i64 quad to_string println
+sum_pair to_string println
+"ab" doubled_str println

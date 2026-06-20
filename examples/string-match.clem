@@ -4,7 +4,7 @@ import std::string(concat)
 import std::number::i64
 
 // Classify a command string via exact, prefix, and char-list patterns.
-def respond (String -> String) {
+def respond (String -> String) \{
     match {
         ""            -> "(empty)"
         "quit"        -> "goodbye"
@@ -14,7 +14,6 @@ def respond (String -> String) {
     }
 }
 
-def main {
     "" respond io::println
     "quit" respond io::println
     "say hello world" respond io::println
@@ -24,4 +23,3 @@ def main {
     // String building + multibyte output still work.
     "café " "costs " concat 3i64 i64::to_string concat io::println
     "héllo ∑ 𝕊" io::println
-}

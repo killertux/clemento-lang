@@ -130,6 +130,18 @@ impl AstNodeWithType {
     }
 }
 
+/// Distinguishes the top-level block being type-checked. The **entry** file is
+/// run as the program, so it may leave a value on the stack: `( -> )` (exit 0)
+/// or `( -> I32)` (the exit code). An **imported module** is a pure namespace
+/// and must be `( -> )`. Nested blocks/bodies are unrestricted (eager defs there
+/// are local let-bindings) and are not tagged — only the outermost block of a
+/// `type_check` call carries this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeKind {
+    Entry,
+    Module,
+}
+
 pub struct TypeChecker {
     imports: HashMap<String, TypeScope>,
     type_definitions: HashMap<Vec<String>, CustomType>,
@@ -153,7 +165,7 @@ impl TypeChecker {
     pub fn type_check(
         &mut self,
         program: AstNode,
-        check_for_main: bool,
+        scope_kind: ScopeKind,
         module_path: Vec<String>,
     ) -> Result<(AstNodeWithType, TypeScope), TypeCheckerError> {
         let mut scope = TypeScope::empty();
@@ -163,15 +175,34 @@ impl TypeChecker {
             )));
         };
 
-        let (block_type_check_result, nodes_with_types) = self.type_check_block(
-            &mut scope,
-            Vec::new(),
-            nodes,
-            check_for_main,
-            module_path,
-            false,
-        )?;
-        if block_type_check_result != Type::empty() {
+        let (block_type_check_result, mut nodes_with_types) =
+            self.type_check_block(&mut scope, Vec::new(), nodes, module_path, false)?;
+        // Back-substitute bindings discovered at top-level `apply`/call sites into
+        // the top-level nodes, so function values pinned only downstream (e.g.
+        // `\dup` consumed by a later `apply`) lose their free type variables.
+        // Inside a `def` body this happens in the Definition arm; the entry/module
+        // top level (which now runs program code directly) needs it here too.
+        let mut subst = std::mem::take(&mut self.function_value_subst);
+        if !subst.is_empty() {
+            resolve_substitution(&mut subst);
+            for node in &mut nodes_with_types {
+                apply_subst_to_node(node, &subst);
+            }
+        }
+        // The entry file runs as the program: it may leave nothing (exit 0) or a
+        // single I32 (exit code). An imported module is a pure namespace: `( -> )`.
+        let valid = match scope_kind {
+            ScopeKind::Entry => {
+                block_type_check_result == Type::empty()
+                    || block_type_check_result
+                        == Type::new(
+                            vec![],
+                            vec![UnitType::Literal(LiteralType::Number(NumberType::I32))],
+                        )
+            }
+            ScopeKind::Module => block_type_check_result == Type::empty(),
+        };
+        if !valid {
             return Err(TypeCheckerError::InvalidModuleDefinition(Box::new(
                 block_type_check_result,
             )));
@@ -191,7 +222,6 @@ impl TypeChecker {
         scope: &mut TypeScope,
         mut type_stack: Vec<UnitType>,
         program: Vec<AstNode>,
-        check_for_main: bool,
         module_path: Vec<String>,
         // When true, bindings learned across the block are applied back to its
         // inferred signature so under-flowed inputs are resolved to concrete
@@ -261,19 +291,6 @@ impl TypeChecker {
             (pop_type_stack, local_stack)
         };
 
-        if check_for_main && let Some(main) = scope.get_definition(vec!["main".to_string()], false)
-        {
-            let valid_main_definitions = [
-                Type::new(vec![], vec![]),
-                Type::new(
-                    vec![],
-                    vec![UnitType::Literal(LiteralType::Number(NumberType::I32))],
-                ),
-            ];
-            if !valid_main_definitions.contains(&main) {
-                return Err(TypeCheckerError::InvalidMainDefinition(Box::new(main)));
-            }
-        }
         let block_type = Type::new(pop_type_stack, local_stack);
         Ok((block_type, node_results))
     }
@@ -465,7 +482,6 @@ impl TypeChecker {
                     &mut scope,
                     type_stack.clone(),
                     nodes,
-                    false,
                     module_path,
                     false,
                 )?;
@@ -510,7 +526,6 @@ impl TypeChecker {
                     &mut quotation_scope,
                     Vec::new(),
                     nodes,
-                    false,
                     module_path,
                     // Resolve under-flowed inputs to concrete types so the
                     // quotation's value type carries no free variables.
@@ -539,25 +554,51 @@ impl TypeChecker {
             AstNodeType::Definition {
                 name: symbol,
                 is_private,
+                is_lazy,
                 body,
             } => {
                 // Each definition body has its own pool of function-value
                 // bindings; save the enclosing one (definitions can nest).
                 let saved_subst = std::mem::take(&mut self.function_value_subst);
-                let mut body = if let Some(ty) = body.type_definition.as_ref() {
-                    // We use this to allow recursive types. We should probably create a better implementation latter
-                    let ty = self.replace_custom_type(scope, ty.clone())?;
-                    scope.insert_definition(symbol.clone(), ty, is_private);
-
-                    self.infer_type_definition(scope, Vec::new(), *body, module_path)?
+                let (mut body, def_type) = if is_lazy {
+                    // Lazy function def (`def f \{ ... }` / `def f \g`, unwrapped
+                    // to a block by the parser). Identical to the historical
+                    // behaviour: the body is checked against an EMPTY stack to
+                    // infer the function signature `(ins -> outs)`, the name is
+                    // stored as that callable, and defining it changes nothing on
+                    // the surrounding stack (`( -> )`).
+                    let body = if let Some(ty) = body.type_definition.as_ref() {
+                        // Pre-insert the annotated signature so the body may recurse.
+                        let ty = self.replace_custom_type(scope, ty.clone())?;
+                        scope.insert_definition(symbol.clone(), ty, is_private);
+                        self.infer_type_definition(scope, Vec::new(), *body, module_path)?
+                    } else {
+                        let body =
+                            self.infer_type_definition(scope, Vec::new(), *body, module_path)?;
+                        scope.insert_definition(
+                            symbol.clone(),
+                            body.type_definition.clone(),
+                            is_private,
+                        );
+                        body
+                    };
+                    (body, Type::empty())
                 } else {
-                    let body = self.infer_type_definition(scope, Vec::new(), *body, module_path)?;
+                    // Eager value def (`def x { ... }`). The body runs once
+                    // against the CURRENT stack; its outputs are captured into the
+                    // name and removed from the stack. So the name resolves to a
+                    // nullary `( -> outs)` (referencing it re-pushes the outputs),
+                    // and the def statement itself consumes the body's inputs and
+                    // pushes nothing: `(ins -> )`.
+                    let body =
+                        self.infer_type_definition(scope, type_stack.clone(), *body, module_path)?;
+                    let body_ty = body.type_definition.clone();
                     scope.insert_definition(
                         symbol.clone(),
-                        body.type_definition.clone(),
+                        Type::new(vec![], body_ty.push_types.clone()),
                         is_private,
                     );
-                    body
+                    (body, Type::new(body_ty.pop_types, vec![]))
                 };
                 // Back-substitute the bindings discovered from `apply`/call sites
                 // into the body, concretizing function-value references and
@@ -571,10 +612,11 @@ impl TypeChecker {
                     AstNodeType::Definition {
                         name: symbol,
                         is_private,
+                        is_lazy,
                         body: Box::new(body),
                     },
                     node.position.clone(),
-                    Type::empty(),
+                    def_type,
                 ))
             }
             AstNodeType::ExternalDefinition(symbol, ty) => {
@@ -590,7 +632,7 @@ impl TypeChecker {
                 let result_node = if let Some(nodes) = import_node.node {
                     // let mut module_path = module_path.clone();
                     // module_path.extend(path.clone());
-                    let result = self.type_check(nodes, false, path.clone())?;
+                    let result = self.type_check(nodes, ScopeKind::Module, path.clone())?;
                     scope.insert_import(import_node.name.alias.clone(), result.1);
                     for function in &import_node.functions {
                         scope.insert_function_import(
@@ -1407,12 +1449,9 @@ mod test {
         type_checker::TypeChecker,
     };
 
-    use super::TypeCheckerError;
+    use super::{ScopeKind, TypeCheckerError};
 
-    fn parse_and_type_check(
-        contents: &str,
-        check_for_main: bool,
-    ) -> Result<String, TypeCheckerError> {
+    fn parse_and_type_check(contents: &str, is_entry: bool) -> Result<String, TypeCheckerError> {
         let program = Parser::new_from_str(contents)
             .collect::<Result<Vec<AstNode>, ParserError>>()
             .unwrap();
@@ -1423,7 +1462,11 @@ mod test {
                     position: Position::default(),
                     type_definition: None,
                 },
-                check_for_main,
+                if is_entry {
+                    ScopeKind::Entry
+                } else {
+                    ScopeKind::Module
+                },
                 vec![],
             )
             .map(|ast_node| ast_node.0.to_string())
@@ -1501,31 +1544,36 @@ def hello { "Hello, World!" }"#;
     }
 
     #[test]
-    fn valid_main_function() {
-        let contents = r#"def main { }"#;
+    fn valid_empty_entry() {
+        // No `main`: the entry file's top-level block is the program. An empty
+        // program is `( -> )` (exit 0).
+        let contents = r#""#;
         let result = parse_and_type_check(contents, true).unwrap();
-        assert_eq!(result, "( -> ) {( -> ) def main ( -> ) {}\n}");
+        assert_eq!(result, "( -> ) {}");
     }
 
     #[test]
-    fn valid_main_function_with_i32_return() {
-        let contents = r#"def main (-> I32) { 0i32 }"#;
+    fn valid_entry_with_i32_exit() {
+        // A single I32 left at the top level is the process exit code.
+        let contents = r#"0i32"#;
         let result = parse_and_type_check(contents, true).unwrap();
-        assert_eq!(
-            result,
-            "( -> ) {( -> ) def main ( -> I32) {( -> I32) 0i32}\n}"
-        );
+        assert_eq!(result, "( -> I32) {( -> I32) 0i32}");
     }
 
     #[test]
-    fn invalid_main_function_wrong_return_type() {
+    fn invalid_entry_non_i32_result() {
+        // The entry file may only leave nothing or an I32; a leftover String is
+        // rejected.
         let contents = r#"import std::list
-def main (-> String) { "hello" }"#;
+"hello""#;
         let error = parse_and_type_check(contents, true)
             .unwrap_err()
             .to_string();
 
-        assert_eq!(error, "Invalid main definition ( -> std::list::List<Char>)");
+        assert_eq!(
+            error,
+            "Invalid top-level stack effect ( -> std::list::List<Char>). An imported module must be ( -> ); the entry file must be ( -> ) or ( -> I32)"
+        );
     }
 
     #[test]
@@ -1601,35 +1649,31 @@ def main {
     fn type_conflict_error() {
         let contents = r#"
             import std::stack(dup drop)
-            def test (U8 -> U8) { dup drop }
-            def main {
-                42i32 test  # This should fail - trying to pass I32 where U8 expected
-            }
+            def test (U8 -> U8) \{ dup drop }
+            42i32 test
         "#;
         let error = parse_and_type_check(contents, true)
             .unwrap_err()
             .to_string();
 
-        assert_eq!(error, "Type conflict at 5:23: expected U8, got I32");
+        assert_eq!(error, "Type conflict at 4:19: expected U8, got I32");
     }
 
     #[test]
     fn nested_def() {
         let contents = r#"
             import std::stack(drop)
-            def test {
-                def test1 { drop }
+            def test \{
+                def test1 \{ drop }
                 10i32 test1
             }
-            def main {
-                test
-            }
+            test
         "#;
         let result = parse_and_type_check(contents, true).unwrap();
 
         assert_eq!(
             result,
-            "( -> ) {( -> ) import std::stack(drop) ( -> ) def test ( -> ) {( -> ) def test1 (a -> ) {(a -> ) drop}\n ( -> I32) 10i32 (I32 -> ) test1}\n ( -> ) def main ( -> ) {( -> ) test}\n}"
+            "( -> ) {( -> ) import std::stack(drop) ( -> ) def test \\{ ( -> ) {( -> ) def test1 \\{ (a -> ) {(a -> ) drop} }\n ( -> I32) 10i32 (I32 -> ) test1} }\n ( -> ) test}"
         );
     }
 
@@ -1767,8 +1811,8 @@ def main {
         let contents = r#"
             import std::number::i64
 
-            def double (I64 -> I64) { 2i64 i64::* }
-            def test (I64 -> I64) { \double apply }
+            def double (I64 -> I64) \{ 2i64 i64::* }
+            def test (I64 -> I64) \{ \double apply }
         "#;
         let result = parse_and_type_check(contents, false);
         assert!(result.is_ok(), "{:?}", result);
@@ -1779,7 +1823,7 @@ def main {
         let contents = r#"
             import std::number::i64
 
-            def test (I64 -> I64) { \{ 1i64 i64::+ } apply }
+            def test (I64 -> I64) \{ \{ 1i64 i64::+ } apply }
         "#;
         let result = parse_and_type_check(contents, false);
         assert!(result.is_ok(), "{:?}", result);
@@ -1843,13 +1887,11 @@ def main {
             defx free_cstr (CStr ->)
             defx use_str (String ->)
 
-            def with (a (a -> b) -> b) { apply }
+            def with (a (a -> b) -> b) \{ apply }
 
-            def main ( -> ) {
-                mkcstr \{ dup from_cstr swap free_cstr } with use_str
-            }
+            mkcstr \{ dup from_cstr swap free_cstr } with use_str
         "#;
-        let result = parse_and_type_check(contents, false);
+        let result = parse_and_type_check(contents, true);
         assert!(result.is_ok(), "{:?}", result);
     }
 
@@ -1859,7 +1901,7 @@ def main {
         let contents = r#"
             import std::number::i64
 
-            def test (I64 I64 -> I64) { \i64::+ apply }
+            def test (I64 I64 -> I64) \{ \i64::+ apply }
         "#;
         let result = parse_and_type_check(contents, false);
         assert!(result.is_ok(), "{:?}", result);
@@ -1871,9 +1913,9 @@ def main {
         let contents = r#"
             import std::number::i64
 
-            def double (I64 -> I64) { 2i64 i64::* }
-            def with (a (a -> a) -> a) { apply }
-            def test (I64 -> I64) { \double with }
+            def double (I64 -> I64) \{ 2i64 i64::* }
+            def with (a (a -> a) -> a) \{ apply }
+            def test (I64 -> I64) \{ \double with }
         "#;
         let result = parse_and_type_check(contents, false);
         assert!(result.is_ok(), "{:?}", result);
@@ -1886,7 +1928,7 @@ def main {
         let contents = r#"
             import std::list
 
-            def copy (list::List<a> -> list::List<a>) {
+            def copy (list::List<a> -> list::List<a>) \{
                 match {
                     [] -> { list::Empty }
                     [head ... tail] -> { tail copy head list::List }
@@ -1905,7 +1947,7 @@ def main {
             import std::list
             import std::stack(swap dup drop)
 
-            def map (list::List<a> (a -> a) -> list::List<a>) {
+            def map (list::List<a> (a -> a) -> list::List<a>) \{
                 swap
                 match {
                     [] -> { drop list::Empty }
@@ -1943,9 +1985,72 @@ def main {
             import std::stack
             import std::number::i64
 
-            def test (I64 -> I64 I64) { \stack::dup apply }
+            def test (I64 -> I64 I64) \{ \stack::dup apply }
         "#;
         let result = parse_and_type_check(contents, false);
+        assert!(result.is_ok(), "{:?}", result);
+    }
+
+    #[test]
+    fn eager_def_binds_value_and_consumes_stack() {
+        // `doubled` runs `2i64 *` once against the current stack (consuming the
+        // `5i64`), binds the result, and re-pushes it on reference.
+        let contents = r#"
+            import std::number::i64(* to_string)
+            import std::io(println)
+
+            5i64 def doubled { 2i64 * } doubled to_string println
+        "#;
+        let result = parse_and_type_check(contents, true);
+        assert!(result.is_ok(), "{:?}", result);
+    }
+
+    #[test]
+    fn eager_def_in_module_consuming_stack_is_rejected() {
+        // At module scope every def must be `( -> )`; an eager def that consumes
+        // an input has type `(I64 -> )`, leaving the module non-`( -> )`.
+        let contents = r#"
+            import std::number::i64(*)
+            def doubled { 2i64 * }
+        "#;
+        let error = parse_and_type_check(contents, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Invalid top-level stack effect"),
+            "unexpected error: {}",
+            error
+        );
+    }
+
+    #[test]
+    fn eager_def_can_capture_a_function_value() {
+        // `def k { \double }` captures the function *value* (not calling it);
+        // referencing `k` pushes it, then `apply` runs it.
+        let contents = r#"
+            import std::number::i64(*)
+            import std::stack(drop)
+
+            def double (I64 -> I64) \{ 2i64 * }
+            def k { \double }
+            5i64 k apply drop
+        "#;
+        let result = parse_and_type_check(contents, true);
+        assert!(result.is_ok(), "{:?}", result);
+    }
+
+    #[test]
+    fn lazy_def_is_callable() {
+        // The `\` form keeps the historical function behaviour: referencing the
+        // name runs the body.
+        let contents = r#"
+            import std::number::i64(*)
+            import std::stack(drop)
+
+            def double (I64 -> I64) \{ 2i64 * }
+            5i64 double drop
+        "#;
+        let result = parse_and_type_check(contents, true);
         assert!(result.is_ok(), "{:?}", result);
     }
 
@@ -2135,15 +2240,15 @@ def main {
                 Some(val a) None
             }
 
-            def test1 (option::Option<I64> -> ) {
+            def test1 (option::Option<I64> -> ) \{
                 drop
             }
 
-            def test2 (Option<I64> -> ) {
+            def test2 (Option<I64> -> ) \{
                 drop
             }
 
-            def test {
+            def test \{
                 42 option::Some test1 42 Some test2
             }
         "#;
@@ -2151,7 +2256,7 @@ def main {
 
         assert_eq!(
             result,
-            "( -> ) {( -> ) import std::option ( -> ) import std::stack(drop) ( -> ) type Option<a> {Some(val a) None} ( -> ) def test1 (std::option::Option<I64> -> ) {(std::option::Option<I64> -> ) drop}\n ( -> ) def test2 (Option<I64> -> ) {(Option<I64> -> ) drop}\n ( -> ) def test ( -> ) {( -> I64) 42i64 (I64 -> std::option::Option<I64>) option::Some (std::option::Option<I64> -> ) test1 ( -> I64) 42i64 (I64 -> Option<I64>) Some (Option<I64> -> ) test2}\n}"
+            "( -> ) {( -> ) import std::option ( -> ) import std::stack(drop) ( -> ) type Option<a> {Some(val a) None} ( -> ) def test1 \\{ (std::option::Option<I64> -> ) {(std::option::Option<I64> -> ) drop} }\n ( -> ) def test2 \\{ (Option<I64> -> ) {(Option<I64> -> ) drop} }\n ( -> ) def test \\{ ( -> ) {( -> I64) 42i64 (I64 -> std::option::Option<I64>) option::Some (std::option::Option<I64> -> ) test1 ( -> I64) 42i64 (I64 -> Option<I64>) Some (Option<I64> -> ) test2} }\n}"
         );
     }
 
@@ -2165,11 +2270,11 @@ def main {
                 Some(val a) None
             }
 
-            def test_option (option::Option<I64> -> ) {
+            def test_option (option::Option<I64> -> ) \{
                 drop
             }
 
-            def test {
+            def test \{
                 42 Some test_option
             }
         "#;
@@ -2193,11 +2298,11 @@ def main {
                 Some(val a) None
             }
 
-            def test_option (Option<I64> -> ) {
+            def test_option (Option<I64> -> ) \{
                 drop
             }
 
-            def test {
+            def test \{
                 42 option::Some test_option
             }
         "#;

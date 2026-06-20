@@ -9,7 +9,7 @@ import std::boolean(True False)
 // rewrites it into a branch back to the function's loop header instead of a real
 // call. That lets it recurse 100_000_000 deep in constant stack — without the
 // tail-call lowering this overflows the native stack and crashes.
-def count_up (I64 I64 -> I64) {
+def count_up (I64 I64 -> I64) \{
     dup2 = match {
         True -> { swap drop }
         False -> { 1 + count_up }
@@ -23,14 +23,12 @@ def count_up (I64 I64 -> I64) {
 // reference-counting runtime, which has no recursive deep-drop for heap values
 // bound out of a tail-call scrutinee. Loops over fresh scalar scrutinees, like
 // `count_up` above, are fully reclaimed.)
-def sum_acc (I64 list::List<I64> -> I64) {
+def sum_acc (I64 list::List<I64> -> I64) \{
     match {
         [] -> { 0i64 + }
         [head ... tail] -> { head + tail sum_acc }
     }
 }
 
-def main {
     100000000 0 count_up to_string println
     0 [1i64 2i64 3i64 4i64 5i64 6i64 7i64 8i64] sum_acc to_string println
-}

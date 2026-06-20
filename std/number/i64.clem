@@ -15,8 +15,8 @@ defx lt (I64 I64 -> Boolean)
 defx = (I64 I64 -> Boolean)
 defx != (I64 I64 -> Boolean)
 
-def to_string (I64 -> String) {
-    defp digit (I64 -> Char) {
+def to_string (I64 -> String) \{
+    defp digit (I64 -> Char) \{
         match {
             0i64 -> '0'
             1i64 -> '1'
@@ -33,7 +33,7 @@ def to_string (I64 -> String) {
     }
     // Extract digits without negating the whole number (so I64::MIN works):
     // each step takes |n % 10| (a single digit 0-9) and divides n toward zero.
-    defp go (String I64 -> String) {
+    defp go (String I64 -> String) \{
         dup 0i64 = match {
             True -> { drop touch }
             False -> {
@@ -52,3 +52,20 @@ def to_string (I64 -> String) {
         }
     }
 }
+
+// TEMPORARILY COMMENTED OUT (eager-def-bindings branch): this in-progress `cmp`
+// does not parse/type-check yet — `<`/`>` are generic chevrons, not operators
+// (use `i64::lt`/`i64::gt`), `Ordering` is not imported here, and the match arms
+// have inconsistent stack effects (the True arm `drop2`s, the others don't).
+// Reconcile this with the new def semantics and re-enable.
+// def cmp (I64 I64 -> Ordering) \{
+//     dup2 lt match {
+//         True -> { drop2 Ordering::Less }
+//         False -> {
+//             dup2 gt match {
+//                 True -> { drop2 Ordering::Greater }
+//                 False -> { drop2 Ordering::Equal }
+//             }
+//         }
+//     }
+// }

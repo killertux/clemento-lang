@@ -7,7 +7,7 @@ import std::stack(swap dup drop)
 // A generic definition that CONSTRUCTS generic values: it rebuilds the list
 // using the `list::Empty` (nullary) and `list::List` (binary) constructors, with
 // the element type left generic. Works at any element type.
-def copy (list::List<a> -> list::List<a>) {
+def copy (list::List<a> -> list::List<a>) \{
     match {
         [] -> { list::Empty }
         [head ... tail] -> { tail copy head list::List }
@@ -16,7 +16,7 @@ def copy (list::List<a> -> list::List<a>) {
 
 // Generic higher-order map: constructs a new list while applying a function value
 // to every element. Exercises generic construction together with `apply`.
-def map (list::List<a> (a -> a) -> list::List<a>) {
+def map (list::List<a> (a -> a) -> list::List<a>) \{
     swap
     match {
         [] -> { drop list::Empty }
@@ -29,28 +29,27 @@ def map (list::List<a> (a -> a) -> list::List<a>) {
 }
 
 // Constructs a generic `Option<a>` from a value.
-def wrap (a -> option::Option<a>) {
+def wrap (a -> option::Option<a>) \{
     option::Some
 }
 
-def sum (list::List<I64> -> I64) {
+def sum (list::List<I64> -> I64) \{
     match {
         [] -> 0i64
         [head ... tail] -> { tail sum head + }
     }
 }
 
-def unwrap_or_zero (option::Option<I64> -> I64) {
+def unwrap_or_zero (option::Option<I64> -> I64) \{
     match {
         option::Some(value) -> { value }
         option::None -> { 0i64 }
     }
 }
 
-def double (I64 -> I64) { 2i64 * }
-def bang (Char -> Char) { drop '!' }
+def double (I64 -> I64) \{ 2i64 * }
+def bang (Char -> Char) \{ drop '!' }
 
-def main {
     // `copy` at two element types: an I64 list (summed) and a String (List<Char>).
     [1i64 2i64 3i64] copy sum to_string println   // 6
     "hello" copy println                           // hello
@@ -61,4 +60,3 @@ def main {
 
     // Generic Option construction, then matched back out.
     7i64 wrap unwrap_or_zero to_string println     // 7
-}
