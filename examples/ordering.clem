@@ -1,0 +1,16 @@
+import std::list
+import std::cmp(Ordering Less Equal Greater)
+import std::number::i64(cmp)
+import std::io(println)
+
+def describe (Ordering -> String) \{
+    match {
+        Less -> "less"
+        Equal -> "equal"
+        Greater -> "greater"
+    }
+}
+
+3i64 5i64 cmp describe println
+7i64 7i64 cmp describe println
+9i64 2i64 cmp describe println

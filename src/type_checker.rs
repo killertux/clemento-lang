@@ -151,6 +151,11 @@ pub struct TypeChecker {
     /// references/quotations whose concrete type is pinned only by a downstream
     /// `apply` become concrete. Saved/restored per definition.
     function_value_subst: HashMap<VarType, UnitType>,
+    /// One-shot scope for the *next* block to type-check into, instead of a fresh
+    /// child. Set by an eager namespace def so its body's nested defs are
+    /// retained (as the def's members) rather than discarded; consumed by the
+    /// very next `Block` arm. `None` everywhere else.
+    pending_block_scope: Option<TypeScope>,
 }
 
 impl TypeChecker {
@@ -159,6 +164,7 @@ impl TypeChecker {
             imports: HashMap::new(),
             type_definitions: HashMap::new(),
             function_value_subst: HashMap::new(),
+            pending_block_scope: None,
         }
     }
 
@@ -477,7 +483,11 @@ impl TypeChecker {
                 ))
             }
             AstNodeType::Block(nodes) => {
-                let mut scope = TypeScope::with_parent(scope.clone());
+                // An eager namespace def pre-seeds the scope to retain its members.
+                let mut scope = self
+                    .pending_block_scope
+                    .take()
+                    .unwrap_or_else(|| TypeScope::with_parent(scope.clone()));
                 let (ty, nodes) = self.type_check_block(
                     &mut scope,
                     type_stack.clone(),
@@ -590,6 +600,18 @@ impl TypeChecker {
                     // nullary `( -> outs)` (referencing it re-pushes the outputs),
                     // and the def statement itself consumes the body's inputs and
                     // pushes nothing: `(ins -> )`.
+                    //
+                    // When the body is a block, the def is also a *namespace*: pre-
+                    // seed a retained `member_scope` so its nested defs survive as
+                    // the def's members (`name::member`, see `get_definition`).
+                    // Registering it BEFORE checking the body lets a qualified
+                    // self-reference (`math::double` inside `math`) resolve, and the
+                    // normal `infer_type_definition` path keeps annotation handling.
+                    if matches!(body.node_type, AstNodeType::Block(_)) {
+                        let member_scope = TypeScope::with_parent(scope.clone());
+                        scope.insert_member(symbol.clone(), member_scope.clone());
+                        self.pending_block_scope = Some(member_scope);
+                    }
                     let body =
                         self.infer_type_definition(scope, type_stack.clone(), *body, module_path)?;
                     let body_ty = body.type_definition.clone();
@@ -1283,6 +1305,12 @@ struct InnerTypeScope {
     imported_functions: HashMap<String, (String, String)>,
     definitions: HashMap<String, (Type, bool)>,
     type_definitions: HashMap<String, CustomType>,
+    /// Member namespaces: the retained body scope of an eager namespace def
+    /// (`def std { def string { ... } }`), keyed by the def's name. Navigated by
+    /// `::` (see `get_definition`). Distinct from `imported` so file imports keep
+    /// their current (privacy-free) qualified access, while member access enforces
+    /// privacy.
+    members: HashMap<String, TypeScope>,
 }
 
 impl TypeScope {
@@ -1294,6 +1322,7 @@ impl TypeScope {
                 imported_functions: HashMap::new(),
                 definitions: HashMap::new(),
                 type_definitions: HashMap::new(),
+                members: HashMap::new(),
             })),
         }
     }
@@ -1306,6 +1335,13 @@ impl TypeScope {
     fn insert_import(&mut self, symbol: String, scope: TypeScope) {
         let mut inner = self.inner.borrow_mut();
         inner.imported.insert(symbol, scope);
+    }
+
+    /// Registers the retained body scope of an eager namespace def as a member,
+    /// reachable via `name::member`.
+    fn insert_member(&mut self, symbol: String, scope: TypeScope) {
+        let mut inner = self.inner.borrow_mut();
+        inner.members.insert(symbol, scope);
     }
 
     fn insert_function_import(
@@ -1363,6 +1399,22 @@ impl TypeScope {
                 if let Some(from_imports) = inner.imported.get(&first) {
                     return from_imports.get_definition(symbol, filter_private);
                 }
+                // Member-namespace navigation (`first::rest`). Reject if `first`
+                // itself is a private member the caller cannot name; then recurse
+                // into the member scope forcing `filter_private` — crossing into a
+                // namespace means we are outside its internals, so its `defp`
+                // members stay hidden (the terminal single-segment lookup rejects).
+                if let Some(member_scope) = inner.members.get(&first) {
+                    let first_private = inner
+                        .definitions
+                        .get(&first)
+                        .map(|(_, is_private)| *is_private)
+                        .unwrap_or(false);
+                    if first_private && filter_private {
+                        return None;
+                    }
+                    return member_scope.get_definition(symbol, true);
+                }
                 if let Some(parent) = inner.parent.as_ref() {
                     symbol.insert(0, first);
                     return parent.get_definition(symbol, filter_private);
@@ -1381,6 +1433,7 @@ impl TypeScope {
                 imported_functions: HashMap::new(),
                 definitions: HashMap::new(),
                 type_definitions: HashMap::new(),
+                members: HashMap::new(),
             })),
         }
     }
@@ -2034,6 +2087,96 @@ def main {
             def double (I64 -> I64) \{ 2i64 * }
             def k { \double }
             5i64 k apply drop
+        "#;
+        let result = parse_and_type_check(contents, true);
+        assert!(result.is_ok(), "{:?}", result);
+    }
+
+    #[test]
+    fn namespace_member_navigation() {
+        // An eager namespace def exposes its nested defs as `::`-navigable members.
+        let contents = r#"
+            import std::number::i64(*)
+            import std::stack(drop)
+
+            def math {
+                def double (I64 -> I64) \{ 2i64 * }
+            }
+            5i64 math::double drop
+        "#;
+        let result = parse_and_type_check(contents, true);
+        assert!(result.is_ok(), "{:?}", result);
+    }
+
+    #[test]
+    fn namespace_deep_nesting_and_self_reference() {
+        // Arbitrary nesting depth, plus a member calling a qualified
+        // self-reference (`math::double` from inside `math`) and an outer import.
+        let contents = r#"
+            import std::number::i64(*)
+            import std::stack(drop)
+
+            def math {
+                def double (I64 -> I64) \{ 2i64 * }
+                def geometry {
+                    def perimeter (I64 -> I64) \{ math::double }
+                }
+            }
+            5i64 math::geometry::perimeter drop
+        "#;
+        let result = parse_and_type_check(contents, true);
+        assert!(result.is_ok(), "{:?}", result);
+    }
+
+    #[test]
+    fn namespace_private_member_hidden() {
+        // A `defp` member is not navigable via `::` from outside.
+        let contents = r#"
+            import std::number::i64(+)
+            import std::stack(drop)
+
+            def m {
+                defp secret (I64 -> I64) \{ 1i64 + }
+            }
+            5i64 m::secret drop
+        "#;
+        let error = parse_and_type_check(contents, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("m::secret not found"),
+            "expected a not-found error for the private member: {}",
+            error
+        );
+    }
+
+    #[test]
+    fn namespace_public_member_visible() {
+        // The same shape with `def` (public) resolves.
+        let contents = r#"
+            import std::number::i64(+)
+            import std::stack(drop)
+
+            def m {
+                def pub (I64 -> I64) \{ 1i64 + }
+            }
+            5i64 m::pub drop
+        "#;
+        let result = parse_and_type_check(contents, true);
+        assert!(result.is_ok(), "{:?}", result);
+    }
+
+    #[test]
+    fn namespace_member_function_ref() {
+        // `\m::f` references a member as a function value, applied via `apply`.
+        let contents = r#"
+            import std::number::i64(*)
+            import std::stack(drop)
+
+            def m {
+                def double (I64 -> I64) \{ 2i64 * }
+            }
+            5i64 \m::double apply drop
         "#;
         let result = parse_and_type_check(contents, true);
         assert!(result.is_ok(), "{:?}", result);

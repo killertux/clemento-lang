@@ -665,9 +665,37 @@ impl<'ctx> CompilerContext<'ctx> {
                     // and capture its output(s) into the name. The body consumes
                     // its inputs from the stack; we pop the produced outputs and
                     // bind them so later references re-push (cloned) copies.
+                    //
+                    // If the body is a block that declares nested defs, the def is
+                    // also a *namespace*: we compile its body into a retained
+                    // `member_scope` (so the nested defs' closures capture it) and
+                    // register it as members for `name::member` navigation. We do
+                    // NOT release `member_scope` — like an import, a namespace's
+                    // bindings live for the program (const-like).
                     let n_outputs = body.type_definition.push_types.len();
                     self.tail_position = false;
-                    self.compile_ast(scope.clone(), stack, *body, module_path)?;
+                    let body = *body;
+                    if let AstNodeType::Block(nodes) = body.node_type {
+                        let member_scope = Scope::with_parent(scope.clone());
+                        // Register the member scope BEFORE compiling the body so a
+                        // qualified self-reference (`math::double` inside `math`)
+                        // resolves, and the nested defs' closures capture it.
+                        scope.add_member(symbol.clone(), member_scope.clone());
+                        for node in nodes {
+                            self.tail_position = false;
+                            self.compile_ast(
+                                member_scope.clone(),
+                                stack,
+                                node,
+                                module_path.clone(),
+                            )?;
+                            if self.current_block_terminated() {
+                                break;
+                            }
+                        }
+                    } else {
+                        self.compile_ast(scope.clone(), stack, body, module_path)?;
+                    }
                     let mut values = Vec::with_capacity(n_outputs);
                     for _ in 0..n_outputs {
                         values.push(stack.pop().ok_or(CompilerError::StackUnderflow)?);
@@ -2402,6 +2430,11 @@ struct InternalScope<'ctx> {
     owned_values: HashMap<String, Vec<(UnitType, BasicValueEnum<'ctx>)>>,
     /// Insertion order of `owned_values`, so scope-exit release is deterministic.
     owned_value_order: Vec<String>,
+    /// Member namespaces: the retained body scope of an eager namespace def
+    /// (`def std { def string { ... } }`), keyed by the def's name. Navigated by
+    /// `::` in `call_symbol`/`materialize_symbol`, alongside `imported`. Privacy is
+    /// enforced by the type checker, so there is no privacy bit here.
+    members: HashMap<String, Scope<'ctx>>,
     parent: Option<Scope<'ctx>>,
     id: u64,
 }
@@ -2422,6 +2455,7 @@ impl<'ctx> Scope<'ctx> {
                 values: HashMap::new(),
                 owned_values: HashMap::new(),
                 owned_value_order: Vec::new(),
+                members: HashMap::new(),
                 id: SCOPE_ID.fetch_add(1, Ordering::Relaxed),
             })),
         }
@@ -2521,6 +2555,9 @@ impl<'ctx> Scope<'ctx> {
                 if let Some(from_imports) = inner.imported.get(&first) {
                     return from_imports.call_symbol(symbol, context, ty, stack);
                 }
+                if let Some(member_scope) = inner.members.get(&first) {
+                    return member_scope.call_symbol(symbol, context, ty, stack);
+                }
                 if let Some(parent) = inner.parent.as_ref() {
                     symbol.insert(0, first);
                     return parent.call_symbol(symbol, context, ty, stack);
@@ -2617,6 +2654,9 @@ impl<'ctx> Scope<'ctx> {
                 if let Some(from_imports) = inner.imported.get(&first) {
                     return from_imports.materialize_symbol(symbol, context, ty);
                 }
+                if let Some(member_scope) = inner.members.get(&first) {
+                    return member_scope.materialize_symbol(symbol, context, ty);
+                }
                 if let Some(parent) = inner.parent.as_ref() {
                     symbol.insert(0, first);
                     return parent.materialize_symbol(symbol, context, ty);
@@ -2672,6 +2712,13 @@ impl<'ctx> Scope<'ctx> {
         inner.imported.insert(alias, scope);
     }
 
+    /// Registers the retained body scope of an eager namespace def as a member,
+    /// reachable via `name::member` in `call_symbol`/`materialize_symbol`.
+    fn add_member(&self, name: String, scope: Scope<'ctx>) {
+        let mut inner = self.scope.borrow_mut();
+        inner.members.insert(name, scope);
+    }
+
     fn add_function_import(&self, alias: String, real_name: String, module_alias: String) {
         let mut inner = self.scope.borrow_mut();
         inner
@@ -2699,6 +2746,7 @@ impl<'ctx> Scope<'ctx> {
                 values: HashMap::new(),
                 owned_values: HashMap::new(),
                 owned_value_order: Vec::new(),
+                members: HashMap::new(),
                 id: SCOPE_ID.fetch_add(1, Ordering::Relaxed),
             })),
         }

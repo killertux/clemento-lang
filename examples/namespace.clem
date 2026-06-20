@@ -1,0 +1,20 @@
+import std::list
+import std::io(println)
+import std::number::i64(+ * to_string)
+
+// An eager `def` whose body is only nested defs is a *namespace*: its members are
+// reachable by `::`. Members may be functions (`\`) or further namespaces, and
+// may call siblings and outer (imported) names.
+def math {
+    def double (I64 -> I64) \{ 2i64 * }
+
+    def geometry {
+        // calls a sibling-of-parent member and an outer import
+        def perimeter (I64 -> I64) \{ math::double }
+    }
+
+    defp secret (I64 -> I64) \{ 999i64 + }
+}
+
+3i64 math::double to_string println              // 6
+5i64 math::geometry::perimeter to_string println // 10
