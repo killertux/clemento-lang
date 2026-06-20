@@ -2,7 +2,7 @@ use thiserror::Error;
 
 use crate::lexer::Position;
 use crate::parser::Pattern;
-use crate::types::{Type, UnitType};
+use crate::types::{Effect, Type, UnitType};
 
 #[derive(Debug, Error)]
 pub enum TypeCheckerError {
@@ -40,4 +40,18 @@ pub enum TypeCheckerError {
     NonExhaustiveMatch(Position),
     #[error("`apply` expects a function value on top of the stack at {0}, but got {1}")]
     ApplyOnNonFunction(Position, String),
+    #[error("Effect not found {0:?}. Declare it with `effect <Name>`")]
+    EffectNotFound(Vec<String>),
+    #[error("Effect conflict at {0}: expected effects [{e1}], got [{e2}]", e1 = fmt_effects(.1), e2 = fmt_effects(.2))]
+    EffectConflict(Position, Vec<Effect>, Vec<Effect>),
+    #[error("Undeclared effect {1} at {0}. The function performs it but does not declare it (declared: [{d}])", d = fmt_effects(.2))]
+    UndeclaredEffect(Position, Effect, Vec<Effect>),
+}
+
+fn fmt_effects(effects: &[Effect]) -> String {
+    effects
+        .iter()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
 }

@@ -45,6 +45,8 @@ pub enum TokenType {
     LeftChevron,
     RightChevron,
     Backslash,
+    /// `!` — introduces an effect in a type signature (`!IO`, `!a`, `!*`).
+    Bang,
     Number(Number),
     String(String),
     Char(char),

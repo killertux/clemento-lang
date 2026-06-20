@@ -3,8 +3,8 @@ import std::number::i64
 import std::list
 import std::string(concat)
 
-def print_list (list::List<I64> -> ) \{
-    defp inner_print_list (list::List<I64> -> ) \{
+def print_list (list::List<I64> -> !io::IO) \{
+    defp inner_print_list (list::List<I64> -> !io::IO) \{
         match {
             list::Empty -> { " " io::print }
             list::List(element next) -> {
@@ -18,8 +18,8 @@ def print_list (list::List<I64> -> ) \{
     "]" io::print
 }
 
-def print_list_of_list (list::List<list::List<I64>> -> ) \{
-    defp inner_print_list (list::List<list::List<I64>> -> ) \{
+def print_list_of_list (list::List<list::List<I64>> -> !io::IO) \{
+    defp inner_print_list (list::List<list::List<I64>> -> !io::IO) \{
         match {
             list::Empty -> {}
             list::List(element next) -> {
