@@ -26,7 +26,7 @@ use crate::{
     internal_functions::builtins_functions,
     lexer::{IntegerNumber, Number, Position},
     parser::{AstNode, AstNodeType, FieldPattern, Parser, ParserError, Pattern},
-    type_checker::{AstNodeWithType, TypeChecker},
+    type_checker::{AstNodeWithType, ScopeKind, TypeChecker},
     types::{CustomType, LiteralType, NumberType, Type, UnitType, VarType},
 };
 
@@ -91,7 +91,7 @@ pub fn compile(
             position: Position::default(),
             type_definition: None,
         },
-        true,
+        ScopeKind::Entry,
         vec![],
     )?;
     let context = Context::create();
@@ -99,7 +99,39 @@ pub fn compile(
 
     let scope = Scope::empty();
     let mut compiler_context = CompilerContext::new(&context);
+
+    // The entry file has no `main`: its top-level block *is* the program. Emit an
+    // LLVM `main` whose body is that block (executable words run in source order;
+    // lazy defs register callables; eager defs bind values). The block's type is
+    // `( -> )` (exit 0) or `( -> I32)` (the value left on the stack is the exit
+    // code), enforced by the type checker.
+    let main_type = compiler_context.context.i32_type().fn_type(&[], false);
+    let main_function = compiler_context
+        .module
+        .add_function("main", main_type, None);
+    let entry_block = compiler_context
+        .context
+        .append_basic_block(main_function, "entry");
+    compiler_context.builder.position_at_end(entry_block);
+    compiler_context.tail_ctx = None;
+    compiler_context.tail_position = false;
+
     compiler_context.compile_ast(scope, &mut stack, program.0, vec![])?;
+
+    match stack.pop() {
+        Some(value) => {
+            compiler_context.builder.build_return(Some(&value.1))?;
+        }
+        None => {
+            compiler_context.builder.build_return(Some(
+                &compiler_context
+                    .context
+                    .i32_type()
+                    .const_zero()
+                    .as_basic_value_enum(),
+            ))?;
+        }
+    }
 
     let mut output_path = file.as_ref().to_path_buf();
     output_path.set_extension("ll");
@@ -574,6 +606,13 @@ impl<'ctx> CompilerContext<'ctx> {
                 }
                 self.tail_position = false;
 
+                // Release eager bindings introduced in this block. Skipped when a
+                // tail-call already terminated the block (the back-edge bypasses
+                // this, matching the existing tail-loop leak trade-off).
+                if !self.current_block_terminated() {
+                    scope.release_owned_values(self)?;
+                }
+
                 Ok(())
             }
             AstNodeType::FunctionRef(symbol) => {
@@ -613,8 +652,32 @@ impl<'ctx> CompilerContext<'ctx> {
                 Ok(())
             }
             AstNodeType::Definition {
-                name: symbol, body, ..
-            } => self.compile_definition(scope, &symbol, *body, module_path),
+                name: symbol,
+                is_lazy,
+                body,
+                ..
+            } => {
+                if is_lazy {
+                    // Lazy function def: register a callable (today's behaviour).
+                    self.compile_definition(scope, &symbol, *body, module_path)
+                } else {
+                    // Eager value def: run the body once against the current stack
+                    // and capture its output(s) into the name. The body consumes
+                    // its inputs from the stack; we pop the produced outputs and
+                    // bind them so later references re-push (cloned) copies.
+                    let n_outputs = body.type_definition.push_types.len();
+                    self.tail_position = false;
+                    self.compile_ast(scope.clone(), stack, *body, module_path)?;
+                    let mut values = Vec::with_capacity(n_outputs);
+                    for _ in 0..n_outputs {
+                        values.push(stack.pop().ok_or(CompilerError::StackUnderflow)?);
+                    }
+                    values.reverse();
+                    scope.add_owned_values(symbol, values);
+                    self.tail_position = false;
+                    Ok(())
+                }
+            }
             AstNodeType::ExternalDefinition(symbol, ty) => {
                 for function in builtins_functions(self) {
                     if function.name == symbol && match_types(&ty.pop_types, &function.ty.pop_types)
@@ -892,45 +955,6 @@ impl<'ctx> CompilerContext<'ctx> {
     ) -> Result<(), CompilerError> {
         let cloned_scope = scope.clone();
         let symbol_name = symbol.to_string();
-
-        if symbol_name == "main" {
-            let function_name = "main";
-            let function_type = self.context.i32_type().fn_type(&[], false);
-            let function = self.module.add_function(function_name, function_type, None);
-            let new_scope = Scope::with_parent(cloned_scope);
-
-            let entry = self.context.append_basic_block(function, "entry");
-            self.builder.position_at_end(entry);
-
-            let mut stack = Stack::new();
-
-            for param in body
-                .type_definition
-                .pop_types
-                .clone()
-                .into_iter()
-                .zip(function.get_param_iter())
-            {
-                stack.push(param);
-            }
-
-            // `main` is never self-recursive: no tail loop, no tail position.
-            self.tail_ctx = None;
-            self.tail_position = false;
-            self.compile_ast(new_scope, &mut stack, body, module_path)?;
-
-            match stack.pop() {
-                Some(value) => {
-                    self.builder.build_return(Some(&value.1))?;
-                }
-                None => {
-                    self.builder.build_return(Some(
-                        &self.context.i32_type().const_zero().as_basic_value_enum(),
-                    ))?;
-                }
-            }
-            return Ok(());
-        }
         let id = scope.id();
 
         scope.add_function_definition(
@@ -1864,7 +1888,17 @@ impl<'ctx> CompilerContext<'ctx> {
                     phi.add_incoming(values.as_slice());
                     stack.push((ty.0, phi.as_basic_value()));
                 }
-                self.drop_value(match_value.0, match_value.1)?;
+                // Release the scrutinee NODE ONLY — never its payload fields. Arm
+                // patterns bind fields as borrowed aliases into this payload (no
+                // retain; see the field load in `compile_rows`), and an arm may let a
+                // bound field escape into the match's result — e.g. `result::map`'s
+                // `Err(error) -> { error ... Err }` re-wraps the inner error into a
+                // fresh node. A deep `drop_value` here would free that still-referenced
+                // field out from under the result, a use-after-free. Freeing just the
+                // node is the same trade-off the self-tail-call back-edge already makes
+                // (see `build_rc_release_node_only`): a bound field that is genuinely
+                // dead leaks rather than risking a double-free.
+                self.build_rc_release_node_only(match_value.0, match_value.1)?;
                 Ok(())
             }
             other => Err(CompilerError::UnsupportedType(other)),
@@ -2360,6 +2394,14 @@ struct InternalScope<'ctx> {
     imported: HashMap<String, Scope<'ctx>>,
     imported_functions: HashMap<String, (String, String)>,
     values: HashMap<String, (UnitType, BasicValueEnum<'ctx>)>,
+    /// Eager value definitions (`def x { ... }`) bound in this scope. Each name
+    /// maps to the captured output value(s) (a def may produce several). Unlike
+    /// `values` (match-arm bindings, which alias into a scrutinee), an owned
+    /// binding holds its own reference: referencing it pushes a `clone_value`
+    /// copy (rc++), and the binding's reference is released at scope exit.
+    owned_values: HashMap<String, Vec<(UnitType, BasicValueEnum<'ctx>)>>,
+    /// Insertion order of `owned_values`, so scope-exit release is deterministic.
+    owned_value_order: Vec<String>,
     parent: Option<Scope<'ctx>>,
     id: u64,
 }
@@ -2378,6 +2420,8 @@ impl<'ctx> Scope<'ctx> {
                 imported_functions: HashMap::new(),
                 parent: Some(parent),
                 values: HashMap::new(),
+                owned_values: HashMap::new(),
+                owned_value_order: Vec::new(),
                 id: SCOPE_ID.fetch_add(1, Ordering::Relaxed),
             })),
         }
@@ -2405,6 +2449,16 @@ impl<'ctx> Scope<'ctx> {
 
                 if let Some(value) = inner.values.get(&last) {
                     stack.push(value.clone());
+                    return Ok(());
+                }
+
+                // Eager value binding: push a clone of each captured value so the
+                // binding keeps owning its own reference (released at scope exit).
+                if let Some(owned) = inner.owned_values.get(&last).cloned() {
+                    for (ty, value) in owned {
+                        let pushed = context.clone_value(ty.clone(), value)?;
+                        stack.push((ty, pushed));
+                    }
                     return Ok(());
                 }
 
@@ -2577,6 +2631,42 @@ impl<'ctx> Scope<'ctx> {
         inner.values.insert(name, value);
     }
 
+    /// Binds an eager value definition's captured output(s) in this scope. The
+    /// binding owns one reference to each custom-typed value; see `owned_values`.
+    fn add_owned_values(&self, name: String, values: Vec<(UnitType, BasicValueEnum<'ctx>)>) {
+        let mut inner = self.scope.borrow_mut();
+        if inner.owned_values.insert(name.clone(), values).is_none() {
+            inner.owned_value_order.push(name);
+        }
+    }
+
+    /// Releases the reference each eager binding in this scope owns. Called when
+    /// the scope (a block / function body) exits on a fall-through path. A
+    /// reference to a binding pushes a clone (rc++), so dropping the binding's own
+    /// reference here frees the value only once every referenced copy is also
+    /// gone; top-level (entry/module) scopes never call this, so their bindings
+    /// live for the whole program.
+    fn release_owned_values(
+        &self,
+        context: &mut CompilerContext<'ctx>,
+    ) -> Result<(), CompilerError> {
+        let owned: Vec<(UnitType, BasicValueEnum<'ctx>)> = {
+            let inner = self.scope.borrow();
+            inner
+                .owned_value_order
+                .iter()
+                .rev()
+                .filter_map(|name| inner.owned_values.get(name))
+                .flatten()
+                .cloned()
+                .collect()
+        };
+        for (ty, value) in owned {
+            context.drop_value(ty, value)?;
+        }
+        Ok(())
+    }
+
     fn add_import(&self, alias: String, scope: Scope<'ctx>) {
         let mut inner = self.scope.borrow_mut();
         inner.imported.insert(alias, scope);
@@ -2607,6 +2697,8 @@ impl<'ctx> Scope<'ctx> {
 
                 parent: None,
                 values: HashMap::new(),
+                owned_values: HashMap::new(),
+                owned_value_order: Vec::new(),
                 id: SCOPE_ID.fetch_add(1, Ordering::Relaxed),
             })),
         }

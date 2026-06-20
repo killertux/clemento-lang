@@ -15,8 +15,8 @@ defx lt (U64 U64 -> Boolean)
 defx = (U64 U64 -> Boolean)
 defx != (U64 U64 -> Boolean)
 
-def to_string (U64 -> String) {
-    defp digit (U64 -> Char) {
+def to_string (U64 -> String) \{
+    defp digit (U64 -> Char) \{
         match {
             0u64 -> '0'
             1u64 -> '1'
@@ -32,7 +32,7 @@ def to_string (U64 -> String) {
         }
     }
     // go (accumulator n): prepends each digit of n (least-significant first) to acc.
-    defp go (String U64 -> String) {
+    defp go (String U64 -> String) \{
         dup 0u64 = match {
             True -> { drop touch }
             False -> { dup 10u64 % digit rot swap list::List swap 10u64 / go }

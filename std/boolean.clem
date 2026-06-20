@@ -4,14 +4,14 @@ type Boolean {
     False True
 }
 
-def && (Boolean Boolean -> Boolean) {
+def && (Boolean Boolean -> Boolean) \{
     match {
         True -> touch
         False -> { drop False }
     }
 }
 
-def || (Boolean Boolean -> Boolean) {
+def || (Boolean Boolean -> Boolean) \{
     match {
         True -> { drop True }
         False -> touch

@@ -3,7 +3,7 @@ use thiserror::Error;
 use crate::{
     lexer::Position,
     parser::{AstNode, AstNodeType, Parser, ParserError},
-    type_checker::{TypeChecker, TypeCheckerError},
+    type_checker::{ScopeKind, TypeChecker, TypeCheckerError},
 };
 use std::{
     cell::RefCell,
@@ -32,7 +32,7 @@ pub fn print_type(
             position: Position::default(),
             type_definition: None,
         },
-        true,
+        ScopeKind::Entry,
         vec![],
     )?;
     println!("{}", program.0);

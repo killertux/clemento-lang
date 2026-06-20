@@ -3,11 +3,10 @@ import std::stack(dup drop)
 import std::number::i64(= - * to_string)
 import std::boolean(True False)
 
-def factorial (I64 -> I64) {
+def factorial (I64 -> I64) \{
     dup 0 = match { True -> { drop 1 } False -> { dup 1 - factorial * } }
 }
 
-def main {
     0 factorial to_string println
     1 factorial to_string println
     2 factorial to_string println
@@ -16,4 +15,3 @@ def main {
     5 factorial to_string println
     6 factorial to_string println
     7 factorial to_string println
-}

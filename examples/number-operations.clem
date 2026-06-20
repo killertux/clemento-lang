@@ -12,7 +12,6 @@ import std::number::i128
 import std::number::f64
 import std::io
 
-def main {
     // ===== u8 tests =====
     "u8 tests:" io::println
     0u8 0u8 u8::+ u8::to_string io::println
@@ -188,4 +187,3 @@ def main {
     -1i8 -1i8 i8::* i8::to_string io::println       // Should be 1
     1.0f64 3.0f64 f64::/ f64::to_string io::println // Should be ~0.333...
     0.0f64 5.0f64 f64::* f64::to_string io::println // Should be 0.0
-}

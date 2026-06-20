@@ -3,7 +3,7 @@ import std::number::i64(lt = + - to_string)
 import std::io(println)
 import std::boolean(True False)
 
-def fibonacci (I64 -> I64) {
+def fibonacci (I64 -> I64) \{
     dup 2 lt match {
         True ->  {
             drop 1
@@ -16,8 +16,8 @@ def fibonacci (I64 -> I64) {
     }
 }
 
-def print_fibonacci (I64 -> ) {
-    def inner_print_fibonacci (I64 I64 -> ) {
+def print_fibonacci (I64 -> ) \{
+    def inner_print_fibonacci (I64 I64 -> ) \{
         dup2 = match {
             True -> drop2
             False -> { dup fibonacci to_string println 1 +  inner_print_fibonacci }
@@ -26,6 +26,4 @@ def print_fibonacci (I64 -> ) {
     0 inner_print_fibonacci
 }
 
-def main {
     10 print_fibonacci
-}

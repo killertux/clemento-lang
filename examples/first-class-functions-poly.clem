@@ -3,16 +3,15 @@ import std::char
 import std::number::i64(+ * to_string)
 import std::stack(dup drop)
 
-def double (I64 -> I64) { 2i64 * }
-def bang (Char -> Char) { drop '!' }
+def double (I64 -> I64) \{ 2i64 * }
+def bang (Char -> Char) \{ drop '!' }
 
 // A generic higher-order definition: apply a function value to a value. It is
 // monomorphized once per concrete type it is used at (I64 and Char below).
-def with (a (a -> a) -> a) {
+def with (a (a -> a) -> a) \{
     apply
 }
 
-def main {
     // References to builtins as function values (`\+`, `\*`), applied directly.
     5i64 6i64 \+ apply to_string println        // 11
     4i64 3i64 \* apply to_string println        // 12
@@ -27,4 +26,3 @@ def main {
     // The generic `with` instantiated at two different types.
     7i64 \double with to_string println         // 14
     'a' \bang with char::print '\n' char::print // !
-}

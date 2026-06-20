@@ -7,10 +7,10 @@ defx to_code_point (Char -> U32)
 defx print (Char ->)
 defx print_err (Char ->)
 
-def = (Char Char -> boolean::Boolean) {
+def = (Char Char -> boolean::Boolean) \{
     to_code_point swap to_code_point u32::=
 }
 
-def lt (Char Char -> boolean::Boolean) {
+def lt (Char Char -> boolean::Boolean) \{
     to_code_point swap to_code_point swap u32::lt
 }

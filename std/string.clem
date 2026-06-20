@@ -1,10 +1,29 @@
 import std::list
 import std::stack(swap touch)
+import std::boolean(Boolean True False)
+import std::char
 
 // A String is a List<Char>. concat appends: (head:tail) ++ b = head : (tail ++ b).
-def concat (String String -> String) {
+def concat (String String -> String) \{
     swap match {
         [] -> touch
         [head ... tail] -> { tail swap concat head list::List }
+    }
+}
+
+def = (String String -> Boolean) \{
+    match {
+        [] -> match {
+            [] -> True
+            [head ... tail] -> False
+        }
+        [head1 ... tail1] -> match {
+            [] -> False
+            [head ... tail] -> { head1 head char::= match {
+                    False -> False
+                    True -> { tail1 tail = }
+                }
+            }
+        }
     }
 }

@@ -1,24 +1,24 @@
 import std::list
 import std::char
 
-def print (String ->) {
+def print (String ->) \{
     match {
         [] -> {}
         [head ... tail] -> { head char::print tail print }
     }
 }
 
-def println (String ->) {
+def println (String ->) \{
     print 10u32 char::from_code_point char::print
 }
 
-def eprint (String ->) {
+def eprint (String ->) \{
     match {
         [] -> {}
         [head ... tail] -> { head char::print_err tail eprint }
     }
 }
 
-def eprintln (String ->) {
+def eprintln (String ->) \{
     eprint 10u32 char::from_code_point char::print_err
 }

@@ -19,8 +19,8 @@ defx = (U128 U128 -> Boolean)
 defx != (U128 U128 -> Boolean)
 
 
-def to_string (U128 -> String) {
-    defp inner_to_string (String U128 -> String) {
+def to_string (U128 -> String) \{
+    defp inner_to_string (String U128 -> String) \{
         dup 10u128 / swap 10u8 %u8 u8::to_string rot concat swap dup 0u128 = match { boolean::True -> { drop touch } boolean::False -> { inner_to_string } }
     }
     "" swap inner_to_string

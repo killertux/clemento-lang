@@ -12,9 +12,9 @@ pub enum TypeCheckerError {
         "Symbol {0} not found at {1} with type stack {2}. Maybe it is defined after the current position"
     )]
     SymbolNotFound(String, Position, String),
-    #[error("Invalid main definition {0}")]
-    InvalidMainDefinition(Box<Type>),
-    #[error("Invalid module definition {0}. It should always be (->)")]
+    #[error(
+        "Invalid top-level stack effect {0}. An imported module must be ( -> ); the entry file must be ( -> ) or ( -> I32)"
+    )]
     InvalidModuleDefinition(Box<Type>),
     #[error("Missing import {0}")]
     MissingImport(String),
