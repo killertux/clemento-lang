@@ -10,14 +10,14 @@ defx is_even (I64 -> boolean::Boolean)
 defx safe_div (I64 I64 -> option::Option<I64>)
 defx range (I64 -> list::List<I64>)
 
-def print_parity (boolean::Boolean -> ) \{
+def print_parity (boolean::Boolean -> !io::IO) \{
     match {
         True -> { "even" println }
         False -> { "odd" println }
     }
 }
 
-def print_div (option::Option<I64> -> ) \{
+def print_div (option::Option<I64> -> !io::IO) \{
     match {
         option::Some(value) -> { value to_string println }
         option::None -> { "undefined" println }

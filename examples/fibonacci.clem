@@ -16,8 +16,8 @@ def fibonacci (I64 -> I64) \{
     }
 }
 
-def print_fibonacci (I64 -> ) \{
-    def inner_print_fibonacci (I64 I64 -> ) \{
+def print_fibonacci (I64 -> !io::IO) \{
+    def inner_print_fibonacci (I64 I64 -> !io::IO) \{
         dup2 = match {
             True -> drop2
             False -> { dup fibonacci to_string println 1 +  inner_print_fibonacci }

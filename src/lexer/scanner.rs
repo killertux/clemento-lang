@@ -39,6 +39,11 @@ impl<'a> Lexer<'a> {
             // `\` introduces a function value: `\name` (reference) or `\{ ... }`
             // (anonymous quotation). It is always its own token.
             Some('\\') => Ok(Some(self.create_token_here(TokenType::Backslash))),
+            // `!=` is the not-equal operator, lexed as an ordinary symbol.
+            Some('!') if self.input.peek().is_some_and(|c| *c == '=') => self.lex_symbol('!'),
+            // Otherwise `!` introduces an effect annotation in a signature: `!IO`
+            // / `!a` / `!*`. It is its own token; the effect name (or `*`) follows.
+            Some('!') => Ok(Some(self.create_token_here(TokenType::Bang))),
             Some('/') if self.input.peek().is_some_and(|c| *c == '/') => {
                 self.lex_single_line_comment()
             }

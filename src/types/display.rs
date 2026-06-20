@@ -3,7 +3,7 @@ use std::{
     fmt::{Display, Formatter},
 };
 
-use super::signature::{Type, VarType};
+use super::signature::{Effect, Type, VarType};
 use super::unit_type::{LiteralType, NumberType, UnitType};
 
 pub struct VarTypeToCharContainer {
@@ -87,6 +87,23 @@ impl Display for UnitType {
 impl Display for Type {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let mut var_t_container = VarTypeToCharContainer::new();
+        let push = self
+            .push_types
+            .iter()
+            .map(|t| t.to_consistent_string(&mut var_t_container))
+            .collect::<Vec<String>>()
+            .join(" ");
+        let effects = self
+            .effects
+            .iter()
+            .map(|e| e.to_consistent_string(&mut var_t_container))
+            .collect::<Vec<String>>()
+            .join(" ");
+        let output = match (push.is_empty(), effects.is_empty()) {
+            (_, true) => push,
+            (true, false) => effects,
+            (false, false) => format!("{push} {effects}"),
+        };
         write!(
             f,
             "({} -> {})",
@@ -95,11 +112,27 @@ impl Display for Type {
                 .map(|t| t.to_consistent_string(&mut var_t_container))
                 .collect::<Vec<String>>()
                 .join(" "),
-            self.push_types
-                .iter()
-                .map(|t| t.to_consistent_string(&mut var_t_container))
-                .collect::<Vec<String>>()
-                .join(" ")
+            output,
+        )
+    }
+}
+
+impl Effect {
+    pub fn to_consistent_string(&self, var_t: &mut VarTypeToCharContainer) -> String {
+        match self {
+            Effect::Named(name) => format!("!{}", name.join("::")),
+            Effect::Var(var_type) => format!("!{}", var_t.get_string(var_type)),
+            Effect::Wildcard => "!*".into(),
+        }
+    }
+}
+
+impl Display for Effect {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            self.to_consistent_string(&mut VarTypeToCharContainer::new())
         )
     }
 }

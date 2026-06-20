@@ -10,14 +10,18 @@ mod unify;
 
 pub use error::TypeCheckerError;
 use unify::{
-    apply_substitution, replace_custom_unit_type, substitute_types, substitute_unit_type,
+    Substitution, apply_substitution, replace_custom_type, replace_custom_unit_type,
+    substitute_effects, substitute_types, substitute_unit_type,
     validate_types_and_return_variable_substitution,
 };
 
 use crate::{
     lexer::{IntegerNumber, Number, Position},
     parser::{AstNode, AstNodeType, Case, FieldPattern, Import, Pattern},
-    types::{CustomType, LiteralType, NumberType, Type, UnitType, VarType, VarTypeToCharContainer},
+    types::{
+        CustomType, Effect, LiteralType, NumberType, Type, UnitType, VarType,
+        VarTypeToCharContainer,
+    },
 };
 
 /// Replaces every type variable in `ty` with a fresh one, consistently (the same
@@ -26,7 +30,7 @@ use crate::{
 /// `\dup` references must not share `a`, or applying them at different types
 /// would spuriously conflict.
 fn freshen_type(ty: &Type, remap: &mut HashMap<VarType, VarType>) -> Type {
-    Type::new(
+    Type::with_effects(
         ty.pop_types
             .iter()
             .map(|u| freshen_unit(u, remap))
@@ -35,7 +39,25 @@ fn freshen_type(ty: &Type, remap: &mut HashMap<VarType, VarType>) -> Type {
             .iter()
             .map(|u| freshen_unit(u, remap))
             .collect(),
+        ty.effects
+            .iter()
+            .map(|e| freshen_effect(e, remap))
+            .collect(),
     )
+}
+
+/// Gives each effect *variable* (`!a`) a fresh identity per function-value
+/// occurrence, consistently with the type-variable freshening in `freshen_unit`.
+fn freshen_effect(effect: &Effect, remap: &mut HashMap<VarType, VarType>) -> Effect {
+    match effect {
+        Effect::Var(var) => Effect::Var(
+            remap
+                .entry(var.clone())
+                .or_insert_with(VarType::new)
+                .clone(),
+        ),
+        other => other.clone(),
+    }
 }
 
 fn freshen_unit(unit: &UnitType, remap: &mut HashMap<VarType, VarType>) -> UnitType {
@@ -64,7 +86,7 @@ fn freshen_unit(unit: &UnitType, remap: &mut HashMap<VarType, VarType>) -> UnitT
 /// Rewrites every `type_definition` in an AST subtree with `subst`, recursing
 /// into nested blocks/quotations/match arms. Used to back-substitute the
 /// apply-site bindings into a definition body (and to freshen quotation bodies).
-fn apply_subst_to_node(node: &mut AstNodeWithType, subst: &HashMap<VarType, UnitType>) {
+fn apply_subst_to_node(node: &mut AstNodeWithType, subst: &Substitution) {
     node.type_definition = apply_substitution(subst, node.type_definition.clone());
     match &mut node.node_type {
         AstNodeType::Block(nodes) | AstNodeType::Quotation(nodes) => {
@@ -85,15 +107,34 @@ fn apply_subst_to_node(node: &mut AstNodeWithType, subst: &HashMap<VarType, Unit
 /// Closes transitive chains in a substitution (`a -> b`, `b -> I64` becomes
 /// `a -> I64`) so a single back-substitution pass fully concretizes. Capped to
 /// avoid looping on `a -> b`, `b -> a` cycles.
-fn resolve_substitution(map: &mut HashMap<VarType, UnitType>) {
-    for _ in 0..map.len() + 1 {
+fn resolve_substitution(subst: &mut Substitution) {
+    let total = subst.types.len() + subst.effects.len();
+    for _ in 0..total + 1 {
         let mut changed = false;
-        let keys: Vec<VarType> = map.keys().cloned().collect();
+        let keys: Vec<VarType> = subst.types.keys().cloned().collect();
         for key in keys {
-            let value = map.get(&key).cloned().expect("key came from the map");
-            let resolved = substitute_unit_type(map, value.clone());
+            let value = subst
+                .types
+                .get(&key)
+                .cloned()
+                .expect("key came from the map");
+            let resolved = substitute_unit_type(subst, value.clone());
             if resolved != value {
-                map.insert(key, resolved);
+                subst.types.insert(key, resolved);
+                changed = true;
+            }
+        }
+        // Effect rows can reference other effect variables; close those too.
+        let effect_keys: Vec<VarType> = subst.effects.keys().cloned().collect();
+        for key in effect_keys {
+            let value = subst
+                .effects
+                .get(&key)
+                .cloned()
+                .expect("key came from the map");
+            let resolved = substitute_effects(subst, value.clone());
+            if resolved != value {
+                subst.effects.insert(key, resolved);
                 changed = true;
             }
         }
@@ -101,6 +142,42 @@ fn resolve_substitution(map: &mut HashMap<VarType, UnitType>) {
             break;
         }
     }
+}
+
+/// Unions two effect rows (dedup). A `!*` wildcard absorbs everything, so the
+/// result collapses to `[Wildcard]` whenever one is present.
+fn merge_effects(mut acc: Vec<Effect>, more: Vec<Effect>) -> Vec<Effect> {
+    for e in more {
+        if !acc.contains(&e) {
+            acc.push(e);
+        }
+    }
+    if acc.contains(&Effect::Wildcard) {
+        return vec![Effect::Wildcard];
+    }
+    acc
+}
+
+/// Checks that every effect a body actually performs (`inferred`) is permitted by
+/// its `declared` effect row. A declared `!*` permits anything.
+fn check_effects_declared(
+    inferred: &[Effect],
+    declared: &[Effect],
+    position: &Position,
+) -> Result<(), TypeCheckerError> {
+    if declared.contains(&Effect::Wildcard) {
+        return Ok(());
+    }
+    for effect in inferred {
+        if !declared.contains(effect) {
+            return Err(TypeCheckerError::UndeclaredEffect(
+                position.clone(),
+                effect.clone(),
+                declared.to_vec(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,7 +227,7 @@ pub struct TypeChecker {
     /// checked it is back-substituted into the body so function-value
     /// references/quotations whose concrete type is pinned only by a downstream
     /// `apply` become concrete. Saved/restored per definition.
-    function_value_subst: HashMap<VarType, UnitType>,
+    function_value_subst: Substitution,
     /// One-shot scope for the *next* block to type-check into, instead of a fresh
     /// child. Set by an eager namespace def so its body's nested defs are
     /// retained (as the def's members) rather than discarded; consumed by the
@@ -163,7 +240,7 @@ impl TypeChecker {
         Self {
             imports: HashMap::new(),
             type_definitions: HashMap::new(),
-            function_value_subst: HashMap::new(),
+            function_value_subst: Substitution::new(),
             pending_block_scope: None,
         }
     }
@@ -196,17 +273,23 @@ impl TypeChecker {
             }
         }
         // The entry file runs as the program: it may leave nothing (exit 0) or a
-        // single I32 (exit code). An imported module is a pure namespace: `( -> )`.
+        // single I32 (exit code), and — being the program — it is where effects
+        // are discharged, so any effect row is allowed. An imported module is a
+        // pure namespace: `( -> )` with NO effects. The latter is exactly what
+        // lets a module hold arbitrary (but provably pure) instructions, not just
+        // definitions.
+        let pop_empty = block_type_check_result.pop_types.is_empty();
+        let push = &block_type_check_result.push_types;
         let valid = match scope_kind {
             ScopeKind::Entry => {
-                block_type_check_result == Type::empty()
-                    || block_type_check_result
-                        == Type::new(
-                            vec![],
-                            vec![UnitType::Literal(LiteralType::Number(NumberType::I32))],
-                        )
+                pop_empty
+                    && (push.is_empty()
+                        || push.as_slice()
+                            == [UnitType::Literal(LiteralType::Number(NumberType::I32))])
             }
-            ScopeKind::Module => block_type_check_result == Type::empty(),
+            ScopeKind::Module => {
+                pop_empty && push.is_empty() && block_type_check_result.effects.is_empty()
+            }
         };
         if !valid {
             return Err(TypeCheckerError::InvalidModuleDefinition(Box::new(
@@ -250,7 +333,9 @@ impl TypeChecker {
         // variables. We deliberately do NOT rewrite the working stacks mid-loop:
         // that would change variable identities the rest of inference (notably
         // `match`-arm consistency) relies on.
-        let mut accumulated_subst: HashMap<VarType, UnitType> = HashMap::new();
+        let mut accumulated_subst = Substitution::new();
+        // The union of every node's effects — the block's overall effect row.
+        let mut block_effects: Vec<Effect> = Vec::new();
         for node in program {
             let node =
                 self.infer_type_definition(scope, type_stack.clone(), node, module_path.clone())?;
@@ -272,9 +357,13 @@ impl TypeChecker {
                     node.position.clone(),
                 )?);
             }
-            let push_types =
-                substitute_types(&type_stack, type_definition.clone(), node.position.clone())?
-                    .push_types;
+            let substituted =
+                substitute_types(&type_stack, type_definition.clone(), node.position.clone())?;
+            let push_types = substituted.push_types;
+            // Accumulate this node's (now-substituted) effects into the block's
+            // effect row — this is how effects propagate up to the enclosing
+            // function/program.
+            block_effects = merge_effects(block_effects, substituted.effects);
             type_stack.truncate(type_stack.len() - pop_size);
             type_stack.extend(push_types.clone());
             local_stack.truncate(local_stack.len() - pop_size);
@@ -297,7 +386,12 @@ impl TypeChecker {
             (pop_type_stack, local_stack)
         };
 
-        let block_type = Type::new(pop_type_stack, local_stack);
+        // Resolve any effect variables the block accumulated against the
+        // bindings discovered while checking it.
+        if resolve_inferred_inputs {
+            block_effects = substitute_effects(&accumulated_subst, block_effects);
+        }
+        let block_type = Type::with_effects(pop_type_stack, local_stack, block_effects);
         Ok((block_type, node_results))
     }
 
@@ -449,7 +543,10 @@ impl TypeChecker {
 
                 let mut pop_types = sig.pop_types.clone();
                 pop_types.push(UnitType::Type(sig.clone()));
-                let apply_ty = Type::new(pop_types, sig.push_types.clone());
+                // Applying a function value performs that value's effects, so
+                // `apply` carries the applied signature's effect row upward.
+                let apply_ty =
+                    Type::with_effects(pop_types, sig.push_types.clone(), sig.effects.clone());
                 Ok(AstNodeWithType::new(
                     AstNodeType::Symbol(symbol),
                     node.position.clone(),
@@ -546,10 +643,20 @@ impl TypeChecker {
                 // and so variables bound by unrelated calls don't leak in.
                 let mut remap = HashMap::new();
                 let sig = freshen_type(&sig, &mut remap);
-                let remap: HashMap<VarType, UnitType> = remap
-                    .into_iter()
-                    .map(|(from, to)| (from, UnitType::Var(to)))
-                    .collect();
+                // `remap` may carry both type-variable and effect-variable
+                // renamings (`VarType`s are globally unique, so an entry is
+                // exclusively one or the other); populate both maps — applying a
+                // type-var renaming to effects, or vice versa, is a harmless no-op.
+                let remap = Substitution {
+                    types: remap
+                        .iter()
+                        .map(|(from, to)| (from.clone(), UnitType::Var(to.clone())))
+                        .collect(),
+                    effects: remap
+                        .iter()
+                        .map(|(from, to)| (from.clone(), vec![Effect::Var(to.clone())]))
+                        .collect(),
+                };
                 if !remap.is_empty() {
                     for node in &mut nodes {
                         apply_subst_to_node(node, &remap);
@@ -579,6 +686,8 @@ impl TypeChecker {
                     // the surrounding stack (`( -> )`).
                     let body = if let Some(ty) = body.type_definition.as_ref() {
                         // Pre-insert the annotated signature so the body may recurse.
+                        // (The body's effects are checked against this annotation in
+                        // the general annotation path of `infer_type_definition`.)
                         let ty = self.replace_custom_type(scope, ty.clone())?;
                         scope.insert_definition(symbol.clone(), ty, is_private);
                         self.infer_type_definition(scope, Vec::new(), *body, module_path)?
@@ -620,7 +729,13 @@ impl TypeChecker {
                         Type::new(vec![], body_ty.push_types.clone()),
                         is_private,
                     );
-                    (body, Type::new(body_ty.pop_types, vec![]))
+                    // The eager body runs once at this point, so the def statement
+                    // performs the body's effects (they propagate to the enclosing
+                    // block); the captured name itself is a pure `( -> outs)`.
+                    (
+                        body,
+                        Type::with_effects(body_ty.pop_types, vec![], body_ty.effects),
+                    )
                 };
                 // Back-substitute the bindings discovered from `apply`/call sites
                 // into the body, concretizing function-value references and
@@ -763,6 +878,16 @@ impl TypeChecker {
                     Type::empty(),
                 ))
             }
+            AstNodeType::EffectDefinition(name) => {
+                let mut canonical = module_path.clone();
+                canonical.push(name.clone());
+                scope.insert_effect(canonical);
+                Ok(AstNodeWithType::new(
+                    AstNodeType::EffectDefinition(name),
+                    node.position.clone(),
+                    Type::empty(),
+                ))
+            }
             AstNodeType::Match(cases) => self.type_check_match(
                 scope,
                 cases,
@@ -773,12 +898,12 @@ impl TypeChecker {
         }?;
         Ok(match node.type_definition.clone() {
             Some(ty) => {
-                let push_types = substitute_types(
+                let substituted = substitute_types(
                     &type_stack,
                     inferred_type.type_definition.clone(),
                     node.position.clone(),
-                )?
-                .push_types;
+                )?;
+                let push_types = substituted.push_types;
 
                 if validate_types_and_return_variable_substitution(
                     &ty.push_types,
@@ -794,6 +919,10 @@ impl TypeChecker {
                         Box::new(UnitType::Type(inferred_type.type_definition.clone())),
                     ));
                 }
+                // Every effect the body actually performs must be permitted by the
+                // declared effect row (`!*` permits anything). The node's type then
+                // carries the *declared* effects — what callers see.
+                check_effects_declared(&substituted.effects, &ty.effects, &node.position)?;
                 AstNodeWithType::new(inferred_type.node_type, node.position, ty)
             }
             None => inferred_type,
@@ -805,17 +934,7 @@ impl TypeChecker {
         scope: &mut TypeScope,
         ty: Type,
     ) -> Result<Type, TypeCheckerError> {
-        let pop_types = ty
-            .pop_types
-            .into_iter()
-            .map(|ty| replace_custom_unit_type(scope, ty))
-            .collect::<Result<Vec<_>, _>>()?;
-        let push_types = ty
-            .push_types
-            .into_iter()
-            .map(|ty| replace_custom_unit_type(scope, ty))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Type::new(pop_types, push_types))
+        replace_custom_type(scope, ty)
     }
 
     fn type_check_match(
@@ -841,6 +960,8 @@ impl TypeChecker {
         let type_stack_without_last_element =
             &type_stack[..type_stack.len().saturating_sub(1)].to_vec();
         let mut pattern_body_type = None;
+        // Union of every arm's effects — the match's overall effect row.
+        let mut match_effects: Vec<Effect> = Vec::new();
         match &match_type {
             UnitType::Literal(LiteralType::Number(_)) => {
                 let len = cases.len();
@@ -878,6 +999,10 @@ impl TypeChecker {
                                 pattern: case.pattern,
                                 body: Box::new(body_type.clone()),
                             });
+                            match_effects = merge_effects(
+                                match_effects,
+                                body_type.type_definition.effects.clone(),
+                            );
                             pattern_body_type = Some(body_type.type_definition);
                         }
                         Pattern::Wildcard(name) => {
@@ -909,6 +1034,10 @@ impl TypeChecker {
                                 pattern: case.pattern,
                                 body: Box::new(body_type.clone()),
                             });
+                            match_effects = merge_effects(
+                                match_effects,
+                                body_type.type_definition.effects.clone(),
+                            );
                             pattern_body_type = Some(body_type.type_definition);
                         }
                         other => {
@@ -923,7 +1052,7 @@ impl TypeChecker {
                 Ok(AstNodeWithType {
                     node_type: AstNodeType::Match(result_cases),
                     position: position.clone(),
-                    type_definition: Type::new(
+                    type_definition: Type::with_effects(
                         pattern_body_type
                             .clone()
                             .map(|mut t| {
@@ -933,6 +1062,7 @@ impl TypeChecker {
                             })
                             .unwrap_or(vec![match_type]),
                         pattern_body_type.map(|t| t.push_types).unwrap_or(vec![]),
+                        match_effects,
                     ),
                 })
             }
@@ -976,6 +1106,8 @@ impl TypeChecker {
                         pattern: case.pattern,
                         body: Box::new(body_type.clone()),
                     });
+                    match_effects =
+                        merge_effects(match_effects, body_type.type_definition.effects.clone());
                     pattern_body_type = Some(body_type.type_definition);
                 }
                 // Exhaustiveness: a fresh catch-all arm must be redundant (usefulness check).
@@ -991,7 +1123,7 @@ impl TypeChecker {
                 Ok(AstNodeWithType {
                     node_type: AstNodeType::Match(result_cases),
                     position: position.clone(),
-                    type_definition: Type::new(
+                    type_definition: Type::with_effects(
                         pattern_body_type
                             .clone()
                             .map(|mut t| {
@@ -1001,6 +1133,7 @@ impl TypeChecker {
                             })
                             .unwrap_or(vec![match_type]),
                         pattern_body_type.map(|t| t.push_types).unwrap_or(vec![]),
+                        match_effects,
                     ),
                 })
             }
@@ -1016,8 +1149,11 @@ fn check_branch_body_consistency(
     body_type: &Type,
     position: &Position,
 ) -> Result<(), TypeCheckerError> {
+    // Arms must agree on their stack effect (pop/push); they may differ in
+    // *effects* — those are unioned into the match's overall effect row.
     if let Some(existing) = pattern_body_type
-        && existing != body_type
+        && (existing.pop_types != body_type.pop_types
+            || existing.push_types != body_type.push_types)
     {
         return Err(TypeCheckerError::InvalidMatchBody(
             Box::new(existing.clone()),
@@ -1110,12 +1246,14 @@ fn variant_fields_of(
     let custom_type = type_definitions
         .get(name)
         .ok_or_else(|| TypeCheckerError::TypeNotFound(name.clone()))?;
-    let generics_map: HashMap<VarType, UnitType> = custom_type
-        .generics
-        .iter()
-        .map(|g| g.1.clone())
-        .zip(generic_types.iter().cloned())
-        .collect();
+    let generics_map = Substitution::from_types(
+        custom_type
+            .generics
+            .iter()
+            .map(|g| g.1.clone())
+            .zip(generic_types.iter().cloned())
+            .collect(),
+    );
     let (_, fields) = custom_type
         .variants
         .iter()
@@ -1305,6 +1443,10 @@ struct InnerTypeScope {
     imported_functions: HashMap<String, (String, String)>,
     definitions: HashMap<String, (Type, bool)>,
     type_definitions: HashMap<String, CustomType>,
+    /// Declared effects (`effect IO`), keyed by their last name segment and
+    /// mapping to the canonical fully-qualified path (e.g. `IO` →
+    /// `["std", "io", "IO"]`). Resolved like `type_definitions`.
+    effect_definitions: HashMap<String, Vec<String>>,
     /// Member namespaces: the retained body scope of an eager namespace def
     /// (`def std { def string { ... } }`), keyed by the def's name. Navigated by
     /// `::` (see `get_definition`). Distinct from `imported` so file imports keep
@@ -1322,6 +1464,7 @@ impl TypeScope {
                 imported_functions: HashMap::new(),
                 definitions: HashMap::new(),
                 type_definitions: HashMap::new(),
+                effect_definitions: HashMap::new(),
                 members: HashMap::new(),
             })),
         }
@@ -1342,6 +1485,58 @@ impl TypeScope {
     fn insert_member(&mut self, symbol: String, scope: TypeScope) {
         let mut inner = self.inner.borrow_mut();
         inner.members.insert(symbol, scope);
+    }
+
+    /// Registers a declared effect by its canonical fully-qualified path.
+    fn insert_effect(&self, canonical: Vec<String>) {
+        let mut inner = self.inner.borrow_mut();
+        inner.effect_definitions.insert(
+            canonical
+                .last()
+                .expect("An effect always has a name")
+                .clone(),
+            canonical,
+        );
+    }
+
+    /// Resolves an effect reference to its canonical path, navigating imports and
+    /// members exactly like `get_definition`. Returns `None` if undeclared.
+    fn get_effect(&self, mut name: Vec<String>) -> Option<Vec<String>> {
+        match name.len() {
+            0 => None,
+            1 => {
+                let inner = self.inner.borrow();
+                let last = name.last().expect("We checked for the name size").clone();
+                if let Some(canonical) = inner.effect_definitions.get(&last).cloned() {
+                    return Some(canonical);
+                }
+                if let Some(imported_functions) = inner.imported_functions.get(&last) {
+                    return self.get_effect(vec![
+                        imported_functions.1.clone(),
+                        imported_functions.0.clone(),
+                    ]);
+                }
+                if let Some(parent) = inner.parent.as_ref() {
+                    return parent.get_effect(name);
+                }
+                None
+            }
+            _ => {
+                let inner = self.inner.borrow();
+                let first = name.remove(0);
+                if let Some(from_imports) = inner.imported.get(&first) {
+                    return from_imports.get_effect(name);
+                }
+                if let Some(member_scope) = inner.members.get(&first) {
+                    return member_scope.get_effect(name);
+                }
+                if let Some(parent) = inner.parent.as_ref() {
+                    name.insert(0, first);
+                    return parent.get_effect(name);
+                }
+                None
+            }
+        }
     }
 
     fn insert_function_import(
@@ -1433,6 +1628,7 @@ impl TypeScope {
                 imported_functions: HashMap::new(),
                 definitions: HashMap::new(),
                 type_definitions: HashMap::new(),
+                effect_definitions: HashMap::new(),
                 members: HashMap::new(),
             })),
         }
@@ -2570,6 +2766,147 @@ def main {
             import std::list
             import std::number::i64
             def test { "hi" match { "" -> 0i64 [c ... rest] -> 1i64 } }
+        "#;
+        assert!(parse_and_type_check(contents, false).is_ok());
+    }
+
+    // --------------------------------------------------------------- effects
+
+    #[test]
+    fn declared_effect_is_accepted() {
+        // A function that performs IO and declares `!io::IO` type-checks.
+        let contents = r#"
+            import std::list
+            import std::io(println)
+            def shout (String -> !io::IO) \{ println }
+            "hi" shout
+            0i32
+        "#;
+        assert!(parse_and_type_check(contents, true).is_ok());
+    }
+
+    #[test]
+    fn undeclared_effect_is_rejected() {
+        // Calling an effectful function without declaring its effect is an error.
+        let contents = r#"
+            import std::list
+            import std::io(println)
+            def shout (String -> ) \{ println }
+            "hi" shout
+            0i32
+        "#;
+        assert!(matches!(
+            parse_and_type_check(contents, true),
+            Err(TypeCheckerError::UndeclaredEffect(..))
+        ));
+    }
+
+    #[test]
+    fn module_performing_io_is_rejected() {
+        // A module is pure: an effectful top-level instruction is rejected.
+        let contents = r#"
+            import std::list
+            import std::io(println)
+            "side effect" println
+        "#;
+        assert!(matches!(
+            parse_and_type_check(contents, false),
+            Err(TypeCheckerError::InvalidModuleDefinition(..))
+        ));
+    }
+
+    #[test]
+    fn module_with_pure_instruction_is_allowed() {
+        // The relaxation: a module may now hold non-definition instructions, as
+        // long as they are pure (no stack change, no effects).
+        let contents = r#"
+            import std::stack(drop)
+            1u8 drop
+        "#;
+        assert!(parse_and_type_check(contents, false).is_ok());
+    }
+
+    #[test]
+    fn effectful_function_into_pure_param_is_rejected() {
+        // Strict/sound: an effectful `(String -> !IO)` value cannot satisfy a
+        // pure `(String -> )` parameter.
+        let contents = r#"
+            import std::list
+            import std::io(println)
+            def use_pure (String (String -> ) -> ) \{ apply }
+            "x" \println use_pure
+            0i32
+        "#;
+        assert!(matches!(
+            parse_and_type_check(contents, true),
+            Err(TypeCheckerError::EffectConflict(..))
+        ));
+    }
+
+    #[test]
+    fn effect_variable_threads_callee_effects() {
+        // `!e` is bound to the argument's effects and threaded to the output, so
+        // applying an effectful function makes the call effectful.
+        let contents = r#"
+            import std::list
+            import std::io(println)
+            def run (String (String -> !e) -> !e) \{ apply }
+            "x" \println run
+            0i32
+        "#;
+        let result = parse_and_type_check(contents, true).expect("should type-check");
+        assert!(
+            result.contains("!std::io::IO"),
+            "expected the threaded IO effect, got: {result}"
+        );
+    }
+
+    #[test]
+    fn wildcard_param_accepts_effectful_function() {
+        // `!*` accepts a function value carrying any effects.
+        let contents = r#"
+            import std::list
+            import std::io(println)
+            def run_any (String (String -> !*) -> !*) \{ apply }
+            "x" \println run_any
+            0i32
+        "#;
+        assert!(parse_and_type_check(contents, true).is_ok());
+    }
+
+    #[test]
+    fn pure_function_into_effect_polymorphic_param_stays_pure() {
+        // Passing a pure function to an `!e` combinator leaves the call pure.
+        let contents = r#"
+            import std::list
+            import std::stack(drop)
+            def run (String (String -> ) -> ) \{ apply }
+            def consume (String -> ) \{ drop }
+            "x" \consume run
+        "#;
+        let result = parse_and_type_check(contents, false).expect("should type-check");
+        assert!(!result.contains('!'), "expected no effects, got: {result}");
+    }
+
+    #[test]
+    fn undeclared_effect_name_is_rejected() {
+        // Referencing an effect that was never declared with `effect` is an error.
+        let contents = r#"
+            import std::number::i64
+            def f (I64 -> !Bogus) \{ }
+            0i32
+        "#;
+        assert!(matches!(
+            parse_and_type_check(contents, true),
+            Err(TypeCheckerError::EffectNotFound(..))
+        ));
+    }
+
+    #[test]
+    fn effect_declaration_type_checks() {
+        // `effect IO` is a valid pure declaration.
+        let contents = r#"
+            effect IO
         "#;
         assert!(parse_and_type_check(contents, false).is_ok());
     }

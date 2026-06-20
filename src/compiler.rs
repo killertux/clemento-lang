@@ -842,6 +842,9 @@ impl<'ctx> CompilerContext<'ctx> {
 
                 Ok(())
             }
+            // Effects are a compile-time-only concept (the type checker is the
+            // only gate); an `effect` declaration produces no code.
+            AstNodeType::EffectDefinition(_) => Ok(()),
             AstNodeType::Match(cases) => {
                 self.compile_match(scope, cases, stack, module_path, program.type_definition)
             }

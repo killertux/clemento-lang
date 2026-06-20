@@ -1,0 +1,24 @@
+import std::list
+import std::io(println eprintln)
+
+// A user-defined function that performs IO must declare the IO effect. The
+// effect lives in std::io, so it is referenced here as `io::IO`. If `shout` left
+// the `!io::IO` off, the call to `println` would be a type error.
+def shout (String -> !io::IO) \{
+    println
+}
+
+// Effect polymorphism: `!e` is an effect variable threaded from the function
+// argument to the output. Passing an effectful function makes `run` effectful;
+// passing a pure one keeps it pure. The argument's effect row is whatever the
+// caller supplies.
+def run (String (String -> !e) -> !e) \{
+    apply
+}
+
+// The entry program is where effects are discharged, so it may freely perform
+// IO. `\shout` is effectful, so this `run` call performs `!io::IO`.
+"first" shout
+"second" \shout run
+"third (stderr)" eprintln
+0i32

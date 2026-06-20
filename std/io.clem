@@ -1,24 +1,31 @@
 import std::list
 import std::char
 
-def print (String ->) \{
+// The IO effect. Every function here that writes to stdout/stderr carries it,
+// so it propagates up through any caller (referenced as `io::IO` elsewhere, or
+// bare `!IO` within this module). The underlying FFI primitives in `std::char`
+// are the trusted boundary and are not themselves effect-annotated (annotating
+// them would require `std::char` to import `std::io`, a cycle).
+effect IO
+
+def print (String -> !IO) \{
     match {
         [] -> {}
         [head ... tail] -> { head char::print tail print }
     }
 }
 
-def println (String ->) \{
+def println (String -> !IO) \{
     print 10u32 char::from_code_point char::print
 }
 
-def eprint (String ->) \{
+def eprint (String -> !IO) \{
     match {
         [] -> {}
         [head ... tail] -> { head char::print_err tail eprint }
     }
 }
 
-def eprintln (String ->) \{
+def eprintln (String -> !IO) \{
     eprint 10u32 char::from_code_point char::print_err
 }

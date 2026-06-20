@@ -13,7 +13,7 @@ pub use ast::{AstNode, AstNodeType, Case, FieldPattern, Import, NameWithAlias, P
 pub use error::ParserError;
 
 use crate::lexer::{IntegerNumber, Lexer, Number, Position, Token, TokenType};
-use crate::types::{LiteralType, NumberType, Type, UnitType, VarType};
+use crate::types::{Effect, LiteralType, NumberType, Type, UnitType, VarType};
 
 pub struct Parser<'a> {
     tokens: Peekable<Lexer<'a>>,
@@ -118,6 +118,7 @@ impl<'a> Parser<'a> {
                     "defx" => self.parse_external_definition(token.position),
                     "import" => self.parse_import(token.position),
                     "type" => self.parse_custom_type(token.position),
+                    "effect" => self.parse_effect(token.position),
                     "match" => self.parse_match(token.position),
                     _ => Ok(Some(AstNode {
                         node_type: AstNodeType::Symbol(symbol),
@@ -144,7 +145,8 @@ impl<'a> Parser<'a> {
                 TokenType::RightParen
                 | TokenType::RightBrace
                 | TokenType::RightBracket
-                | TokenType::RightArrow => Err(ParserError::UnexpectedToken(
+                | TokenType::RightArrow
+                | TokenType::Bang => Err(ParserError::UnexpectedToken(
                     token.token_type,
                     token.position,
                 )),
@@ -295,19 +297,24 @@ impl<'a> Parser<'a> {
 
     fn parse_type(&mut self, position: &Position) -> Result<Type, ParserError> {
         let mut var_type_map: HashMap<String, VarType> = HashMap::new();
-        self.parse_type_inner(position, &mut var_type_map)
+        let mut effect_var_map: HashMap<String, VarType> = HashMap::new();
+        self.parse_type_inner(position, &mut var_type_map, &mut effect_var_map)
     }
 
     /// Parses the body of a `( ... -> ... )` stack-effect type (the opening `(`
-    /// must already be consumed). Takes the surrounding `var_type_map` so nested
-    /// function types share type variables with the enclosing signature.
+    /// must already be consumed). Takes the surrounding `var_type_map` /
+    /// `effect_var_map` so nested function types share type/effect variables with
+    /// the enclosing signature. Effects (`!IO`, `!a`, `!*`) may appear only on
+    /// the push (output) side.
     fn parse_type_inner(
         &mut self,
         position: &Position,
         var_type_map: &mut HashMap<String, VarType>,
+        effect_var_map: &mut HashMap<String, VarType>,
     ) -> Result<Type, ParserError> {
         let mut pop_types = Vec::new();
         let mut push_types = Vec::new();
+        let mut effects = Vec::new();
         while self
             .tokens
             .peek()
@@ -319,13 +326,19 @@ impl<'a> Parser<'a> {
             })
             .unwrap_or(false)
         {
-            let ty = self
+            let token = self
                 .tokens
                 .next()
-                .map(|token| self.parse_unit_type(token?, var_type_map, true))
                 .transpose()?
                 .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
-            pop_types.push(ty);
+            // Effects are output-only; a `!` before `->` is invalid.
+            if matches!(token.token_type, TokenType::Bang) {
+                return Err(ParserError::UnexpectedToken(
+                    token.token_type,
+                    token.position,
+                ));
+            }
+            pop_types.push(self.parse_unit_type(token, var_type_map, effect_var_map, true)?);
         }
         let Some(_) = self.tokens.next() else {
             return Err(ParserError::UnexpectedEndOfInput(position.clone()));
@@ -341,18 +354,21 @@ impl<'a> Parser<'a> {
             })
             .unwrap_or(false)
         {
-            let ty = self
+            let token = self
                 .tokens
                 .next()
-                .map(|token| self.parse_unit_type(token?, var_type_map, true))
                 .transpose()?
                 .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
-            push_types.push(ty);
+            if matches!(token.token_type, TokenType::Bang) {
+                effects.push(self.parse_effect_descriptor(position, effect_var_map)?);
+            } else {
+                push_types.push(self.parse_unit_type(token, var_type_map, effect_var_map, true)?);
+            }
         }
         let Some(_) = self.tokens.next() else {
             return Err(ParserError::UnexpectedEndOfInput(position.clone()));
         };
-        let ty = Type::new(pop_types, push_types);
+        let ty = Type::with_effects(pop_types, push_types, effects);
         Ok(ty)
     }
 
@@ -611,6 +627,27 @@ impl<'a> Parser<'a> {
         }))
     }
 
+    /// Parses an `effect Name` declaration. The effect has no value and never
+    /// reaches codegen; the declaration changes nothing on the stack.
+    fn parse_effect(&mut self, position: Position) -> Result<Option<AstNode>, ParserError> {
+        let symbol = self
+            .tokens
+            .next()
+            .transpose()?
+            .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
+        let TokenType::Symbol(name) = symbol.token_type else {
+            return Err(ParserError::UnexpectedToken(
+                symbol.token_type.clone(),
+                symbol.position,
+            ));
+        };
+        Ok(Some(AstNode {
+            node_type: AstNodeType::EffectDefinition(name),
+            position,
+            type_definition: Some(Type::empty()),
+        }))
+    }
+
     fn parse_variant(
         &mut self,
         symbol: Token,
@@ -659,7 +696,8 @@ impl<'a> Parser<'a> {
                     .next()
                     .transpose()?
                     .ok_or(ParserError::UnexpectedEndOfInput(symbol.position.clone()))?;
-                let ty = self.parse_unit_type(symbol, var_types, false)?;
+                let mut effect_var_map: HashMap<String, VarType> = HashMap::new();
+                let ty = self.parse_unit_type(symbol, var_types, &mut effect_var_map, false)?;
                 fields.push((field_name, ty));
             }
         }
@@ -672,6 +710,7 @@ impl<'a> Parser<'a> {
         &mut self,
         position: &Position,
         var_type_map: &mut HashMap<String, VarType>,
+        effect_var_map: &mut HashMap<String, VarType>,
         allow_insert_new_var_type: bool,
     ) -> Result<Vec<UnitType>, ParserError> {
         let mut types = Vec::new();
@@ -694,17 +733,51 @@ impl<'a> Parser<'a> {
                 if matches!(symbol.token_type, TokenType::RightChevron) {
                     break;
                 }
-                let ty = self.parse_unit_type(symbol, var_type_map, allow_insert_new_var_type)?;
+                let ty = self.parse_unit_type(
+                    symbol,
+                    var_type_map,
+                    effect_var_map,
+                    allow_insert_new_var_type,
+                )?;
                 types.push(ty);
             }
         }
         Ok(types)
     }
 
+    /// Parses an effect descriptor following a `!` token: `IO` / `std::io::IO`
+    /// (named), a lowercase word (an effect variable, shared via
+    /// `effect_var_map`), or `*` (the any-effects wildcard).
+    fn parse_effect_descriptor(
+        &mut self,
+        position: &Position,
+        effect_var_map: &mut HashMap<String, VarType>,
+    ) -> Result<Effect, ParserError> {
+        let token = self
+            .tokens
+            .next()
+            .transpose()?
+            .ok_or(ParserError::UnexpectedEndOfInput(position.clone()))?;
+        match token.token_type {
+            TokenType::Symbol(name) if name == "*" => Ok(Effect::Wildcard),
+            TokenType::Symbol(name) if name == name.to_lowercase() => {
+                let var = effect_var_map
+                    .entry(name)
+                    .or_insert_with(VarType::new)
+                    .clone();
+                Ok(Effect::Var(var))
+            }
+            TokenType::Symbol(name) => Ok(Effect::Named(vec![name])),
+            TokenType::SymbolWithPath(path) => Ok(Effect::Named(path)),
+            other => Err(ParserError::UnexpectedToken(other, token.position)),
+        }
+    }
+
     fn parse_unit_type(
         &mut self,
         token: Token,
         var_type_map: &mut HashMap<String, VarType>,
+        effect_var_map: &mut HashMap<String, VarType>,
         allow_insert_new_var_type: bool,
     ) -> Result<UnitType, ParserError> {
         match &token.token_type {
@@ -747,6 +820,7 @@ impl<'a> Parser<'a> {
                         let types = self.parse_generic_args(
                             &token.position,
                             var_type_map,
+                            effect_var_map,
                             allow_insert_new_var_type,
                         )?;
                         Ok(UnitType::Custom {
@@ -760,6 +834,7 @@ impl<'a> Parser<'a> {
                 let types = self.parse_generic_args(
                     &token.position,
                     var_type_map,
+                    effect_var_map,
                     allow_insert_new_var_type,
                 )?;
                 Ok(UnitType::Custom {
@@ -770,7 +845,7 @@ impl<'a> Parser<'a> {
             // A nested `( ... -> ... )` is a function type used as a value type,
             // e.g. the `(I64 -> I64)` parameter in `(I64 (I64 -> I64) -> I64)`.
             TokenType::LeftParen => {
-                let ty = self.parse_type_inner(&token.position, var_type_map)?;
+                let ty = self.parse_type_inner(&token.position, var_type_map, effect_var_map)?;
                 Ok(UnitType::Type(ty))
             }
             _ => Err(ParserError::UnexpectedToken(

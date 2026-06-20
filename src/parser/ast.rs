@@ -34,6 +34,9 @@ pub enum AstNodeType<T> {
         generics: Vec<(String, VarType)>,
         variants: Vec<(String, Vec<(String, UnitType)>)>,
     },
+    /// `effect IO`: declares a side effect. Treated like a type with no value;
+    /// it never reaches codegen. Defining it changes nothing on the stack.
+    EffectDefinition(String),
     Match(Vec<Case<T>>),
 }
 
@@ -237,6 +240,7 @@ where
                 write!(f, "{}", variants_str.join(" "))?;
                 write!(f, "}}")
             }
+            AstNodeType::EffectDefinition(name) => write!(f, "effect {}", name),
             AstNodeType::Match(cases) => {
                 write!(f, "match {{")?;
 
