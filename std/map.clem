@@ -1,0 +1,32 @@
+import std::number::i64(-)
+import std::stack(rot)
+
+type Pair<k v> {
+    Pair(key k, value v)
+}
+
+type Tree<k v> {
+    Empty(cmp (k k -> Ordering))
+    Node(cmp (k k -> Ordering) left Tree<k v> right Tree<k v> pair Pair<k v> size I64)
+}
+
+defp size (Tree<k v> -> I64) \{
+    match {
+        Empty -> 0
+        Node(size as n_size) -> n_size
+    }
+}
+
+defp node ((k k -> Ordering) Tree<k v> Tree<k v> Pair<k v> -> Tree<k v>) \{
+    rot
+}
+
+
+// def insert (Tree<k v> k v -> Tree<k v>) {
+//     rot match {
+//         Empty(cmp) -> { }
+//         Node(cmp height left right key value) -> {
+
+//         }
+//     }
+// }
