@@ -1,7 +1,38 @@
+import std::stack(dup swap rot rotr drop touch)
+import std::boolean(Boolean True False &&)
+
 type List<a> {
     Empty
     List(
         next List<a>
         element a
     )
+}
+
+def = (List<a> List<a> (a a -> Boolean) -> Boolean) \{
+    rotr match {
+        Empty -> match {
+            Empty -> { drop True }
+            List -> { drop False }
+        }
+        List(next as list1 element as element1) -> match {
+            Empty -> { drop False }
+            List(next as list2 element as element2) -> {
+                dup element1 element2 rot apply match {
+                    False -> { drop False }
+                    True -> { list1 list2 rot = }
+                }
+            }
+        }
+    }
+}
+
+def fold (List<a> b (b a -> b) -> b) \{
+    rot match {
+        Empty -> { drop touch }
+        List(next element) -> {
+            dup rot swap element swap apply
+            swap next rotr fold
+        }
+    }
 }

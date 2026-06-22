@@ -1,5 +1,5 @@
 import std::list
-import std::boolean(Boolean True False)
+import std::boolean(Boolean True False not)
 import std::stack(dup dup2 swap rot drop drop2 touch)
 import std::cmp(Ordering Less Equal Greater)
 
@@ -15,6 +15,10 @@ defx gt (I64 I64 -> Boolean)
 defx lt (I64 I64 -> Boolean)
 defx = (I64 I64 -> Boolean)
 defx != (I64 I64 -> Boolean)
+
+def gte (I64 I64 -> Boolean) \{
+    lt not
+}
 
 def to_string (I64 -> String) \{
     defp digit (I64 -> Char) \{

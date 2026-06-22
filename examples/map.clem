@@ -1,5 +1,50 @@
 import std::map
 import std::io
 import std::list
+import std::option
+import std::number::i64
+import std::pair
+import std::boolean(True False)
+import std::string
+import std::stack(swap dup)
 
-    "Hello world" io::println
+defp assert_some (option::Option<I64> I64 -> !io::IO) \{
+    swap match {
+        option::None -> { i64::to_string "Expected "  swap ", None returned" string::concat string::concat }
+        option::Some(value) -> {
+            dup value i64::= match {
+                boolean::True -> { i64::to_string "Correct value " swap string::concat }
+                boolean::False -> { i64::to_string "Expected " swap string::concat }
+            }
+        }
+    } io::println
+}
+
+defp assert_none (option::Option<I64> -> !io::IO) \{
+    match {
+        option::None -> { "Correct value None" io::println }
+        option::Some -> { "Expected None, got some" io::println}
+    }
+}
+
+// Numeric key from an empty map
+\i64::cmp map::Empty 0 map::get assert_none
+
+// From a list of numeric pairs
+[ {1 2 pair::Pair } { 2 3 pair::Pair } { 3 4 pair::Pair } ] \i64::cmp map::from_pair_list
+dup 1 map::get 2 assert_some
+dup 2 map::get 3 assert_some
+dup 3 map::get 4 assert_some
+dup 4 map::get assert_none
+
+// Map into list
+defp eq \{
+    \i64::= \i64::= pair::=
+}
+
+map::into_pair_list
+[ {1 2 pair::Pair } { 2 3 pair::Pair } { 3 4 pair::Pair } ]
+\eq list::= match {
+    False -> { "The lists did not match" io::println }
+    True -> { "The list matched" io::println }
+}
