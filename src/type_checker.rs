@@ -501,6 +501,10 @@ impl TypeChecker {
                         )
                     }),
                 )?;
+                // Instantiate with fresh variables for this call (see the
+                // `Symbol` arm); a qualified call to a generic definition needs
+                // per-use type variables just the same.
+                let type_definition = freshen_type(&type_definition, &mut HashMap::new());
                 validate_types_and_return_variable_substitution(
                     &type_stack,
                     &type_definition.pop_types,
@@ -568,6 +572,15 @@ impl TypeChecker {
                     }),
                 )?;
 
+                // Instantiate the definition's signature with fresh type
+                // variables for this call. Without this, a generic builtin or
+                // function (e.g. `rot (a b c -> b c a)`) shares one set of vars
+                // across every call site; binding a stack value's variable to
+                // such a shared var can alias it to the builtin's, and a later
+                // reuse then collides — producing spurious conflicts / cycles
+                // (e.g. `fold`'s accumulator getting tangled with `rot`'s vars).
+                // `FunctionRef` already freshens; ordinary calls must too.
+                let type_definition = freshen_type(&type_definition, &mut HashMap::new());
                 validate_types_and_return_variable_substitution(
                     &type_stack,
                     &type_definition.pop_types,
@@ -3102,5 +3115,31 @@ def main {
             defp bad ( -> a) \{ 0i64 'x' same }
         "#;
         assert!(parse_and_type_check(contents, false).is_err());
+    }
+
+    #[test]
+    fn higher_order_recursive_fold_type_checks() {
+        // A `fold` over a list with an accumulator function: it `dup`s the
+        // function value and reuses generic stack builtins (`rot`) twice. Each
+        // call site must instantiate its signature with fresh type variables;
+        // otherwise the accumulator's type gets aliased to a shared builtin
+        // variable and a later reuse collides (an infinite type / conflict).
+        let contents = r#"
+            import std::stack(dup drop rot rotr swap touch)
+            type Lst<a> {
+                Nil
+                Cons(rest Lst<a> head a)
+            }
+            defp myfold (Lst<a> b (b a -> b) -> b) \{
+                rot match {
+                    Nil -> { drop touch }
+                    Cons(rest head) -> {
+                        dup rot swap head swap apply
+                        swap rest rotr myfold
+                    }
+                }
+            }
+        "#;
+        assert!(parse_and_type_check(contents, false).is_ok());
     }
 }
