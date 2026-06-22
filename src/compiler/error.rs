@@ -49,7 +49,7 @@ pub enum CompilerError {
     )]
     CannotReferenceFunction(String),
     #[error(
-        "Cannot determine a concrete type for function value `{0}`: its type still has unresolved type variables. Apply it (or annotate it) so its type can be inferred."
+        "Cannot determine a concrete type for function value `{0}` at {1}: its type still has unresolved type variables. Apply it (or annotate it) so its type can be inferred."
     )]
-    UnresolvedFunctionValue(String),
+    UnresolvedFunctionValue(String, Position),
 }

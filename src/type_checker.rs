@@ -252,10 +252,12 @@ impl TypeChecker {
         module_path: Vec<String>,
     ) -> Result<(AstNodeWithType, TypeScope), TypeCheckerError> {
         let mut scope = TypeScope::empty();
+        let position = program.position.clone();
         let AstNodeType::Block(nodes) = program.node_type else {
-            return Err(TypeCheckerError::InvalidModuleDefinition(Box::new(
-                Type::empty(),
-            )));
+            return Err(TypeCheckerError::InvalidModuleDefinition(
+                Box::new(Type::empty()),
+                position,
+            ));
         };
 
         let (block_type_check_result, mut nodes_with_types) =
@@ -292,9 +294,10 @@ impl TypeChecker {
             }
         };
         if !valid {
-            return Err(TypeCheckerError::InvalidModuleDefinition(Box::new(
-                block_type_check_result,
-            )));
+            return Err(TypeCheckerError::InvalidModuleDefinition(
+                Box::new(block_type_check_result),
+                position,
+            ));
         }
         Ok((
             AstNodeWithType::new(
@@ -403,7 +406,7 @@ impl TypeChecker {
         module_path: Vec<String>,
     ) -> Result<AstNodeWithType, TypeCheckerError> {
         node.type_definition = match node.type_definition {
-            Some(ty) => Some(self.replace_custom_type(scope, ty.clone())?),
+            Some(ty) => Some(self.replace_custom_type(scope, ty.clone(), &node.position)?),
             None => None,
         };
         let type_stack = match &node.type_definition {
@@ -701,7 +704,7 @@ impl TypeChecker {
                         // Pre-insert the annotated signature so the body may recurse.
                         // (The body's effects are checked against this annotation in
                         // the general annotation path of `infer_type_definition`.)
-                        let ty = self.replace_custom_type(scope, ty.clone())?;
+                        let ty = self.replace_custom_type(scope, ty.clone(), &node.position)?;
                         scope.insert_definition(symbol.clone(), ty, is_private);
                         self.infer_type_definition(scope, Vec::new(), *body, module_path)?
                     } else {
@@ -770,7 +773,7 @@ impl TypeChecker {
                 ))
             }
             AstNodeType::ExternalDefinition(symbol, ty) => {
-                let ty = self.replace_custom_type(scope, ty.clone())?;
+                let ty = self.replace_custom_type(scope, ty.clone(), &node.position)?;
                 scope.insert_definition(symbol.clone(), ty.clone(), false);
                 Ok(AstNodeWithType::new(
                     AstNodeType::ExternalDefinition(symbol, ty),
@@ -835,6 +838,7 @@ impl TypeChecker {
                     generics.clone(),
                     variants.clone(),
                 );
+                let position = node.position.clone();
                 let variants = variants
                     .into_iter()
                     .map(|variant| {
@@ -844,7 +848,10 @@ impl TypeChecker {
                                 .1
                                 .into_iter()
                                 .map(|field| {
-                                    Ok((field.0, replace_custom_unit_type(scope, field.1)?))
+                                    Ok((
+                                        field.0,
+                                        replace_custom_unit_type(scope, field.1, &position)?,
+                                    ))
                                 })
                                 .collect::<Result<Vec<(String, UnitType)>, TypeCheckerError>>()?,
                         ))
@@ -946,8 +953,9 @@ impl TypeChecker {
         &self,
         scope: &mut TypeScope,
         ty: Type,
+        position: &Position,
     ) -> Result<Type, TypeCheckerError> {
-        replace_custom_type(scope, ty)
+        replace_custom_type(scope, ty, position)
     }
 
     fn type_check_match(
@@ -1329,6 +1337,7 @@ fn bind_pattern(
                     TypeCheckerError::FieldNotFoundInVariant(
                         field.field.clone(),
                         variant_name.join("::"),
+                        position.clone(),
                     ),
                 )?;
                 bind_pattern(
@@ -1364,7 +1373,7 @@ fn variant_fields_of(
     };
     let custom_type = type_definitions
         .get(name)
-        .ok_or_else(|| TypeCheckerError::TypeNotFound(name.clone()))?;
+        .ok_or_else(|| TypeCheckerError::TypeNotFound(name.clone(), position.clone()))?;
     let generics_map = Substitution::from_types(
         custom_type
             .generics
@@ -1498,9 +1507,9 @@ fn is_useful(
             // A custom type has a complete signature iff every variant appears in column 0.
             let complete_variants = match t0 {
                 UnitType::Custom { name, .. } => {
-                    let custom_type = type_definitions
-                        .get(name)
-                        .ok_or_else(|| TypeCheckerError::TypeNotFound(name.clone()))?;
+                    let custom_type = type_definitions.get(name).ok_or_else(|| {
+                        TypeCheckerError::TypeNotFound(name.clone(), position.clone())
+                    })?;
                     let all: Vec<String> = custom_type
                         .variants
                         .iter()
@@ -1940,7 +1949,7 @@ def hello { "Hello, World!" }"#;
 
         assert_eq!(
             error,
-            "Invalid top-level stack effect ( -> std::list::List<Char>). An imported module must be ( -> ); the entry file must be ( -> ) or ( -> I32)"
+            "Invalid top-level stack effect ( -> std::list::List<Char>) at 1:1. An imported module must be ( -> ); the entry file must be ( -> ) or ( -> I32)"
         );
     }
 

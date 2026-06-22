@@ -622,7 +622,10 @@ impl<'ctx> CompilerContext<'ctx> {
                     return Err(CompilerError::UnexpectedType);
                 };
                 if type_contains_var(&sig) {
-                    return Err(CompilerError::UnresolvedFunctionValue(symbol.join("::")));
+                    return Err(CompilerError::UnresolvedFunctionValue(
+                        format!("\\{}", symbol.join("::")),
+                        program.position,
+                    ));
                 }
                 let function = scope.materialize_symbol(symbol, self, sig.clone())?;
                 let pointer = function.as_global_value().as_pointer_value();
@@ -636,7 +639,8 @@ impl<'ctx> CompilerContext<'ctx> {
                 };
                 if type_contains_var(&sig) {
                     return Err(CompilerError::UnresolvedFunctionValue(
-                        "{ ... }".to_string(),
+                        "\\{ ... }".to_string(),
+                        program.position.clone(),
                     ));
                 }
                 let function = self.compile_quotation(

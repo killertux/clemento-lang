@@ -112,6 +112,7 @@ pub(super) fn substitute_effects(subst: &Substitution, effects: Vec<Effect>) -> 
 pub(super) fn replace_custom_unit_type(
     scope: &mut TypeScope,
     ty: UnitType,
+    position: &Position,
 ) -> Result<UnitType, TypeCheckerError> {
     match ty {
         UnitType::Custom {
@@ -119,57 +120,63 @@ pub(super) fn replace_custom_unit_type(
             generic_types,
         } => {
             let Some(ty) = scope.get_type(name.clone()) else {
-                return Err(TypeCheckerError::TypeNotFound(name));
+                return Err(TypeCheckerError::TypeNotFound(name, position.clone()));
             };
             if ty.generics.len() != generic_types.len() {
-                return Err(TypeCheckerError::TypeNotFound(name));
+                return Err(TypeCheckerError::TypeNotFound(name, position.clone()));
             }
             Ok(UnitType::Custom {
                 name: ty.name,
                 generic_types: generic_types
                     .into_iter()
-                    .map(|ty| replace_custom_unit_type(scope, ty))
+                    .map(|ty| replace_custom_unit_type(scope, ty, position))
                     .collect::<Result<Vec<_>, _>>()?,
             })
         }
         // Recurse into a nested function type so any `Custom` types and `Named`
         // effects it carries (e.g. a `(a -> b !IO)` parameter) are resolved too.
-        UnitType::Type(inner) => Ok(UnitType::Type(replace_custom_type(scope, inner)?)),
+        UnitType::Type(inner) => Ok(UnitType::Type(replace_custom_type(scope, inner, position)?)),
         other => Ok(other),
     }
 }
 
 /// Resolves the `Custom` types and `Named` effects in a whole signature to their
-/// canonical forms (errors if a type or effect is undeclared).
+/// canonical forms (errors if a type or effect is undeclared). `position` is the
+/// source location to attribute any resolution error to.
 pub(super) fn replace_custom_type(
     scope: &mut TypeScope,
     ty: Type,
+    position: &Position,
 ) -> Result<Type, TypeCheckerError> {
     let pop_types = ty
         .pop_types
         .into_iter()
-        .map(|ty| replace_custom_unit_type(scope, ty))
+        .map(|ty| replace_custom_unit_type(scope, ty, position))
         .collect::<Result<Vec<_>, _>>()?;
     let push_types = ty
         .push_types
         .into_iter()
-        .map(|ty| replace_custom_unit_type(scope, ty))
+        .map(|ty| replace_custom_unit_type(scope, ty, position))
         .collect::<Result<Vec<_>, _>>()?;
     let effects = ty
         .effects
         .into_iter()
-        .map(|effect| resolve_effect(scope, effect))
+        .map(|effect| resolve_effect(scope, effect, position))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Type::with_effects(pop_types, push_types, effects))
 }
 
 /// Resolves a `Named` effect to its canonical path (errors if undeclared).
 /// Variables and the wildcard pass through unchanged.
-fn resolve_effect(scope: &TypeScope, effect: Effect) -> Result<Effect, TypeCheckerError> {
+fn resolve_effect(
+    scope: &TypeScope,
+    effect: Effect,
+    position: &Position,
+) -> Result<Effect, TypeCheckerError> {
     match effect {
         Effect::Named(path) => match scope.get_effect(path.clone()) {
             Some(canonical) => Ok(Effect::Named(canonical)),
-            None => Err(TypeCheckerError::EffectNotFound(path)),
+            None => Err(TypeCheckerError::EffectNotFound(path, position.clone())),
         },
         other => Ok(other),
     }
