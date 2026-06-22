@@ -294,8 +294,15 @@ pub(super) fn validate_types_and_return_variable_substitution(
     position: Position,
 ) -> Result<Substitution, TypeCheckerError> {
     let mut subst = Substitution::new();
-    let stack_pop_types = &type_stack_1[type_stack_1.len().saturating_sub(type_stack_2.len())..];
-    for (ty, expected) in stack_pop_types.iter().zip(type_stack_2) {
+    // Align the two sequences at their RIGHT ends: the top of the stack matches
+    // the last pop type. When the stack has fewer values than the signature pops
+    // (an under-flow), the *leading* pop types are the ones supplied later (they
+    // become inferred inputs, which the block loop prepends) — so the values
+    // present must match the *trailing* pop types, not the leading ones.
+    let common = type_stack_1.len().min(type_stack_2.len());
+    let stack_tail = &type_stack_1[type_stack_1.len() - common..];
+    let pop_tail = &type_stack_2[type_stack_2.len() - common..];
+    for (ty, expected) in stack_tail.iter().zip(pop_tail) {
         unify_pair(ty, expected, &mut subst, &position)?;
     }
     Ok(subst)
