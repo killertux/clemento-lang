@@ -43,6 +43,15 @@ impl VarType {
         let id = VAR_TYPE.fetch_add(1, Ordering::SeqCst);
         VarType { identifier: id }
     }
+
+    /// The variable's globally-unique id. Ids increase with allocation order, so
+    /// a lower id means "declared earlier" — unification uses this to pick the
+    /// representative when merging two variables (the earlier one wins, keeping
+    /// a definition's signature variables as representatives so monomorphization
+    /// can resolve them).
+    pub fn id(&self) -> u64 {
+        self.identifier
+    }
 }
 
 impl Type {

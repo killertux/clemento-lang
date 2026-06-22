@@ -267,11 +267,9 @@ fn bind_or_reconcile(
     if let Some(existent) = subst.types.insert(var.clone(), ty.clone())
         && existent != ty
     {
-        subst.extend(validate_types_and_return_variable_substitution(
-            std::slice::from_ref(&existent),
-            std::slice::from_ref(&ty),
-            position.clone(),
-        )?);
+        // Reconcile into the SAME substitution (threaded), so the two candidates
+        // are unified with every binding discovered so far visible.
+        unify_pair(&existent, &ty, subst, position)?;
     }
     Ok(())
 }
@@ -295,149 +293,129 @@ pub(super) fn validate_types_and_return_variable_substitution(
     type_stack_2: &[UnitType],
     position: Position,
 ) -> Result<Substitution, TypeCheckerError> {
-    let mut variable_substitution = Substitution::new();
+    let mut subst = Substitution::new();
     let stack_pop_types = &type_stack_1[type_stack_1.len().saturating_sub(type_stack_2.len())..];
-    for (i, ty) in stack_pop_types.iter().enumerate() {
-        match (ty, &type_stack_2[i]) {
-            (UnitType::Literal(lit1), UnitType::Literal(lit2)) if lit1 == lit2 => {}
-            // Binding a type variable to a literal — either order (unification is
-            // symmetric; the actual value may be on either side).
-            (UnitType::Literal(lit), UnitType::Var(var))
-            | (UnitType::Var(var), UnitType::Literal(lit)) => {
-                bind_or_reconcile(
-                    &mut variable_substitution,
-                    var,
-                    UnitType::Literal(lit.clone()),
-                    &position,
-                )?;
-            }
-            (
-                UnitType::Custom {
-                    name,
-                    generic_types,
-                },
-                UnitType::Var(var),
-            )
-            | (
-                UnitType::Var(var),
-                UnitType::Custom {
-                    name,
-                    generic_types,
-                },
-            ) => {
-                let ty = UnitType::Custom {
-                    name: name.clone(),
-                    generic_types: generic_types.clone(),
-                };
-                bind_or_reconcile(&mut variable_substitution, var, ty, &position)?;
-            }
-            (
-                UnitType::Custom {
-                    name: name1,
-                    generic_types: generic_types1,
-                },
-                UnitType::Custom {
-                    name: name2,
-                    generic_types: generic_types2,
-                },
-            ) => {
-                if name1 != name2 {
-                    return Err(TypeCheckerError::TypeConflict(
-                        position,
-                        Box::new(UnitType::Custom {
-                            name: name1.clone(),
-                            generic_types: generic_types1.clone(),
-                        }),
-                        Box::new(UnitType::Custom {
-                            name: name2.clone(),
-                            generic_types: generic_types2.clone(),
-                        }),
-                    ));
-                }
-                if generic_types1.len() != generic_types2.len() {
-                    return Err(TypeCheckerError::TypeConflict(
-                        position,
-                        Box::new(UnitType::Custom {
-                            name: name1.clone(),
-                            generic_types: generic_types1.clone(),
-                        }),
-                        Box::new(UnitType::Custom {
-                            name: name2.clone(),
-                            generic_types: generic_types2.clone(),
-                        }),
-                    ));
-                }
+    for (ty, expected) in stack_pop_types.iter().zip(type_stack_2) {
+        unify_pair(ty, expected, &mut subst, &position)?;
+    }
+    Ok(subst)
+}
 
-                variable_substitution.extend(validate_types_and_return_variable_substitution(
-                    generic_types1,
-                    generic_types2,
-                    position.clone(),
-                )?);
-            }
-            (UnitType::Type(ty1), UnitType::Type(ty2)) => {
-                // Structurally unify two function types so a concrete `(I64 -> I64)`
-                // can match a generic `(a -> a)` parameter, binding `a := I64`.
-                if ty1.pop_types.len() != ty2.pop_types.len()
-                    || ty1.push_types.len() != ty2.push_types.len()
-                {
-                    return Err(TypeCheckerError::TypeConflict(
-                        position,
-                        Box::new(UnitType::Type(ty1.clone())),
-                        Box::new(UnitType::Type(ty2.clone())),
-                    ));
-                }
-                variable_substitution.extend(validate_types_and_return_variable_substitution(
-                    &ty1.pop_types,
-                    &ty2.pop_types,
-                    position.clone(),
-                )?);
-                variable_substitution.extend(validate_types_and_return_variable_substitution(
-                    &ty1.push_types,
-                    &ty2.push_types,
-                    position.clone(),
-                )?);
-                // Unify the effect rows of the two function types. This is what
-                // enforces effect compatibility (strict/sound): an effectful
-                // function value cannot satisfy a pure `(a -> b)` parameter.
-                variable_substitution.extend(unify_effects(
-                    &ty1.effects,
-                    &ty2.effects,
-                    position.clone(),
-                )?);
-            }
-            (UnitType::Type(ty), UnitType::Var(var)) | (UnitType::Var(var), UnitType::Type(ty)) => {
-                bind_or_reconcile(
-                    &mut variable_substitution,
-                    var,
-                    UnitType::Type(ty.clone()),
-                    &position,
-                )?;
-            }
-            (UnitType::Var(var1), UnitType::Var(var2)) => {
-                // A variable unified with itself carries no information; inserting
-                // `v := v` would falsely block a later, real binding `v := u`
-                // (this happens when structurally unifying a function type against
-                // itself, e.g. `(a -> a)` vs `(a -> a)`).
-                if var1 == var2 {
-                    continue;
-                }
-                bind_or_reconcile(
-                    &mut variable_substitution,
-                    var1,
-                    UnitType::Var(var2.clone()),
-                    &position,
-                )?;
-            }
-            (other1, other2) => {
+/// Unifies one pair of types *into* the shared `subst`. Threading the
+/// substitution (rather than building fresh sub-substitutions and merging) is
+/// what lets a variable constrained in one branch reconcile with a rebinding in
+/// another — e.g. a function-value argument whose parameter was already pinned
+/// by a sibling argument. This deliberately does NOT resolve variables before
+/// matching: it keeps the positional structural matching the rest of the checker
+/// relies on, and only changes how the accumulating bindings are shared.
+fn unify_pair(
+    a: &UnitType,
+    b: &UnitType,
+    subst: &mut Substitution,
+    position: &Position,
+) -> Result<(), TypeCheckerError> {
+    match (a, b) {
+        (UnitType::Literal(l1), UnitType::Literal(l2)) if l1 == l2 => Ok(()),
+        // Binding a type variable to a literal — either order (unification is
+        // symmetric; the actual value may be on either side).
+        (UnitType::Literal(lit), UnitType::Var(var))
+        | (UnitType::Var(var), UnitType::Literal(lit)) => {
+            bind_or_reconcile(subst, var, UnitType::Literal(lit.clone()), position)
+        }
+        (
+            UnitType::Custom {
+                name,
+                generic_types,
+            },
+            UnitType::Var(var),
+        )
+        | (
+            UnitType::Var(var),
+            UnitType::Custom {
+                name,
+                generic_types,
+            },
+        ) => bind_or_reconcile(
+            subst,
+            var,
+            UnitType::Custom {
+                name: name.clone(),
+                generic_types: generic_types.clone(),
+            },
+            position,
+        ),
+        (
+            UnitType::Custom {
+                name: n1,
+                generic_types: g1,
+            },
+            UnitType::Custom {
+                name: n2,
+                generic_types: g2,
+            },
+        ) => {
+            if n1 != n2 || g1.len() != g2.len() {
                 return Err(TypeCheckerError::TypeConflict(
-                    position,
-                    Box::new(other2.clone()),
-                    Box::new(other1.clone()),
+                    position.clone(),
+                    Box::new(a.clone()),
+                    Box::new(b.clone()),
                 ));
             }
+            for (x, y) in g1.iter().zip(g2) {
+                unify_pair(x, y, subst, position)?;
+            }
+            Ok(())
         }
+        // Structurally unify two function types so a concrete `(I64 -> I64)` can
+        // match a generic `(a -> a)` parameter, and unify their effect rows
+        // (strict/sound: an effectful value cannot satisfy a pure `(a -> b)`).
+        (UnitType::Type(t1), UnitType::Type(t2)) => {
+            if t1.pop_types.len() != t2.pop_types.len()
+                || t1.push_types.len() != t2.push_types.len()
+            {
+                return Err(TypeCheckerError::TypeConflict(
+                    position.clone(),
+                    Box::new(a.clone()),
+                    Box::new(b.clone()),
+                ));
+            }
+            for (x, y) in t1
+                .pop_types
+                .iter()
+                .zip(&t2.pop_types)
+                .chain(t1.push_types.iter().zip(&t2.push_types))
+            {
+                unify_pair(x, y, subst, position)?;
+            }
+            subst.extend(unify_effects(&t1.effects, &t2.effects, position.clone())?);
+            Ok(())
+        }
+        (UnitType::Type(ty), UnitType::Var(var)) | (UnitType::Var(var), UnitType::Type(ty)) => {
+            bind_or_reconcile(subst, var, UnitType::Type(ty.clone()), position)
+        }
+        (UnitType::Var(var1), UnitType::Var(var2)) => {
+            // A variable unified with itself carries no information.
+            if var1 == var2 {
+                return Ok(());
+            }
+            // Union by id: rewrite the later-declared variable to the earlier one,
+            // so the representative is the earliest variable (e.g. a definition's
+            // signature variable rather than a fresh per-call or annotation
+            // variable). This keeps a generic body's variables aligned with the
+            // signature so monomorphization can resolve them.
+            let (from, to) = if var1.id() > var2.id() {
+                (var1, var2)
+            } else {
+                (var2, var1)
+            };
+            bind_or_reconcile(subst, from, UnitType::Var(to.clone()), position)
+        }
+        (other1, other2) => Err(TypeCheckerError::TypeConflict(
+            position.clone(),
+            Box::new(other2.clone()),
+            Box::new(other1.clone()),
+        )),
     }
-    Ok(variable_substitution)
 }
 
 #[cfg(test)]

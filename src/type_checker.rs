@@ -508,15 +508,16 @@ impl TypeChecker {
                 // `Symbol` arm); a qualified call to a generic definition needs
                 // per-use type variables just the same.
                 let type_definition = freshen_type(&type_definition, &mut HashMap::new());
-                validate_types_and_return_variable_substitution(
+                let subst = validate_types_and_return_variable_substitution(
                     &type_stack,
                     &type_definition.pop_types,
                     node.position.clone(),
                 )?;
+                self.function_value_subst.extend(subst.clone());
                 Ok(AstNodeWithType::new(
                     AstNodeType::SymbolWithPath(symbol),
                     node.position.clone(),
-                    substitute_types(&type_stack, type_definition, node.position.clone())?,
+                    apply_substitution(&subst, type_definition),
                 ))
             }
             // `apply` is a builtin whose stack effect depends on the function
@@ -584,15 +585,22 @@ impl TypeChecker {
                 // (e.g. `fold`'s accumulator getting tangled with `rot`'s vars).
                 // `FunctionRef` already freshens; ordinary calls must too.
                 let type_definition = freshen_type(&type_definition, &mut HashMap::new());
-                validate_types_and_return_variable_substitution(
+                let subst = validate_types_and_return_variable_substitution(
                     &type_stack,
                     &type_definition.pop_types,
                     node.position.clone(),
                 )?;
+                // Record the call's bindings so any function value (`\name` /
+                // `\{ ... }`) passed as an argument has its type concretized by
+                // the back-substitution pass — the same mechanism `apply` uses.
+                // Without this, a quotation passed to a generic higher-order call
+                // (e.g. `fold`) keeps the variables from its own annotation and
+                // can't be monomorphized.
+                self.function_value_subst.extend(subst.clone());
                 Ok(AstNodeWithType::new(
                     AstNodeType::Symbol(symbol),
                     node.position.clone(),
-                    substitute_types(&type_stack, type_definition, node.position.clone())?,
+                    apply_substitution(&subst, type_definition),
                 ))
             }
             AstNodeType::Block(nodes) => {
