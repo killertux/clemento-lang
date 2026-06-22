@@ -1,0 +1,5 @@
+42
+Some(value: 5)
+Pair(first: 1, second: 2)
+List(next: List(next: List(next: Empty, element: 3), element: 2), element: 1)
+True

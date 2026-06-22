@@ -1,0 +1,15 @@
+import std::list
+import std::io
+import std::number::i64
+import std::stack(drop)
+
+// `todo` marks unimplemented code. It type-checks against any signature — so a
+// stubbed function still compiles and is pure — but aborts at runtime, citing
+// the source location, with a non-zero exit code.
+def double (I64 -> I64) \{
+    todo
+}
+
+"about to call an unimplemented function" io::println
+5 double drop
+"this line is never reached" io::println
