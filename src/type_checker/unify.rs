@@ -248,6 +248,15 @@ fn bind_or_reconcile(
     ty: UnitType,
     position: &Position,
 ) -> Result<(), TypeCheckerError> {
+    // Occurs-check: never bind a variable to a type that contains it, which would
+    // describe an infinite type and make substitution expand without bound.
+    if occurs_in(var, &ty) {
+        return Err(TypeCheckerError::TypeConflict(
+            position.clone(),
+            Box::new(UnitType::Var(var.clone())),
+            Box::new(ty),
+        ));
+    }
     if let Some(existent) = subst.types.insert(var.clone(), ty.clone())
         && existent != ty
     {
@@ -258,6 +267,20 @@ fn bind_or_reconcile(
         )?);
     }
     Ok(())
+}
+
+/// Whether `var` appears anywhere inside `ty` (used by the occurs-check).
+fn occurs_in(var: &VarType, ty: &UnitType) -> bool {
+    match ty {
+        UnitType::Var(x) => x == var,
+        UnitType::Custom { generic_types, .. } => generic_types.iter().any(|g| occurs_in(var, g)),
+        UnitType::Type(t) => t
+            .pop_types
+            .iter()
+            .chain(&t.push_types)
+            .any(|u| occurs_in(var, u)),
+        UnitType::Literal(_) => false,
+    }
 }
 
 pub(super) fn validate_types_and_return_variable_substitution(
