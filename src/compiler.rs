@@ -2533,8 +2533,15 @@ impl<'ctx> Scope<'ctx> {
                     .expect("We checked for the symbol size")
                     .clone();
 
-                if let Some(value) = inner.values.get(&last) {
-                    stack.push(value.clone());
+                // Match-bound field: push a clone (rc++) so each *use* owns its
+                // own reference. A binding may be referenced more than once (e.g.
+                // `pair first ... pair second`), and each consumer releases the
+                // value it receives; without a per-use retain the second use would
+                // over-release and free the value out from under the still-live
+                // scrutinee tree. Mirrors the eager-binding (`owned_values`) path.
+                if let Some((ty, value)) = inner.values.get(&last).cloned() {
+                    let pushed = context.clone_value(ty.clone(), value)?;
+                    stack.push((ty, pushed));
                     return Ok(());
                 }
 
