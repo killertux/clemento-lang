@@ -13,13 +13,13 @@ pub enum TypeCheckerError {
     )]
     SymbolNotFound(String, Position, String),
     #[error(
-        "Invalid top-level stack effect {0}. An imported module must be ( -> ); the entry file must be ( -> ) or ( -> I32)"
+        "Invalid top-level stack effect {0} at {1}. An imported module must be ( -> ); the entry file must be ( -> ) or ( -> I32)"
     )]
-    InvalidModuleDefinition(Box<Type>),
+    InvalidModuleDefinition(Box<Type>, Position),
     #[error("Missing import {0}")]
     MissingImport(String),
-    #[error("Type not found {0:?}")]
-    TypeNotFound(Vec<String>),
+    #[error("Type `{n}` not found at {1}", n = .0.join("::"))]
+    TypeNotFound(Vec<String>, Position),
     #[error("Match cannot infer type at {0}")]
     MatchCannotInferType(Position),
     #[error("Invalid match type {0} at {1}")]
@@ -34,14 +34,14 @@ pub enum TypeCheckerError {
     InvalidMatchBody(Box<Type>, Box<Type>, Position),
     #[error("Invalid match variant {0} at {1}")]
     InvalidMatchVariant(String, Position),
-    #[error("Field {0} not found in variant {1}")]
-    FieldNotFoundInVariant(String, String),
+    #[error("Field {0} not found in variant {1} at {2}")]
+    FieldNotFoundInVariant(String, String, Position),
     #[error("Non-exhaustive match at {0}")]
     NonExhaustiveMatch(Position),
     #[error("`apply` expects a function value on top of the stack at {0}, but got {1}")]
     ApplyOnNonFunction(Position, String),
-    #[error("Effect not found {0:?}. Declare it with `effect <Name>`")]
-    EffectNotFound(Vec<String>),
+    #[error("Effect `{n}` not found at {1}. Declare it with `effect <Name>`", n = .0.join("::"))]
+    EffectNotFound(Vec<String>, Position),
     #[error("Effect conflict at {0}: expected effects [{e1}], got [{e2}]", e1 = fmt_effects(.1), e2 = fmt_effects(.2))]
     EffectConflict(Position, Vec<Effect>, Vec<Effect>),
     #[error("Undeclared effect {1} at {0}. The function performs it but does not declare it (declared: [{d}])", d = fmt_effects(.2))]
