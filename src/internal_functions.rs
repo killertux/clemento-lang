@@ -75,6 +75,36 @@ pub fn builtins_functions<'ctx>(
             .void_type()
             .fn_type(&[ptr_type.into()], false);
         context.module.add_function("free", free_type, None);
+        // `todo` / `panic` aborts and `dbg` leaf printers (clem_runtime.c).
+        let void = context.context.void_type();
+        context
+            .module
+            .add_function("clem_todo", void.fn_type(&[ptr_type.into()], false), None);
+        context.module.add_function(
+            "clem_panic",
+            void.fn_type(&[ptr_type.into(), ptr_type.into()], false),
+            None,
+        );
+        context.module.add_function(
+            "clem_eprint_cstr",
+            void.fn_type(&[ptr_type.into()], false),
+            None,
+        );
+        context.module.add_function(
+            "clem_eprint_i64",
+            void.fn_type(&[context.context.i64_type().into()], false),
+            None,
+        );
+        context.module.add_function(
+            "clem_eprint_u64",
+            void.fn_type(&[context.context.i64_type().into()], false),
+            None,
+        );
+        context.module.add_function(
+            "clem_eprint_f64",
+            void.fn_type(&[context.context.f64_type().into()], false),
+            None,
+        );
     }
 
     let boolean_type = context

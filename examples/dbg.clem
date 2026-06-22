@@ -1,0 +1,15 @@
+import std::list
+import std::io
+import std::option(Some None)
+import std::pair(Pair)
+import std::number::i64
+import std::stack(drop)
+
+// `dbg` writes a `Variant(field: value, ...)` representation of the top of the
+// stack to *stderr* and leaves the value (and its refcount) untouched. The
+// stdout below therefore stays deterministic; run with `2>&1` to also see the
+// debug lines: `42`, `Some(value: 5)`, `Pair(first: 1, second: 2)`.
+42 dbg drop
+5 option::Some dbg drop
+1 2 pair::Pair dbg drop
+"dbg ran" io::println

@@ -15,7 +15,7 @@ use inkwell::{
     types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, StructType},
     values::{
         AggregateValue, BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue,
-        PointerValue,
+        IntValue, PointerValue,
     },
 };
 mod error;
@@ -37,6 +37,10 @@ pub struct CompilerContext<'ctx> {
     pub imports: HashMap<String, Scope<'ctx>>,
     pub type_definitions: HashMap<Vec<String>, CustomType>,
     pub global_strings: HashMap<String, PointerValue<'ctx>>,
+    /// Cache of generated `dbg` printer functions, keyed by the concrete type they
+    /// print (`{:?}` of the `UnitType`). Each takes the value and prints a
+    /// `Variant(field: value, ...)` representation to stderr, borrowing only.
+    dbg_printers: HashMap<String, FunctionValue<'ctx>>,
     /// Set while a (non-`main`) definition's body is being compiled: identifies
     /// the function currently in scope for self-tail-call rewriting. A self-call
     /// that matches `function_name` and is in tail position becomes a branch back
@@ -157,6 +161,7 @@ impl<'ctx> CompilerContext<'ctx> {
             imports: HashMap::new(),
             type_definitions: HashMap::new(),
             global_strings: HashMap::new(),
+            dbg_printers: HashMap::new(),
             tail_ctx: None,
             tail_position: false,
             tail_cleanups: Vec::new(),
@@ -413,6 +418,244 @@ impl<'ctx> CompilerContext<'ctx> {
             }
             _ => Ok(value),
         }
+    }
+
+    /// Prints a representation of `value` (type `ty`) to stderr — the leaf
+    /// dispatch for the `dbg` keyword. Borrow-only: it never changes a refcount.
+    /// Scalars print inline; custom types go through a generated, cached per-type
+    /// printer, so a recursive type prints via a recursive *call* rather than
+    /// infinite inline expansion.
+    fn emit_dbg(&mut self, ty: UnitType, value: BasicValueEnum<'ctx>) -> Result<(), CompilerError> {
+        match &ty {
+            UnitType::Custom { .. } => {
+                let printer = self.get_or_build_dbg_printer(&ty)?;
+                self.builder.build_call(printer, &[value.into()], "")?;
+                Ok(())
+            }
+            UnitType::Type(_) => self.emit_eprint_cstr("<fn>"),
+            UnitType::Literal(_) => self.emit_dbg_scalar(&ty, value),
+            UnitType::Var(_) => self.emit_eprint_cstr("<?>"),
+        }
+    }
+
+    /// Prints a string literal to stderr via `clem_eprint_cstr`.
+    fn emit_eprint_cstr(&mut self, s: &str) -> Result<(), CompilerError> {
+        let g = self.build_global_string(s.to_string())?;
+        let f = self
+            .module
+            .get_function("clem_eprint_cstr")
+            .ok_or(CompilerError::GetFunctionError("clem_eprint_cstr".into()))?;
+        self.builder.build_call(f, &[g.into()], "")?;
+        Ok(())
+    }
+
+    /// Prints a scalar (`Number` / `Char` / `CStr`) value inline to stderr.
+    fn emit_dbg_scalar(
+        &mut self,
+        ty: &UnitType,
+        value: BasicValueEnum<'ctx>,
+    ) -> Result<(), CompilerError> {
+        match ty {
+            UnitType::Literal(LiteralType::Number(NumberType::F64)) => {
+                let f = self
+                    .module
+                    .get_function("clem_eprint_f64")
+                    .ok_or(CompilerError::GetFunctionError("clem_eprint_f64".into()))?;
+                self.builder.build_call(f, &[value.into()], "")?;
+            }
+            UnitType::Literal(LiteralType::Number(n)) => {
+                let signed = matches!(
+                    n,
+                    NumberType::I8
+                        | NumberType::I16
+                        | NumberType::I32
+                        | NumberType::I64
+                        | NumberType::I128
+                );
+                let widened = self.widen_to_i64(value.into_int_value(), signed)?;
+                let name = if signed {
+                    "clem_eprint_i64"
+                } else {
+                    "clem_eprint_u64"
+                };
+                let f = self
+                    .module
+                    .get_function(name)
+                    .ok_or_else(|| CompilerError::GetFunctionError(name.into()))?;
+                self.builder.build_call(f, &[widened.into()], "")?;
+            }
+            UnitType::Literal(LiteralType::Char) => {
+                self.emit_eprint_cstr("'")?;
+                self.emit_print_char_with(value.into_int_value(), "clem_putchar_err")?;
+                self.emit_eprint_cstr("'")?;
+            }
+            UnitType::Literal(LiteralType::CStr) => {
+                let f = self
+                    .module
+                    .get_function("clem_eprint_cstr")
+                    .ok_or(CompilerError::GetFunctionError("clem_eprint_cstr".into()))?;
+                self.builder.build_call(f, &[value.into()], "")?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Sign/zero-extends (or truncates) an integer to i64 so it fits the
+    /// `clem_eprint_{i64,u64}` helpers.
+    fn widen_to_i64(
+        &self,
+        v: IntValue<'ctx>,
+        signed: bool,
+    ) -> Result<IntValue<'ctx>, CompilerError> {
+        let i64t = self.context.i64_type();
+        let width = v.get_type().get_bit_width();
+        Ok(match width.cmp(&64) {
+            std::cmp::Ordering::Less if signed => {
+                self.builder.build_int_s_extend(v, i64t, "sext")?
+            }
+            std::cmp::Ordering::Less => self.builder.build_int_z_extend(v, i64t, "zext")?,
+            std::cmp::Ordering::Greater => self.builder.build_int_truncate(v, i64t, "trunc")?,
+            _ => v,
+        })
+    }
+
+    /// Recursively substitutes a type's generic variables, yielding the concrete
+    /// type to print (e.g. `Pair<k v>` → `Pair<I64 I64>`).
+    fn resolve_type(&self, ty: &UnitType, generics: &HashMap<VarType, UnitType>) -> UnitType {
+        match ty {
+            UnitType::Var(v) => generics.get(v).cloned().unwrap_or_else(|| ty.clone()),
+            UnitType::Custom {
+                name,
+                generic_types,
+            } => UnitType::Custom {
+                name: name.clone(),
+                generic_types: generic_types
+                    .iter()
+                    .map(|t| self.resolve_type(t, generics))
+                    .collect(),
+            },
+            other => other.clone(),
+        }
+    }
+
+    /// Returns (building on first use) the `dbg` printer for a concrete custom
+    /// type. The function takes the value pointer and prints
+    /// `Variant(field: value, ...)` (no parens for field-less variants) to stderr,
+    /// recursing into pointer fields via their own printers. It is inserted into
+    /// the cache *before* its body is built, so recursive/mutually-recursive types
+    /// resolve to a call back into the (in-progress) function.
+    fn get_or_build_dbg_printer(
+        &mut self,
+        ty: &UnitType,
+    ) -> Result<FunctionValue<'ctx>, CompilerError> {
+        let key = format!("{:?}", ty);
+        if let Some(f) = self.dbg_printers.get(&key) {
+            return Ok(*f);
+        }
+        let UnitType::Custom {
+            name,
+            generic_types,
+        } = ty
+        else {
+            return Err(CompilerError::UnexpectedType);
+        };
+        let custom = self
+            .get_type(name.clone())
+            .ok_or(CompilerError::TypeNotInScope)?;
+        let generics: HashMap<VarType, UnitType> = custom
+            .generics
+            .iter()
+            .map(|g| g.1.clone())
+            .zip(generic_types.iter().cloned())
+            .collect();
+
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let fn_type = self.context.void_type().fn_type(&[ptr_type.into()], false);
+        let func = self.module.add_function(
+            &format!("dbg_print_{}", self.dbg_printers.len()),
+            fn_type,
+            None,
+        );
+        self.dbg_printers.insert(key, func);
+
+        let saved = self.builder.get_insert_block();
+        let entry = self.context.append_basic_block(func, "entry");
+        self.builder.position_at_end(entry);
+        let ptr = func
+            .get_nth_param(0)
+            .ok_or(CompilerError::UnexpectedType)?
+            .into_pointer_value();
+        let base = self.base_custom_type();
+        let tag_ptr = self.builder.build_struct_gep(base, ptr, 1, "variant")?;
+        let tag = self
+            .builder
+            .build_load(self.context.i8_type(), tag_ptr, "tag")?
+            .into_int_value();
+        let ret_block = self.context.append_basic_block(func, "dbg_ret");
+
+        let mut blocks = Vec::new();
+        for (index, _) in custom.variants.iter().enumerate() {
+            let block = self.context.append_basic_block(func, "variant");
+            blocks.push((self.context.i8_type().const_int(index as u64, false), block));
+        }
+        self.builder.build_switch(tag, ret_block, &blocks)?;
+
+        for (index, (variant_name, fields)) in custom.variants.iter().enumerate() {
+            self.builder.position_at_end(blocks[index].1);
+            if fields.is_empty() {
+                self.emit_eprint_cstr(variant_name)?;
+            } else {
+                self.emit_eprint_cstr(&format!("{}(", variant_name))?;
+                let variant_struct = custom_type_variant_struct(
+                    (variant_name.clone(), fields.clone()),
+                    generics.clone(),
+                    self,
+                )?;
+                let payload_ptr = self.builder.build_struct_gep(base, ptr, 2, "payload")?;
+                for (i, (field_name, field_ty)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        self.emit_eprint_cstr(", ")?;
+                    }
+                    self.emit_eprint_cstr(&format!("{}: ", field_name))?;
+                    let resolved = self.resolve_type(field_ty, &generics);
+                    let field_ptr = self.builder.build_struct_gep(
+                        variant_struct,
+                        payload_ptr,
+                        i as u32,
+                        "field",
+                    )?;
+                    match &resolved {
+                        UnitType::Custom { .. } => {
+                            let child = self
+                                .builder
+                                .build_load(ptr_type, field_ptr, "child")?
+                                .into_pointer_value();
+                            let printer = self.get_or_build_dbg_printer(&resolved)?;
+                            // The recursive build repositioned the builder; return here.
+                            self.builder.position_at_end(blocks[index].1);
+                            self.builder.build_call(printer, &[child.into()], "")?;
+                        }
+                        UnitType::Type(_) => self.emit_eprint_cstr("<fn>")?,
+                        UnitType::Var(_) => self.emit_eprint_cstr("<?>")?,
+                        UnitType::Literal(_) => {
+                            let llvm_ty = self.unit_type_to_llvm_type(&resolved)?;
+                            let loaded = self.builder.build_load(llvm_ty, field_ptr, "scalar")?;
+                            self.emit_dbg_scalar(&resolved, loaded)?;
+                        }
+                    }
+                }
+                self.emit_eprint_cstr(")")?;
+            }
+            self.builder.build_unconditional_branch(ret_block)?;
+        }
+
+        self.builder.position_at_end(ret_block);
+        self.builder.build_return(None)?;
+        if let Some(b) = saved {
+            self.builder.position_at_end(b);
+        }
+        Ok(func)
     }
 
     /// Lifts a `\{ ... }` quotation into a fresh top-level LLVM function with the
@@ -853,6 +1096,52 @@ impl<'ctx> CompilerContext<'ctx> {
             AstNodeType::EffectDefinition(_) => Ok(()),
             AstNodeType::Match(cases) => {
                 self.compile_match(scope, cases, stack, module_path, program.type_definition)
+            }
+            AstNodeType::Todo => {
+                let loc = self.build_global_string(format!("{}", program.position))?;
+                let clem_todo = self
+                    .module
+                    .get_function("clem_todo")
+                    .ok_or(CompilerError::GetFunctionError("clem_todo".into()))?;
+                self.builder.build_call(clem_todo, &[loc.into()], "")?;
+                self.builder.build_unreachable()?;
+                Ok(())
+            }
+            AstNodeType::Panic => {
+                let message = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                // Lower the String (List<Char>) message to a C string.
+                let to_cstr = self.module.get_function("clem_string_to_cstr").ok_or(
+                    CompilerError::GetFunctionError("clem_string_to_cstr".into()),
+                )?;
+                let msg = self
+                    .builder
+                    .build_call(to_cstr, &[message.1.into()], "panic_msg")?
+                    .try_as_basic_value()
+                    .left()
+                    .ok_or(CompilerError::UnexpectedType)?;
+                let loc = self.build_global_string(format!("{}", program.position))?;
+                let clem_panic = self
+                    .module
+                    .get_function("clem_panic")
+                    .ok_or(CompilerError::GetFunctionError("clem_panic".into()))?;
+                self.builder
+                    .build_call(clem_panic, &[msg.into(), loc.into()], "")?;
+                self.builder.build_unreachable()?;
+                Ok(())
+            }
+            AstNodeType::Dbg => {
+                // Borrow-only: print the top of the stack, leaving it (and its
+                // refcount) untouched.
+                let value = stack.top().ok_or(CompilerError::StackUnderflow)?.clone();
+                self.emit_dbg(value.0, value.1)?;
+                let newline = self.build_global_string("\n".into())?;
+                let eprint = self
+                    .module
+                    .get_function("clem_eprint_cstr")
+                    .ok_or(CompilerError::GetFunctionError("clem_eprint_cstr".into()))?;
+                self.builder.build_call(eprint, &[newline.into()], "")?;
+                self.tail_position = false;
+                Ok(())
             }
         }
     }
@@ -2433,6 +2722,11 @@ impl<'ctx> Stack<'ctx> {
     /// bottom-most first. Used to read the concrete argument types at a call site.
     fn top_n(&self, n: usize) -> &[(UnitType, BasicValueEnum<'ctx>)] {
         &self.stack[self.stack.len().saturating_sub(n)..]
+    }
+
+    /// The top entry without removing it (used by `dbg`, which only borrows it).
+    fn top(&self) -> Option<&(UnitType, BasicValueEnum<'ctx>)> {
+        self.stack.last()
     }
 
     fn remove_all(&mut self) -> Vec<(UnitType, BasicValueEnum<'ctx>)> {
