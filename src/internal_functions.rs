@@ -346,6 +346,42 @@ pub fn builtins_functions<'ctx>(
             ) as BoxDefinitionType<'ctx>),
         }],
         vec![InternalFunction {
+            name: "rotr".into(),
+            ty: {
+                let var1 = VarType::new();
+                let var2 = VarType::new();
+                let var3 = VarType::new();
+                Type::new(
+                    vec![
+                        UnitType::Var(var1.clone()),
+                        UnitType::Var(var2.clone()),
+                        UnitType::Var(var3.clone()),
+                    ],
+                    vec![
+                        UnitType::Var(var3.clone()),
+                        UnitType::Var(var1.clone()),
+                        UnitType::Var(var2.clone()),
+                    ],
+                )
+            },
+            function: Rc::new(Box::new(
+                |_compiler_context: &mut CompilerContext<'ctx>,
+                 stack: &mut Stack<'ctx>|
+                 -> Result<(), CompilerError> {
+                    let value1 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    let value2 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                    let value3 = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+
+                    // `rotr (a b c -> c a b)`: with `c` on top, the result is
+                    // `[c, a, b]` bottom-to-top. value1=c, value2=b, value3=a.
+                    stack.push(value1.clone());
+                    stack.push(value3.clone());
+                    stack.push(value2.clone());
+                    Ok(())
+                },
+            ) as BoxDefinitionType<'ctx>),
+        }],
+        vec![InternalFunction {
             name: "drop".into(),
             ty: Type::new(vec![UnitType::Var(VarType::new())], vec![]),
             function: Rc::new(Box::new(
