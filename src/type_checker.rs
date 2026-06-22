@@ -3076,4 +3076,31 @@ def main {
             Err(TypeCheckerError::InvalidMatchBody(..))
         ));
     }
+
+    #[test]
+    fn unifier_reconciles_a_variable_constrained_twice() {
+        // Calling `same (a a -> a)` requires both arguments to share a type. When
+        // they arrive as two distinct variables (`b`, `c`), the unifier must
+        // reconcile them (`b := c`) instead of reporting "expected a, got a".
+        let contents = r#"
+            import std::stack(swap drop)
+            defp same (a a -> a) \{ swap drop }
+            defp mk (b c -> a) \{ same }
+        "#;
+        assert!(parse_and_type_check(contents, false).is_ok());
+    }
+
+    #[test]
+    fn unifier_still_rejects_incompatible_constraints() {
+        // Reconciliation must not mask real conflicts: a variable forced to be
+        // both an I64 and a Char still fails.
+        let contents = r#"
+            import std::list
+            import std::number::i64
+            import std::stack(swap drop)
+            defp same (a a -> a) \{ swap drop }
+            defp bad ( -> a) \{ 0i64 'x' same }
+        "#;
+        assert!(parse_and_type_check(contents, false).is_err());
+    }
 }

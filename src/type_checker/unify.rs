@@ -235,6 +235,31 @@ pub(super) fn substitute_unit_type(variable_substitution: &Substitution, ty: Uni
     }
 }
 
+/// Binds `var := ty`. If `var` was already bound to a different type, the two
+/// candidates are themselves *unified* (reconciled) rather than treated as a
+/// hard conflict — this is what lets a parameter variable that is constrained
+/// twice (e.g. `swap (a b -> b a)` applied to two values of the same type, where
+/// `a` must equal both pop slots) succeed by unifying the two, instead of the
+/// spurious "expected a, got a". Genuinely incompatible candidates (e.g. `I64`
+/// vs `String`) still fail inside the recursive unification.
+fn bind_or_reconcile(
+    subst: &mut Substitution,
+    var: &VarType,
+    ty: UnitType,
+    position: &Position,
+) -> Result<(), TypeCheckerError> {
+    if let Some(existent) = subst.types.insert(var.clone(), ty.clone())
+        && existent != ty
+    {
+        subst.extend(validate_types_and_return_variable_substitution(
+            std::slice::from_ref(&existent),
+            std::slice::from_ref(&ty),
+            position.clone(),
+        )?);
+    }
+    Ok(())
+}
+
 pub(super) fn validate_types_and_return_variable_substitution(
     type_stack_1: &[UnitType],
     type_stack_2: &[UnitType],
@@ -249,19 +274,12 @@ pub(super) fn validate_types_and_return_variable_substitution(
             // symmetric; the actual value may be on either side).
             (UnitType::Literal(lit), UnitType::Var(var))
             | (UnitType::Var(var), UnitType::Literal(lit)) => {
-                let existent = variable_substitution
-                    .types
-                    .insert(var.clone(), UnitType::Literal(lit.clone()));
-
-                if let Some(existent) = existent
-                    && existent != UnitType::Literal(lit.clone())
-                {
-                    return Err(TypeCheckerError::TypeConflict(
-                        position,
-                        Box::new(existent),
-                        Box::new(UnitType::Literal(lit.clone())),
-                    ));
-                }
+                bind_or_reconcile(
+                    &mut variable_substitution,
+                    var,
+                    UnitType::Literal(lit.clone()),
+                    &position,
+                )?;
             }
             (
                 UnitType::Custom {
@@ -281,16 +299,7 @@ pub(super) fn validate_types_and_return_variable_substitution(
                     name: name.clone(),
                     generic_types: generic_types.clone(),
                 };
-                let existent = variable_substitution.types.insert(var.clone(), ty.clone());
-                if let Some(existent) = existent
-                    && existent != ty
-                {
-                    return Err(TypeCheckerError::TypeConflict(
-                        position,
-                        Box::new(existent),
-                        Box::new(ty),
-                    ));
-                }
+                bind_or_reconcile(&mut variable_substitution, var, ty, &position)?;
             }
             (
                 UnitType::Custom {
@@ -367,18 +376,12 @@ pub(super) fn validate_types_and_return_variable_substitution(
                 )?);
             }
             (UnitType::Type(ty), UnitType::Var(var)) | (UnitType::Var(var), UnitType::Type(ty)) => {
-                let existent = variable_substitution
-                    .types
-                    .insert(var.clone(), UnitType::Type(ty.clone()));
-                if let Some(existent) = existent
-                    && existent != UnitType::Type(ty.clone())
-                {
-                    return Err(TypeCheckerError::TypeConflict(
-                        position,
-                        Box::new(existent),
-                        Box::new(UnitType::Type(ty.clone())),
-                    ));
-                }
+                bind_or_reconcile(
+                    &mut variable_substitution,
+                    var,
+                    UnitType::Type(ty.clone()),
+                    &position,
+                )?;
             }
             (UnitType::Var(var1), UnitType::Var(var2)) => {
                 // A variable unified with itself carries no information; inserting
@@ -388,18 +391,12 @@ pub(super) fn validate_types_and_return_variable_substitution(
                 if var1 == var2 {
                     continue;
                 }
-                let existent = variable_substitution
-                    .types
-                    .insert(var1.clone(), UnitType::Var(var2.clone()));
-                if let Some(existent) = existent
-                    && existent != UnitType::Var(var2.clone())
-                {
-                    return Err(TypeCheckerError::TypeConflict(
-                        position,
-                        Box::new(existent),
-                        Box::new(UnitType::Var(var2.clone())),
-                    ));
-                }
+                bind_or_reconcile(
+                    &mut variable_substitution,
+                    var1,
+                    UnitType::Var(var2.clone()),
+                    &position,
+                )?;
             }
             (other1, other2) => {
                 return Err(TypeCheckerError::TypeConflict(
