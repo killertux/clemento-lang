@@ -1,0 +1,43 @@
+import std::stack(dup swap touch rot drop2)
+import std::boolean(Boolean True False)
+
+type Pair<v1 v2> {
+    Pair(first v1 second v2)
+}
+
+def first (Pair<v1 v2> -> v1) \{
+    match {
+        Pair(first) -> first
+    }
+}
+
+def first* (Pair<v1 v2> -> v1 Pair<v1 v2> ) \{
+    dup match {
+        Pair(first) -> { first swap }
+    }
+}
+
+def second (Pair<v1 v2> -> v2) \{
+    match {
+        Pair(second) -> second
+    }
+}
+
+def second* (Pair<v1 v2> -> v2 Pair<v1 v2> ) \{
+    dup match {
+        Pair(second) -> { second swap }
+    }
+}
+
+def = (Pair<v1 v2> Pair<v1 v2> (v1 v1 -> Boolean) (v2 v2 -> Boolean) -> Boolean) \{
+    def cmp1 touch
+    def cmp2 touch
+    def pair1 touch
+    def pair2 touch
+    pair1 first pair2 first cmp1 apply match {
+        False -> False
+        True -> {
+            pair1 second pair2 second cmp2 apply
+        }
+    }
+}

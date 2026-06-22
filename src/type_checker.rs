@@ -491,32 +491,42 @@ impl TypeChecker {
                 Type::char(),
             )),
             AstNodeType::SymbolWithPath(symbol) => {
-                let type_definition = scope.get_definition(symbol.clone(), false).ok_or(
-                    TypeCheckerError::SymbolNotFound(symbol.join("::"), node.position.clone(), {
-                        let mut var_t_container = VarTypeToCharContainer::new();
-                        format!(
-                            "<...{}>",
-                            type_stack[type_stack.len().saturating_sub(5)..]
-                                .iter()
-                                .map(|t| t.to_consistent_string(&mut var_t_container))
-                                .collect::<Vec<String>>()
-                                .join(",")
-                        )
-                    }),
-                )?;
+                let (type_definition, freshenable) = scope
+                    .get_definition(symbol.clone(), false)
+                    .ok_or(TypeCheckerError::SymbolNotFound(
+                        symbol.join("::"),
+                        node.position.clone(),
+                        {
+                            let mut var_t_container = VarTypeToCharContainer::new();
+                            format!(
+                                "<...{}>",
+                                type_stack[type_stack.len().saturating_sub(5)..]
+                                    .iter()
+                                    .map(|t| t.to_consistent_string(&mut var_t_container))
+                                    .collect::<Vec<String>>()
+                                    .join(",")
+                            )
+                        },
+                    ))?;
                 // Instantiate with fresh variables for this call (see the
                 // `Symbol` arm); a qualified call to a generic definition needs
-                // per-use type variables just the same.
-                let type_definition = freshen_type(&type_definition, &mut HashMap::new());
-                validate_types_and_return_variable_substitution(
+                // per-use type variables just the same. Value bindings keep their
+                // variables (not freshenable).
+                let type_definition = if freshenable {
+                    freshen_type(&type_definition, &mut HashMap::new())
+                } else {
+                    type_definition
+                };
+                let subst = validate_types_and_return_variable_substitution(
                     &type_stack,
                     &type_definition.pop_types,
                     node.position.clone(),
                 )?;
+                self.function_value_subst.extend(subst.clone());
                 Ok(AstNodeWithType::new(
                     AstNodeType::SymbolWithPath(symbol),
                     node.position.clone(),
-                    substitute_types(&type_stack, type_definition, node.position.clone())?,
+                    apply_substitution(&subst, type_definition),
                 ))
             }
             // `apply` is a builtin whose stack effect depends on the function
@@ -561,19 +571,20 @@ impl TypeChecker {
                 ))
             }
             AstNodeType::Symbol(symbol) => {
-                let type_definition = scope.get_definition(vec![symbol.clone()], false).ok_or(
-                    TypeCheckerError::SymbolNotFound(symbol.clone(), node.position.clone(), {
-                        let mut var_t_container = VarTypeToCharContainer::new();
-                        format!(
-                            "<...{}>",
-                            type_stack[type_stack.len().saturating_sub(5)..]
-                                .iter()
-                                .map(|t| t.to_consistent_string(&mut var_t_container))
-                                .collect::<Vec<String>>()
-                                .join(",")
-                        )
-                    }),
-                )?;
+                let (type_definition, freshenable) =
+                    scope.get_definition(vec![symbol.clone()], false).ok_or(
+                        TypeCheckerError::SymbolNotFound(symbol.clone(), node.position.clone(), {
+                            let mut var_t_container = VarTypeToCharContainer::new();
+                            format!(
+                                "<...{}>",
+                                type_stack[type_stack.len().saturating_sub(5)..]
+                                    .iter()
+                                    .map(|t| t.to_consistent_string(&mut var_t_container))
+                                    .collect::<Vec<String>>()
+                                    .join(",")
+                            )
+                        }),
+                    )?;
 
                 // Instantiate the definition's signature with fresh type
                 // variables for this call. Without this, a generic builtin or
@@ -582,17 +593,32 @@ impl TypeChecker {
                 // such a shared var can alias it to the builtin's, and a later
                 // reuse then collides — producing spurious conflicts / cycles
                 // (e.g. `fold`'s accumulator getting tangled with `rot`'s vars).
-                // `FunctionRef` already freshens; ordinary calls must too.
-                let type_definition = freshen_type(&type_definition, &mut HashMap::new());
-                validate_types_and_return_variable_substitution(
+                // `FunctionRef` already freshens; ordinary calls must too. A value
+                // binding, however, refers to one specific value — keep its
+                // variables (freshening would generalize them and let it be
+                // applied at an unrelated type, e.g. a captured key-comparator
+                // wrongly applied to whole `Pair`s).
+                let type_definition = if freshenable {
+                    freshen_type(&type_definition, &mut HashMap::new())
+                } else {
+                    type_definition
+                };
+                let subst = validate_types_and_return_variable_substitution(
                     &type_stack,
                     &type_definition.pop_types,
                     node.position.clone(),
                 )?;
+                // Record the call's bindings so any function value (`\name` /
+                // `\{ ... }`) passed as an argument has its type concretized by
+                // the back-substitution pass — the same mechanism `apply` uses.
+                // Without this, a quotation passed to a generic higher-order call
+                // (e.g. `fold`) keeps the variables from its own annotation and
+                // can't be monomorphized.
+                self.function_value_subst.extend(subst.clone());
                 Ok(AstNodeWithType::new(
                     AstNodeType::Symbol(symbol),
                     node.position.clone(),
-                    substitute_types(&type_stack, type_definition, node.position.clone())?,
+                    apply_substitution(&subst, type_definition),
                 ))
             }
             AstNodeType::Block(nodes) => {
@@ -615,7 +641,7 @@ impl TypeChecker {
                 ))
             }
             AstNodeType::FunctionRef(symbol) => {
-                let sig = scope.get_definition(symbol.clone(), false).ok_or(
+                let (sig, freshenable) = scope.get_definition(symbol.clone(), false).ok_or(
                     TypeCheckerError::SymbolNotFound(symbol.join("::"), node.position.clone(), {
                         let mut var_t_container = VarTypeToCharContainer::new();
                         format!(
@@ -628,12 +654,17 @@ impl TypeChecker {
                         )
                     }),
                 )?;
-                // Give this occurrence its own type variables; if the reference
-                // is generic its concrete type is resolved later from the
-                // `apply` sites that consume it (or from monomorphization of the
-                // enclosing generic definition).
+                // Give this occurrence its own type variables (unless it refers to
+                // a value binding, whose variables belong to the enclosing scope);
+                // if the reference is generic its concrete type is resolved later
+                // from the `apply` sites that consume it (or from monomorphization
+                // of the enclosing generic definition).
                 let mut remap = HashMap::new();
-                let sig = freshen_type(&sig, &mut remap);
+                let sig = if freshenable {
+                    freshen_type(&sig, &mut remap)
+                } else {
+                    sig
+                };
                 Ok(AstNodeWithType::new(
                     AstNodeType::FunctionRef(symbol),
                     node.position.clone(),
@@ -740,7 +771,9 @@ impl TypeChecker {
                     let body =
                         self.infer_type_definition(scope, type_stack.clone(), *body, module_path)?;
                     let body_ty = body.type_definition.clone();
-                    scope.insert_definition(
+                    // An eager value binding captures a specific value — not a
+                    // freshenable function template.
+                    scope.insert_value_binding(
                         symbol.clone(),
                         Type::new(vec![], body_ty.push_types.clone()),
                         is_private,
@@ -1029,7 +1062,7 @@ impl TypeChecker {
                         Pattern::Wildcard(name) => {
                             let mut scope = TypeScope::with_parent(scope.clone());
                             if let Some(name) = name {
-                                scope.insert_definition(
+                                scope.insert_value_binding(
                                     name.clone(),
                                     Type::new(vec![], vec![match_type.clone()]),
                                     false,
@@ -1305,7 +1338,9 @@ fn bind_pattern(
 ) -> Result<(), TypeCheckerError> {
     match pattern {
         Pattern::Wildcard(Some(alias)) => {
-            scope.insert_definition(alias.clone(), Type::new(vec![], vec![ty.clone()]), false);
+            // A pattern binding names a specific matched value — keep its
+            // variables (not a freshenable template).
+            scope.insert_value_binding(alias.clone(), Type::new(vec![], vec![ty.clone()]), false);
             Ok(())
         }
         Pattern::Wildcard(None) => Ok(()),
@@ -1569,7 +1604,10 @@ struct InnerTypeScope {
     parent: Option<TypeScope>,
     imported: HashMap<String, TypeScope>,
     imported_functions: HashMap<String, (String, String)>,
-    definitions: HashMap<String, (Type, bool)>,
+    // (signature, is_private, freshenable). `freshenable` distinguishes a
+    // polymorphic function template (instantiate fresh per call) from a value
+    // binding (keep its variables, which belong to the enclosing scope).
+    definitions: HashMap<String, (Type, bool, bool)>,
     type_definitions: HashMap<String, CustomType>,
     /// Declared effects (`effect IO`), keyed by their last name segment and
     /// mapping to the canonical fully-qualified path (e.g. `IO` →
@@ -1598,9 +1636,25 @@ impl TypeScope {
         }
     }
 
+    /// Inserts a polymorphic *function* definition (a `def`/`defx`/variant/
+    /// builtin). Its signature is a template, instantiated with fresh type
+    /// variables at each call site (`freshenable = true`).
     fn insert_definition(&mut self, symbol: String, definition: Type, is_private: bool) {
         let mut inner = self.inner.borrow_mut();
-        inner.definitions.insert(symbol, (definition, is_private));
+        inner
+            .definitions
+            .insert(symbol, (definition, is_private, true));
+    }
+
+    /// Inserts a *value* binding (an eager `def x { ... }` capture, or a pattern
+    /// binding). It refers to one specific value, so its type variables belong to
+    /// the enclosing scope and must NOT be freshened — freshening would
+    /// generalize them and let the value be used at an unrelated type.
+    fn insert_value_binding(&mut self, symbol: String, definition: Type, is_private: bool) {
+        let mut inner = self.inner.borrow_mut();
+        inner
+            .definitions
+            .insert(symbol, (definition, is_private, false));
     }
 
     fn insert_import(&mut self, symbol: String, scope: TypeScope) {
@@ -1679,7 +1733,13 @@ impl TypeScope {
             .insert(function_alias, (function_name, module));
     }
 
-    fn get_definition(&self, mut symbol: Vec<String>, filter_private: bool) -> Option<Type> {
+    /// Returns the definition's signature and whether it is `freshenable` (a
+    /// polymorphic function template, vs a value binding).
+    fn get_definition(
+        &self,
+        mut symbol: Vec<String>,
+        filter_private: bool,
+    ) -> Option<(Type, bool)> {
         match symbol.len() {
             1 => {
                 let inner = self.inner.borrow();
@@ -1688,20 +1748,15 @@ impl TypeScope {
                     .expect("We checked for the symbol size")
                     .clone();
 
-                if let Some(from_definitions) =
-                    inner
-                        .definitions
-                        .get(&last)
-                        .cloned()
-                        .and_then(|definitions| {
-                            let (def, is_private) = definitions;
-                            if is_private && filter_private {
-                                None
-                            } else {
-                                Some(def)
-                            }
-                        })
-                {
+                if let Some(from_definitions) = inner.definitions.get(&last).cloned().and_then(
+                    |(def, is_private, freshenable)| {
+                        if is_private && filter_private {
+                            None
+                        } else {
+                            Some((def, freshenable))
+                        }
+                    },
+                ) {
                     return Some(from_definitions);
                 }
                 if let Some(imported_functions) = inner.imported_functions.get(&last) {
@@ -1731,7 +1786,7 @@ impl TypeScope {
                     let first_private = inner
                         .definitions
                         .get(&first)
-                        .map(|(_, is_private)| *is_private)
+                        .map(|(_, is_private, _)| *is_private)
                         .unwrap_or(false);
                     if first_private && filter_private {
                         return None;

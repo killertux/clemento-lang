@@ -4,6 +4,13 @@ type Boolean {
     False True
 }
 
+def not (Boolean -> Boolean) \{
+    match {
+        True -> False
+        False -> True
+    }
+}
+
 def && (Boolean Boolean -> Boolean) \{
     match {
         True -> touch

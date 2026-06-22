@@ -1,32 +1,187 @@
-import std::number::i64(-)
-import std::stack(rot)
+import std::number::i64(- + * gt gte)
+import std::stack(rot rotr dup dup2 drop drop2 swap touch)
+import std::option(Option None Some)
+import std::cmp(Less Greater Equal Ordering)
+import std::pair(Pair first first* second)
+import std::boolean(True False)
+import std::list(List)
 
-type Pair<k v> {
-    Pair(key k, value v)
-}
+defp delta 3
 
-type Tree<k v> {
+type Map<k v> {
     Empty(cmp (k k -> Ordering))
-    Node(cmp (k k -> Ordering) left Tree<k v> right Tree<k v> pair Pair<k v> size I64)
+    Node(cmp (k k -> Ordering) left Map<k v> right Map<k v> pair Pair<k v> size I64)
 }
 
-defp size (Tree<k v> -> I64) \{
+defp size (Map<k v> -> I64) \{
     match {
         Empty -> 0
         Node(size as n_size) -> n_size
     }
 }
 
-defp node ((k k -> Ordering) Tree<k v> Tree<k v> Pair<k v> -> Tree<k v>) \{
+defp node ((k k -> Ordering) Map<k v> Map<k v> Pair<k v> -> Map<k v>) \{
     rot
+    dup
+    def right touch
+    rot
+    dup
+    def left touch
+    rot
+    left size right size 1 + +
+    Node
 }
 
+defp rotate_right (Map<k v> -> Map<k v>) \{
+    dup match {
+        Empty -> touch
+        Node(cmp left right pair) -> {
+            left match {
+                Empty -> touch
+                Node(left as inner_left right as inner_right pair as inner_pair) -> {
+                    drop
+                    cmp inner_right right pair node
+                    cmp inner_left rot inner_pair node
+                }
+            }
+        }
+    }
+}
 
-// def insert (Tree<k v> k v -> Tree<k v>) {
-//     rot match {
-//         Empty(cmp) -> { }
-//         Node(cmp height left right key value) -> {
+defp rotate_left (Map<k v> -> Map<k v>) \{
+    dup match {
+        Empty -> touch
+        Node(cmp left right pair) -> {
+            right match {
+                Empty -> touch
+                Node(left as inner_left right as inner_right pair as inner_pair) -> {
+                    drop
+                    cmp inner_left left pair node
+                    cmp swap inner_right inner_pair node
+                }
+            }
+        }
+    }
+}
 
-//         }
-//     }
-// }
+defp balance_left (Map<k v> -> Map<k v>) \{
+    dup match {
+        Empty -> touch
+        Node(cmp left right pair) -> {
+            right match {
+                Empty -> True
+                Node(left as rl right as rr) -> {
+                    rr size rl size gte
+                }
+            }
+            match {
+                True -> {
+                    rotate_left
+                }
+                False -> {
+                    drop right rotate_right
+                    cmp left rot pair node rotate_left
+                }
+            }
+        }
+    }
+}
+
+defp balance_right (Map<k v> -> Map<k v>) \{
+    dup match {
+        Empty -> touch
+        Node(cmp left right pair) -> {
+            left match {
+                Empty -> True
+                Node(left as ll right as lr) -> {
+                    ll size lr size gte
+                }
+            }
+            match {
+                True -> {
+                    rotate_right
+                }
+                False -> {
+                    drop left rotate_left
+                    cmp swap right pair node rotate_right
+                }
+            }
+        }
+    }
+}
+
+defp balance (Map<k v> -> Map<k v>) \{
+    dup match {
+        Empty -> touch
+        Node(left right) -> {
+            left size right size
+            dup2 delta * gt match {
+                True -> { drop2 balance_left}
+                False -> {
+                    swap delta * gt match {
+                        True -> balance_right
+                        False -> touch
+                    }
+                }
+            }
+        }
+    }
+}
+
+def get (Map<k v> k -> Option<v>) \{
+    swap match {
+        Empty -> { drop None }
+        Node(cmp left right pair) -> {
+            dup pair first cmp apply match {
+                Equal  -> { drop pair second Some }
+                Less   -> { left swap get }
+                Greater -> { right swap get }
+            }
+        }
+    }
+}
+
+def insert (Map<k v> k v -> Map<k v>) \{
+    rot match {
+        Empty(cmp) -> {
+            def empty { cmp Empty }
+            Pair
+            cmp empty rot empty swap node
+        }
+        Node(cmp left right pair) -> {
+            swap dup pair first cmp apply match {
+                Less -> {
+                    swap left rotr insert
+                    cmp swap right pair node balance
+                }
+                Greater -> {
+                    swap right rotr insert
+                    cmp left rot pair node balance
+                }
+                Equal -> {
+                    drop2
+                    cmp left right pair node
+                }
+            }
+        }
+    }
+}
+
+def from_pair_list (List<Pair<k v>> (k k -> Ordering) -> Map<k v>) \{
+    Empty \{ first* second insert } list::fold
+}
+
+def into_pair_list (Map<k v> -> List<Pair<k v>>) \{
+    defp internal_into_pair_list (Map<k v> List<Pair<k v>> -> List<Pair<k v>>) \{
+        swap match {
+            Empty -> touch
+            Node(left right pair) -> {
+                right swap internal_into_pair_list
+                pair List
+                left swap internal_into_pair_list
+            }
+        }
+    }
+
+    list::Empty internal_into_pair_list
+}
