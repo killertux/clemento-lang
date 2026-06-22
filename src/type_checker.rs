@@ -1149,11 +1149,14 @@ fn check_branch_body_consistency(
     body_type: &Type,
     position: &Position,
 ) -> Result<(), TypeCheckerError> {
-    // Arms must agree on their stack effect (pop/push); they may differ in
-    // *effects* — those are unioned into the match's overall effect row.
+    // Arms must agree on their stack effect (pop/push). The comparison is up to
+    // a consistent renaming of free type variables: an arm whose type was
+    // inferred through a generic call (a recursive generic function, or a generic
+    // constructor like `Some`) gets independent variable identities, so it is
+    // *alpha-equivalent* to — but not byte-identical with — the other arms.
+    // (Arms may differ in effects; those are unioned into the match's effect row.)
     if let Some(existing) = pattern_body_type
-        && (existing.pop_types != body_type.pop_types
-            || existing.push_types != body_type.push_types)
+        && !types_alpha_equivalent(existing, body_type)
     {
         return Err(TypeCheckerError::InvalidMatchBody(
             Box::new(existing.clone()),
@@ -1162,6 +1165,81 @@ fn check_branch_body_consistency(
         ));
     }
     Ok(())
+}
+
+/// Whether two types describe the same stack transformation (pop/push) up to a
+/// consistent bijective renaming of type variables. Effects are ignored — match
+/// arms union their effects separately.
+fn types_alpha_equivalent(a: &Type, b: &Type) -> bool {
+    if a.pop_types.len() != b.pop_types.len() || a.push_types.len() != b.push_types.len() {
+        return false;
+    }
+    // One bijection shared across pop *and* push, so `(a -> a)` and `(a -> b)`
+    // stay distinct.
+    let mut forward: HashMap<VarType, VarType> = HashMap::new();
+    let mut backward: HashMap<VarType, VarType> = HashMap::new();
+    a.pop_types
+        .iter()
+        .zip(&b.pop_types)
+        .chain(a.push_types.iter().zip(&b.push_types))
+        .all(|(x, y)| unit_alpha_equivalent(x, y, &mut forward, &mut backward))
+}
+
+fn unit_alpha_equivalent(
+    a: &UnitType,
+    b: &UnitType,
+    forward: &mut HashMap<VarType, VarType>,
+    backward: &mut HashMap<VarType, VarType>,
+) -> bool {
+    match (a, b) {
+        (UnitType::Literal(x), UnitType::Literal(y)) => x == y,
+        (UnitType::Var(x), UnitType::Var(y)) => {
+            // Require a consistent bijection: x always maps to y and vice versa.
+            let fwd_ok = match forward.get(x) {
+                Some(mapped) => mapped == y,
+                None => {
+                    forward.insert(x.clone(), y.clone());
+                    true
+                }
+            };
+            let bwd_ok = match backward.get(y) {
+                Some(mapped) => mapped == x,
+                None => {
+                    backward.insert(y.clone(), x.clone());
+                    true
+                }
+            };
+            fwd_ok && bwd_ok
+        }
+        (
+            UnitType::Custom {
+                name: n1,
+                generic_types: g1,
+            },
+            UnitType::Custom {
+                name: n2,
+                generic_types: g2,
+            },
+        ) => {
+            n1 == n2
+                && g1.len() == g2.len()
+                && g1
+                    .iter()
+                    .zip(g2)
+                    .all(|(x, y)| unit_alpha_equivalent(x, y, forward, backward))
+        }
+        (UnitType::Type(t1), UnitType::Type(t2)) => {
+            t1.pop_types.len() == t2.pop_types.len()
+                && t1.push_types.len() == t2.push_types.len()
+                && t1
+                    .pop_types
+                    .iter()
+                    .zip(&t2.pop_types)
+                    .chain(t1.push_types.iter().zip(&t2.push_types))
+                    .all(|(x, y)| unit_alpha_equivalent(x, y, forward, backward))
+        }
+        _ => false,
+    }
 }
 
 type TypeDefinitions = HashMap<Vec<String>, CustomType>;
@@ -2907,6 +2985,25 @@ def main {
         // `effect IO` is a valid pure declaration.
         let contents = r#"
             effect IO
+        "#;
+        assert!(parse_and_type_check(contents, false).is_ok());
+    }
+
+    #[test]
+    fn match_arms_with_alpha_equivalent_generic_results() {
+        // Each arm produces `Option<a>`, but through different generic paths
+        // (`Some` vs the recursive `id`), so the arm types are alpha-equivalent
+        // but not byte-identical. Match-arm consistency must accept them.
+        let contents = r#"
+            import std::list
+            import std::option(Option None Some)
+            import std::stack(drop)
+            def id (Option<a> -> Option<a>) \{
+                match {
+                    Some(value) -> { value Some }
+                    None        -> { None }
+                }
+            }
         "#;
         assert!(parse_and_type_check(contents, false).is_ok());
     }
