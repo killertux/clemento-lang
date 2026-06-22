@@ -1243,7 +1243,12 @@ impl<'ctx> CompilerContext<'ctx> {
                     Ok(self.context.ptr_type(AddressSpace::default()).into())
                 }
             },
-            UnitType::Var(_) => todo!("Handle variatic types"),
+            // An unconstrained generic that survived monomorphization (e.g. the
+            // value type of an empty `Map<I64, v>` that is never populated). No
+            // concrete value of this type is ever produced, so the code handling
+            // it is dead — we only need a consistent, valid lowering. Use an
+            // opaque pointer, the same representation as boxed/`Custom` values.
+            UnitType::Var(_) => Ok(self.context.ptr_type(AddressSpace::default()).into()),
             // A function value is an opaque code pointer.
             UnitType::Type(_) => Ok(self.context.ptr_type(AddressSpace::default()).into()),
             UnitType::Custom { .. } => Ok(self.context.ptr_type(AddressSpace::default()).into()),
