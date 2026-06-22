@@ -540,11 +540,15 @@ impl<'ctx> CompilerContext<'ctx> {
     }
 
     /// Returns (building on first use) the `dbg` printer for a concrete custom
-    /// type. The function takes the value pointer and prints
-    /// `Variant(field: value, ...)` (no parens for field-less variants) to stderr,
-    /// recursing into pointer fields via their own printers. It is inserted into
-    /// the cache *before* its body is built, so recursive/mutually-recursive types
-    /// resolve to a call back into the (in-progress) function.
+    /// type. The function takes the value pointer and prints a representation to
+    /// stderr. It is inserted into the cache *before* its body is built, so
+    /// recursive/mutually-recursive types resolve to a call back into the
+    /// (in-progress) function.
+    ///
+    /// `std::list::List` gets two special renderings: a `List<Char>` (a string)
+    /// prints as `"the string"`, and any other `List<a>` as `[ e1 e2 ... en]`.
+    /// Every other type prints generically as `Variant(field: value, ...)` (no
+    /// parens for field-less variants).
     fn get_or_build_dbg_printer(
         &mut self,
         ty: &UnitType,
@@ -580,6 +584,32 @@ impl<'ctx> CompilerContext<'ctx> {
         self.dbg_printers.insert(key, func);
 
         let saved = self.builder.get_insert_block();
+        let is_list = name.as_slice() == ["std", "list", "List"];
+        let element_is_char = matches!(
+            generic_types.first(),
+            Some(UnitType::Literal(LiteralType::Char))
+        );
+        if is_list && element_is_char {
+            self.build_dbg_string_body(func)?;
+        } else if is_list {
+            self.build_dbg_list_body(func, &custom, &generics)?;
+        } else {
+            self.build_dbg_variant_body(func, &custom, &generics)?;
+        }
+        if let Some(b) = saved {
+            self.builder.position_at_end(b);
+        }
+        Ok(func)
+    }
+
+    /// Generic printer body: `Variant(field: value, ...)`, one switch arm per
+    /// variant; field-less variants print just their name.
+    fn build_dbg_variant_body(
+        &mut self,
+        func: FunctionValue<'ctx>,
+        custom: &CustomType,
+        generics: &HashMap<VarType, UnitType>,
+    ) -> Result<(), CompilerError> {
         let entry = self.context.append_basic_block(func, "entry");
         self.builder.position_at_end(entry);
         let ptr = func
@@ -602,7 +632,8 @@ impl<'ctx> CompilerContext<'ctx> {
         self.builder.build_switch(tag, ret_block, &blocks)?;
 
         for (index, (variant_name, fields)) in custom.variants.iter().enumerate() {
-            self.builder.position_at_end(blocks[index].1);
+            let home = blocks[index].1;
+            self.builder.position_at_end(home);
             if fields.is_empty() {
                 self.emit_eprint_cstr(variant_name)?;
             } else {
@@ -618,32 +649,14 @@ impl<'ctx> CompilerContext<'ctx> {
                         self.emit_eprint_cstr(", ")?;
                     }
                     self.emit_eprint_cstr(&format!("{}: ", field_name))?;
-                    let resolved = self.resolve_type(field_ty, &generics);
+                    let resolved = self.resolve_type(field_ty, generics);
                     let field_ptr = self.builder.build_struct_gep(
                         variant_struct,
                         payload_ptr,
                         i as u32,
                         "field",
                     )?;
-                    match &resolved {
-                        UnitType::Custom { .. } => {
-                            let child = self
-                                .builder
-                                .build_load(ptr_type, field_ptr, "child")?
-                                .into_pointer_value();
-                            let printer = self.get_or_build_dbg_printer(&resolved)?;
-                            // The recursive build repositioned the builder; return here.
-                            self.builder.position_at_end(blocks[index].1);
-                            self.builder.build_call(printer, &[child.into()], "")?;
-                        }
-                        UnitType::Type(_) => self.emit_eprint_cstr("<fn>")?,
-                        UnitType::Var(_) => self.emit_eprint_cstr("<?>")?,
-                        UnitType::Literal(_) => {
-                            let llvm_ty = self.unit_type_to_llvm_type(&resolved)?;
-                            let loaded = self.builder.build_load(llvm_ty, field_ptr, "scalar")?;
-                            self.emit_dbg_scalar(&resolved, loaded)?;
-                        }
-                    }
+                    self.emit_dbg_value_at(field_ptr, &resolved, home)?;
                 }
                 self.emit_eprint_cstr(")")?;
             }
@@ -652,10 +665,152 @@ impl<'ctx> CompilerContext<'ctx> {
 
         self.builder.position_at_end(ret_block);
         self.builder.build_return(None)?;
-        if let Some(b) = saved {
-            self.builder.position_at_end(b);
+        Ok(())
+    }
+
+    /// `List<Char>` printer body: renders the list as a quoted string,
+    /// `"contents"`, reusing the runtime's `clem_string_to_cstr`.
+    fn build_dbg_string_body(&mut self, func: FunctionValue<'ctx>) -> Result<(), CompilerError> {
+        let entry = self.context.append_basic_block(func, "entry");
+        self.builder.position_at_end(entry);
+        let ptr = func
+            .get_nth_param(0)
+            .ok_or(CompilerError::UnexpectedType)?
+            .into_pointer_value();
+        self.emit_eprint_cstr("\"")?;
+        let to_cstr = self.module.get_function("clem_string_to_cstr").ok_or(
+            CompilerError::GetFunctionError("clem_string_to_cstr".into()),
+        )?;
+        let cstr = self
+            .builder
+            .build_call(to_cstr, &[ptr.into()], "cstr")?
+            .try_as_basic_value()
+            .left()
+            .ok_or(CompilerError::UnexpectedType)?;
+        let eprint = self
+            .module
+            .get_function("clem_eprint_cstr")
+            .ok_or(CompilerError::GetFunctionError("clem_eprint_cstr".into()))?;
+        self.builder.build_call(eprint, &[cstr.into()], "")?;
+        self.emit_eprint_cstr("\"")?;
+        self.builder.build_return(None)?;
+        Ok(())
+    }
+
+    /// `List<a>` (a ≠ Char) printer body: renders `[ e1 e2 ... en]` by walking
+    /// the `next` chain at runtime, printing each `element` via its own printer.
+    fn build_dbg_list_body(
+        &mut self,
+        func: FunctionValue<'ctx>,
+        custom: &CustomType,
+        generics: &HashMap<VarType, UnitType>,
+    ) -> Result<(), CompilerError> {
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let base = self.base_custom_type();
+        let i8 = self.context.i8_type();
+
+        // The cons variant is the one carrying fields (`List`); `Empty` has none.
+        let cons_idx = custom
+            .variants
+            .iter()
+            .position(|(_, f)| !f.is_empty())
+            .ok_or(CompilerError::UnexpectedType)?;
+        let (cons_name, cons_fields) = custom.variants[cons_idx].clone();
+        let variant_struct =
+            custom_type_variant_struct((cons_name, cons_fields.clone()), generics.clone(), self)?;
+        let next_i = cons_fields
+            .iter()
+            .position(|(n, _)| n == "next")
+            .ok_or(CompilerError::UnexpectedType)? as u32;
+        let elem_i = cons_fields
+            .iter()
+            .position(|(n, _)| n == "element")
+            .ok_or(CompilerError::UnexpectedType)? as u32;
+        let elem_ty = self.resolve_type(&cons_fields[elem_i as usize].1, generics);
+        let cons_tag = i8.const_int(cons_idx as u64, false);
+
+        let entry = self.context.append_basic_block(func, "entry");
+        self.builder.position_at_end(entry);
+        let head = func
+            .get_nth_param(0)
+            .ok_or(CompilerError::UnexpectedType)?
+            .into_pointer_value();
+        self.emit_eprint_cstr("[")?;
+
+        let check = self.context.append_basic_block(func, "list_check");
+        let body = self.context.append_basic_block(func, "list_body");
+        let done = self.context.append_basic_block(func, "list_done");
+        self.builder.build_unconditional_branch(check)?;
+
+        self.builder.position_at_end(check);
+        let cur = self.builder.build_phi(ptr_type, "cur")?;
+        cur.add_incoming(&[(&head, entry)]);
+        let cur_ptr = cur.as_basic_value().into_pointer_value();
+        let tag_ptr = self.builder.build_struct_gep(base, cur_ptr, 1, "tag")?;
+        let tag = self
+            .builder
+            .build_load(i8, tag_ptr, "tag")?
+            .into_int_value();
+        let is_cons =
+            self.builder
+                .build_int_compare(inkwell::IntPredicate::EQ, tag, cons_tag, "is_cons")?;
+        self.builder.build_conditional_branch(is_cons, body, done)?;
+
+        self.builder.position_at_end(body);
+        self.emit_eprint_cstr(" ")?;
+        let payload_ptr = self.builder.build_struct_gep(base, cur_ptr, 2, "payload")?;
+        let elem_ptr =
+            self.builder
+                .build_struct_gep(variant_struct, payload_ptr, elem_i, "elem_ptr")?;
+        self.emit_dbg_value_at(elem_ptr, &elem_ty, body)?;
+        let next_ptr =
+            self.builder
+                .build_struct_gep(variant_struct, payload_ptr, next_i, "next_ptr")?;
+        let next = self
+            .builder
+            .build_load(ptr_type, next_ptr, "next")?
+            .into_pointer_value();
+        // Element printing is straight-line in this block (recursive printers are
+        // separate functions), so the back-edge originates from `body`.
+        cur.add_incoming(&[(&next, body)]);
+        self.builder.build_unconditional_branch(check)?;
+
+        self.builder.position_at_end(done);
+        self.emit_eprint_cstr("]")?;
+        self.builder.build_return(None)?;
+        Ok(())
+    }
+
+    /// Loads the value at `field_ptr` (of resolved type `resolved`) and prints it
+    /// to stderr; custom-typed values recurse through their own printer. `home`
+    /// is the block to resume in after a recursive printer build repositions the
+    /// builder. Shared by the variant and list printer bodies.
+    fn emit_dbg_value_at(
+        &mut self,
+        field_ptr: PointerValue<'ctx>,
+        resolved: &UnitType,
+        home: inkwell::basic_block::BasicBlock<'ctx>,
+    ) -> Result<(), CompilerError> {
+        match resolved {
+            UnitType::Custom { .. } => {
+                let ptr_type = self.context.ptr_type(AddressSpace::default());
+                let child = self
+                    .builder
+                    .build_load(ptr_type, field_ptr, "child")?
+                    .into_pointer_value();
+                let printer = self.get_or_build_dbg_printer(resolved)?;
+                self.builder.position_at_end(home);
+                self.builder.build_call(printer, &[child.into()], "")?;
+            }
+            UnitType::Type(_) => self.emit_eprint_cstr("<fn>")?,
+            UnitType::Var(_) => self.emit_eprint_cstr("<?>")?,
+            UnitType::Literal(_) => {
+                let llvm_ty = self.unit_type_to_llvm_type(resolved)?;
+                let loaded = self.builder.build_load(llvm_ty, field_ptr, "scalar")?;
+                self.emit_dbg_scalar(resolved, loaded)?;
+            }
         }
-        Ok(func)
+        Ok(())
     }
 
     /// Lifts a `\{ ... }` quotation into a fresh top-level LLVM function with the
