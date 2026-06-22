@@ -579,13 +579,15 @@ impl<'ctx> CompilerContext<'ctx> {
                     // `tail_position` stays set across the call so `call_function`
                     // can see it; clear it afterwards so it never leaks to a
                     // sibling word.
-                    scope.call_symbol(vec![symbol], self, program.type_definition, stack)?;
+                    let ty = concretize_call_type(&program.type_definition, stack);
+                    scope.call_symbol(vec![symbol], self, ty, stack)?;
                 }
                 self.tail_position = false;
                 Ok(())
             }
             AstNodeType::SymbolWithPath(symbol) => {
-                scope.call_symbol(symbol, self, program.type_definition, stack)?;
+                let ty = concretize_call_type(&program.type_definition, stack);
+                scope.call_symbol(symbol, self, ty, stack)?;
                 self.tail_position = false;
                 Ok(())
             }
@@ -2201,6 +2203,38 @@ fn bind_generics(template: &UnitType, concrete: &UnitType, map: &mut HashMap<Var
     }
 }
 
+/// Resolves a call's signature to the concrete monomorphic instance to invoke,
+/// using the actual types of the arguments on the stack rather than the node's
+/// annotated type. The type checker may leave free type variables in a call
+/// node's type (each call site is instantiated with fresh variables), but at
+/// codegen the operands on the stack are concrete — so binding the signature's
+/// pop types against them yields the concrete instance. Without this, a generic
+/// recursive call (e.g. `fold` calling itself) would dispatch to an
+/// un-monomorphized generic instance.
+fn concretize_call_type(node_ty: &Type, stack: &Stack) -> Type {
+    let args = stack.top_n(node_ty.pop_types.len());
+    let mut map = HashMap::new();
+    for (template, (concrete, _)) in node_ty.pop_types.iter().zip(args) {
+        bind_generics(template, concrete, &mut map);
+    }
+    if map.is_empty() {
+        return node_ty.clone();
+    }
+    Type::with_effects(
+        node_ty
+            .pop_types
+            .iter()
+            .map(|t| substitute_unit(t, &map))
+            .collect(),
+        node_ty
+            .push_types
+            .iter()
+            .map(|t| substitute_unit(t, &map))
+            .collect(),
+        node_ty.effects.clone(),
+    )
+}
+
 /// Rewrites every `type_definition` in an AST subtree with `map`, used to
 /// concretize a generic definition's body for a monomorphic instance. Reuses
 /// [`substitute_unit`], which recurses through function and custom types.
@@ -2393,6 +2427,12 @@ impl<'ctx> Stack<'ctx> {
 
     fn pop_n(&mut self, n: usize) -> Vec<(UnitType, BasicValueEnum<'ctx>)> {
         self.stack.split_off(self.stack.len().saturating_sub(n))
+    }
+
+    /// The top `n` entries (the arguments a call about to run will consume),
+    /// bottom-most first. Used to read the concrete argument types at a call site.
+    fn top_n(&self, n: usize) -> &[(UnitType, BasicValueEnum<'ctx>)] {
+        &self.stack[self.stack.len().saturating_sub(n)..]
     }
 
     fn remove_all(&mut self) -> Vec<(UnitType, BasicValueEnum<'ctx>)> {
