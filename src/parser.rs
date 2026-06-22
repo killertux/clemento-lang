@@ -120,6 +120,21 @@ impl<'a> Parser<'a> {
                     "type" => self.parse_custom_type(token.position),
                     "effect" => self.parse_effect(token.position),
                     "match" => self.parse_match(token.position),
+                    "todo" => Ok(Some(AstNode {
+                        node_type: AstNodeType::Todo,
+                        position: token.position,
+                        type_definition: None,
+                    })),
+                    "panic" => Ok(Some(AstNode {
+                        node_type: AstNodeType::Panic,
+                        position: token.position,
+                        type_definition: None,
+                    })),
+                    "dbg" => Ok(Some(AstNode {
+                        node_type: AstNodeType::Dbg,
+                        position: token.position,
+                        type_definition: None,
+                    })),
                     _ => Ok(Some(AstNode {
                         node_type: AstNodeType::Symbol(symbol),
                         position: token.position,

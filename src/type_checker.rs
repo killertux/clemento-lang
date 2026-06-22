@@ -185,6 +185,12 @@ pub struct AstNodeWithType {
     pub node_type: AstNodeType<AstNodeWithType>,
     pub position: Position,
     pub type_definition: Type,
+    /// Whether control never falls through this node (`todo`/`panic`, a block
+    /// ending in one, or a `match` whose every arm diverges). A diverging node
+    /// satisfies any declared signature and is compatible with any sibling
+    /// `match` arm — the type system stops constraining its (unreachable) stack
+    /// effect. It carries no runtime meaning beyond the `unreachable` codegen.
+    pub diverges: bool,
 }
 
 impl Display for AstNodeWithType {
@@ -203,6 +209,21 @@ impl AstNodeWithType {
             node_type,
             position,
             type_definition,
+            diverges: false,
+        }
+    }
+
+    /// Like `new`, but marks the node as diverging (never falls through).
+    pub fn new_diverging(
+        node_type: AstNodeType<AstNodeWithType>,
+        position: Position,
+        type_definition: Type,
+    ) -> Self {
+        Self {
+            node_type,
+            position,
+            type_definition,
+            diverges: true,
         }
     }
 }
@@ -282,12 +303,16 @@ impl TypeChecker {
         // definitions.
         let pop_empty = block_type_check_result.pop_types.is_empty();
         let push = &block_type_check_result.push_types;
+        // A program ending in `todo`/`panic` never reaches its end, so whatever it
+        // leaves on the (unreachable) stack is irrelevant.
+        let block_diverges = nodes_with_types.iter().any(|n| n.diverges);
         let valid = match scope_kind {
             ScopeKind::Entry => {
-                pop_empty
-                    && (push.is_empty()
-                        || push.as_slice()
-                            == [UnitType::Literal(LiteralType::Number(NumberType::I32))])
+                block_diverges
+                    || pop_empty
+                        && (push.is_empty()
+                            || push.as_slice()
+                                == [UnitType::Literal(LiteralType::Number(NumberType::I32))])
             }
             ScopeKind::Module => {
                 pop_empty && push.is_empty() && block_type_check_result.effects.is_empty()
@@ -634,11 +659,24 @@ impl TypeChecker {
                     module_path,
                     false,
                 )?;
-                Ok(AstNodeWithType::new(
-                    AstNodeType::Block(nodes),
-                    node.position.clone(),
-                    substitute_types(&type_stack, ty, node.position.clone())?,
-                ))
+                // Linear control flow: the block diverges if any of its words does
+                // (everything after is unreachable). Propagated so an enclosing
+                // `def`/`match` arm can treat the whole block as diverging.
+                let diverges = nodes.iter().any(|n| n.diverges);
+                let block_type = substitute_types(&type_stack, ty, node.position.clone())?;
+                Ok(if diverges {
+                    AstNodeWithType::new_diverging(
+                        AstNodeType::Block(nodes),
+                        node.position.clone(),
+                        block_type,
+                    )
+                } else {
+                    AstNodeWithType::new(
+                        AstNodeType::Block(nodes),
+                        node.position.clone(),
+                        block_type,
+                    )
+                })
             }
             AstNodeType::FunctionRef(symbol) => {
                 let (sig, freshenable) = scope.get_definition(symbol.clone(), false).ok_or(
@@ -948,6 +986,41 @@ impl TypeChecker {
                 node.position.clone(),
                 module_path,
             ),
+            // `todo`: diverges, pure, no stack constraint. Its empty `( -> )` is
+            // a stand-in; divergence lets it satisfy any declared signature.
+            AstNodeType::Todo => Ok(AstNodeWithType::new_diverging(
+                AstNodeType::Todo,
+                node.position.clone(),
+                Type::new(vec![], vec![]),
+            )),
+            // `panic`: pops the message `String` (= List<Char>), diverges, and
+            // performs the `std::panic::Panic` effect (canonical path).
+            AstNodeType::Panic => Ok(AstNodeWithType::new_diverging(
+                AstNodeType::Panic,
+                node.position.clone(),
+                Type::with_effects(
+                    vec![UnitType::Custom {
+                        name: vec!["std".into(), "list".into(), "List".into()],
+                        generic_types: vec![UnitType::Literal(LiteralType::Char)],
+                    }],
+                    vec![],
+                    vec![Effect::Named(vec![
+                        "std".into(),
+                        "panic".into(),
+                        "Panic".into(),
+                    ])],
+                ),
+            )),
+            // `dbg`: `<a>(a -> a)` identity. A fresh variable unifies with the
+            // stack top, so it leaves the stack unchanged and is pure.
+            AstNodeType::Dbg => {
+                let a = UnitType::Var(VarType::new());
+                Ok(AstNodeWithType::new(
+                    AstNodeType::Dbg,
+                    node.position.clone(),
+                    Type::new(vec![a.clone()], vec![a]),
+                ))
+            }
         }?;
         Ok(match node.type_definition.clone() {
             Some(ty) => {
@@ -958,13 +1031,17 @@ impl TypeChecker {
                 )?;
                 let push_types = substituted.push_types;
 
-                if validate_types_and_return_variable_substitution(
-                    &ty.push_types,
-                    &push_types,
-                    node.position.clone(),
-                )
-                .is_err()
-                    || inferred_type.type_definition.pop_types.len() != ty.pop_types.len()
+                // A diverging body never falls through, so its (unreachable) stack
+                // effect is unconstrained: accept the declared signature verbatim.
+                // Effects are still checked — a `panic` body must declare `!Panic`.
+                if !inferred_type.diverges
+                    && (validate_types_and_return_variable_substitution(
+                        &ty.push_types,
+                        &push_types,
+                        node.position.clone(),
+                    )
+                    .is_err()
+                        || inferred_type.type_definition.pop_types.len() != ty.pop_types.len())
                 {
                     return Err(TypeCheckerError::TypeConflict(
                         node.position.clone(),
@@ -976,7 +1053,12 @@ impl TypeChecker {
                 // declared effect row (`!*` permits anything). The node's type then
                 // carries the *declared* effects — what callers see.
                 check_effects_declared(&substituted.effects, &ty.effects, &node.position)?;
-                AstNodeWithType::new(inferred_type.node_type, node.position, ty)
+                AstNodeWithType {
+                    node_type: inferred_type.node_type,
+                    position: node.position,
+                    type_definition: ty,
+                    diverges: inferred_type.diverges,
+                }
             }
             None => inferred_type,
         })
@@ -1016,6 +1098,10 @@ impl TypeChecker {
         let mut pattern_body_type = None;
         // Union of every arm's effects — the match's overall effect row.
         let mut match_effects: Vec<Effect> = Vec::new();
+        // The match diverges only if *every* arm does; a diverging arm is excluded
+        // from the common-type reconciliation (its unreachable stack effect can be
+        // anything), so the value-producing arms alone fix the result type.
+        let mut all_diverge = true;
         match &match_type {
             UnitType::Literal(LiteralType::Number(_)) => {
                 let len = cases.len();
@@ -1044,11 +1130,14 @@ impl TypeChecker {
                                 body_type.type_definition,
                                 position.clone(),
                             )?;
-                            let refined = check_branch_body_consistency(
-                                &pattern_body_type,
-                                &body_type.type_definition,
-                                &position,
-                            )?;
+                            if !body_type.diverges {
+                                pattern_body_type = Some(check_branch_body_consistency(
+                                    &pattern_body_type,
+                                    &body_type.type_definition,
+                                    &position,
+                                )?);
+                            }
+                            all_diverge = all_diverge && body_type.diverges;
                             result_cases.push(Case {
                                 pattern: case.pattern,
                                 body: Box::new(body_type.clone()),
@@ -1057,7 +1146,6 @@ impl TypeChecker {
                                 match_effects,
                                 body_type.type_definition.effects.clone(),
                             );
-                            pattern_body_type = Some(refined);
                         }
                         Pattern::Wildcard(name) => {
                             let mut scope = TypeScope::with_parent(scope.clone());
@@ -1079,11 +1167,14 @@ impl TypeChecker {
                                 body_type.type_definition,
                                 position.clone(),
                             )?;
-                            let refined = check_branch_body_consistency(
-                                &pattern_body_type,
-                                &body_type.type_definition,
-                                &position,
-                            )?;
+                            if !body_type.diverges {
+                                pattern_body_type = Some(check_branch_body_consistency(
+                                    &pattern_body_type,
+                                    &body_type.type_definition,
+                                    &position,
+                                )?);
+                            }
+                            all_diverge = all_diverge && body_type.diverges;
                             result_cases.push(Case {
                                 pattern: case.pattern,
                                 body: Box::new(body_type.clone()),
@@ -1092,7 +1183,6 @@ impl TypeChecker {
                                 match_effects,
                                 body_type.type_definition.effects.clone(),
                             );
-                            pattern_body_type = Some(refined);
                         }
                         other => {
                             return Err(TypeCheckerError::InvalidPatternForType(
@@ -1118,6 +1208,7 @@ impl TypeChecker {
                         pattern_body_type.map(|t| t.push_types).unwrap_or(vec![]),
                         match_effects,
                     ),
+                    diverges: all_diverge,
                 })
             }
             UnitType::Custom { .. } => {
@@ -1151,18 +1242,20 @@ impl TypeChecker {
                         body_type.type_definition,
                         position.clone(),
                     )?;
-                    let refined = check_branch_body_consistency(
-                        &pattern_body_type,
-                        &body_type.type_definition,
-                        &position,
-                    )?;
+                    if !body_type.diverges {
+                        pattern_body_type = Some(check_branch_body_consistency(
+                            &pattern_body_type,
+                            &body_type.type_definition,
+                            &position,
+                        )?);
+                    }
+                    all_diverge = all_diverge && body_type.diverges;
                     result_cases.push(Case {
                         pattern: case.pattern,
                         body: Box::new(body_type.clone()),
                     });
                     match_effects =
                         merge_effects(match_effects, body_type.type_definition.effects.clone());
-                    pattern_body_type = Some(refined);
                 }
                 // Exhaustiveness: a fresh catch-all arm must be redundant (usefulness check).
                 let top_patterns: Vec<Pattern> = cases.iter().map(|c| c.pattern.clone()).collect();
@@ -1189,6 +1282,7 @@ impl TypeChecker {
                         pattern_body_type.map(|t| t.push_types).unwrap_or(vec![]),
                         match_effects,
                     ),
+                    diverges: all_diverge,
                 })
             }
             other => Err(TypeCheckerError::InvalidMatchType(other.clone(), position)),
@@ -3205,5 +3299,72 @@ def main {
             }
         "#;
         assert!(parse_and_type_check(contents, false).is_ok());
+    }
+
+    #[test]
+    fn todo_satisfies_any_declared_signature() {
+        // A `todo` body diverges, so it type-checks against any declared stack
+        // effect and stays pure (no effect).
+        let contents = r#"
+            import std::number::i64
+            def double (I64 -> I64) \{ todo }
+        "#;
+        let result = parse_and_type_check(contents, false).expect("should type-check");
+        assert!(!result.contains('!'), "todo must stay pure, got: {result}");
+    }
+
+    #[test]
+    fn panic_diverging_arm_is_consistent_with_value_arm() {
+        // An `unwrap`: the diverging `None` arm (it `panic`s) is compatible with
+        // the value-producing `Some` arm, so the match unifies to `I64`.
+        let contents = r#"
+            import std::list
+            import std::panic
+            import std::option(Option None Some)
+            def unwrap (Option<I64> -> I64 !panic::Panic) \{
+                match {
+                    Some(value) -> value
+                    None        -> { "none" panic }
+                }
+            }
+        "#;
+        assert!(parse_and_type_check(contents, false).is_ok());
+    }
+
+    #[test]
+    fn panic_without_declared_effect_is_rejected() {
+        // `panic` performs `!std::panic::Panic`; a typed function body that uses
+        // it must declare the effect (or `!*`).
+        let contents = r#"
+            import std::list
+            import std::number::i64
+            def f (I64 -> I64) \{ "boom" panic }
+        "#;
+        assert!(matches!(
+            parse_and_type_check(contents, false),
+            Err(TypeCheckerError::UndeclaredEffect(..))
+        ));
+    }
+
+    #[test]
+    fn panic_wildcard_effect_is_accepted() {
+        // `!*` permits the panic effect.
+        let contents = r#"
+            import std::list
+            import std::number::i64
+            def f (I64 -> I64 !*) \{ "boom" panic }
+        "#;
+        assert!(parse_and_type_check(contents, false).is_ok());
+    }
+
+    #[test]
+    fn dbg_is_identity() {
+        // `dbg` leaves the stack unchanged: `(I64 -> I64)`.
+        let contents = r#"
+            import std::number::i64
+            def f (I64 -> I64) \{ dbg }
+        "#;
+        let result = parse_and_type_check(contents, false).expect("should type-check");
+        assert!(!result.contains('!'), "dbg must stay pure, got: {result}");
     }
 }

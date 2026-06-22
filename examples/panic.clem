@@ -1,0 +1,18 @@
+import std::list
+import std::io
+import std::panic
+import std::number::i64
+import std::option(Some None Option)
+
+// `panic` aborts with a message popped from the stack plus the source location.
+// It carries the `!panic::Panic` effect, so any non-entry function that may
+// panic must declare it (here, `unwrap`). The entry program may panic freely.
+def unwrap (Option<I64> -> I64 !panic::Panic) \{
+    match {
+        Some(value) -> value
+        None        -> { "called unwrap on a None value" panic }
+    }
+}
+
+42 option::Some unwrap i64::to_string io::println
+option::None unwrap i64::to_string io::println

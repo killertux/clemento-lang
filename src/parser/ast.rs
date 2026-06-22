@@ -38,6 +38,17 @@ pub enum AstNodeType<T> {
     /// it never reaches codegen. Defining it changes nothing on the stack.
     EffectDefinition(String),
     Match(Vec<Case<T>>),
+    /// `todo`: an unimplemented-code placeholder. Type-checks against any required
+    /// stack effect (diverges) and is pure; at runtime it aborts with a message
+    /// citing its source location.
+    Todo,
+    /// `panic`: pops a `String` message, type-checks like `todo` (diverges), and
+    /// carries the `!std::panic::Panic` effect; at runtime it aborts printing the
+    /// message and its source location.
+    Panic,
+    /// `dbg`: `<a>(a -> a)` identity that eprintln's a representation of the top
+    /// of the stack. Pure (a debug escape hatch).
+    Dbg,
 }
 
 impl<T> AstNodeType<T> {
@@ -251,6 +262,9 @@ where
                 write!(f, "{}", case_str.join(" "))?;
                 write!(f, "}}")
             }
+            AstNodeType::Todo => write!(f, "todo"),
+            AstNodeType::Panic => write!(f, "panic"),
+            AstNodeType::Dbg => write!(f, "dbg"),
         }
     }
 }

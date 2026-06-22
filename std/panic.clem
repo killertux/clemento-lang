@@ -1,0 +1,6 @@
+// The effect performed by the `panic` keyword. A function that may `panic`
+// must declare it (or `!*`); the entry program may panic freely. After
+// `import std::panic`, name the effect by its import alias: `!panic::Panic`
+// (the same convention as `!io::IO`). `panic`/`todo`/`dbg` are language
+// keywords, not functions — this module exists only to name the effect.
+effect Panic

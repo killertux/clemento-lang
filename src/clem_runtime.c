@@ -131,6 +131,27 @@ int clem_putchar_err(int c) {
     return putc(c, stderr);
 }
 
+// --- `todo` / `panic` / `dbg` support -------------------------------------
+// The language keywords `todo` and `panic` abort the program after reporting a
+// source location (and, for panic, a user message). `dbg` prints a value's
+// representation to stderr; the compiler emits the structure, these helpers
+// emit the leaves.
+
+void clem_todo(const char *loc) {
+    fprintf(stderr, "Not implemented code at %s\n", loc);
+    exit(1);
+}
+
+void clem_panic(const char *msg, const char *loc) {
+    fprintf(stderr, "panic: %s at %s\n", msg, loc);
+    exit(1);
+}
+
+void clem_eprint_cstr(const char *s) { fputs(s, stderr); }
+void clem_eprint_i64(int64_t v) { fprintf(stderr, "%lld", (long long)v); }
+void clem_eprint_u64(uint64_t v) { fprintf(stderr, "%llu", (unsigned long long)v); }
+void clem_eprint_f64(double v) { fprintf(stderr, "%g", v); }
+
 // List<Char> payload accessors, used by the string helpers below.
 static void *cons_next(const void *node) {
     void *next;
