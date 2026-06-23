@@ -1,4 +1,4 @@
-import std::number::i64(- + * gt gte)
+import std::number::i64(- + * gt lt)
 import std::stack(rot rotr dup dup2 drop drop2 swap touch)
 import std::option(Option None Some)
 import std::cmp(Less Greater Equal Ordering)
@@ -7,6 +7,7 @@ import std::boolean(True False)
 import std::list(List)
 
 defp delta 3
+defp ratio 2
 
 type Map<k v> {
     Empty(cmp (k k -> Ordering))
@@ -56,7 +57,7 @@ defp rotate_left (Map<k v> -> Map<k v>) \{
                 Empty -> touch
                 Node(left as inner_left right as inner_right pair as inner_pair) -> {
                     drop
-                    cmp inner_left left pair node
+                    cmp left inner_left pair node
                     cmp swap inner_right inner_pair node
                 }
             }
@@ -71,7 +72,7 @@ defp balance_left (Map<k v> -> Map<k v>) \{
             right match {
                 Empty -> True
                 Node(left as rl right as rr) -> {
-                    rr size rl size gte
+                    rl size ratio rr size * lt
                 }
             }
             match {
@@ -94,7 +95,7 @@ defp balance_right (Map<k v> -> Map<k v>) \{
             left match {
                 Empty -> True
                 Node(left as ll right as lr) -> {
-                    ll size lr size gte
+                    lr size ratio ll size * lt
                 }
             }
             match {
@@ -115,12 +116,17 @@ defp balance (Map<k v> -> Map<k v>) \{
         Empty -> touch
         Node(left right) -> {
             left size right size
-            dup2 delta * gt match {
-                True -> { drop2 balance_left}
+            dup2 + 2 lt match {
+                True -> { drop2 touch }
                 False -> {
-                    swap delta * gt match {
-                        True -> balance_right
-                        False -> touch
+                    dup2 delta * gt match {
+                        True -> { drop2 balance_right }
+                        False -> {
+                            swap delta * gt match {
+                                True -> balance_left
+                                False -> touch
+                            }
+                        }
                     }
                 }
             }

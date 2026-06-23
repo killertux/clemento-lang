@@ -6,7 +6,7 @@ import std::number::i64
 import std::pair
 import std::boolean(True False)
 import std::string
-import std::stack(swap dup)
+import std::stack(swap dup drop)
 
 defp assert_some (option::Option<I64> I64 -> !io::IO) \{
     swap match {
@@ -27,24 +27,49 @@ defp assert_none (option::Option<I64> -> !io::IO) \{
     }
 }
 
-// Numeric key from an empty map
-\i64::cmp map::Empty 0 map::get assert_none
-
-// From a list of numeric pairs
-[ {1 2 pair::Pair } { 2 3 pair::Pair } { 3 4 pair::Pair } ] \i64::cmp map::from_pair_list
-dup 1 map::get 2 assert_some
-dup 2 map::get 3 assert_some
-dup 3 map::get 4 assert_some
-dup 4 map::get assert_none
-
-// Map into list
 defp eq \{
     \i64::= \i64::= pair::=
 }
 
+// A numeric key from an empty map.
+\i64::cmp map::Empty 0 map::get assert_none
+
+// Ascending inserts force left rotations all the way up; every key must still
+// be retrievable (the tree stays an ordered, balanced search tree).
+[ { 1 1 pair::Pair } { 2 2 pair::Pair } { 3 3 pair::Pair } { 4 4 pair::Pair }
+  { 5 5 pair::Pair } { 6 6 pair::Pair } { 7 7 pair::Pair } ] \i64::cmp map::from_pair_list
+dup 1 map::get 1 assert_some
+dup 2 map::get 2 assert_some
+dup 3 map::get 3 assert_some
+dup 4 map::get 4 assert_some
+dup 5 map::get 5 assert_some
+dup 6 map::get 6 assert_some
+dup 7 map::get 7 assert_some
+dup 8 map::get assert_none
+// An in-order traversal of the balanced tree returns the pairs sorted by key.
 map::into_pair_list
-[ {1 2 pair::Pair } { 2 3 pair::Pair } { 3 4 pair::Pair } ]
+[ { 1 1 pair::Pair } { 2 2 pair::Pair } { 3 3 pair::Pair } { 4 4 pair::Pair }
+  { 5 5 pair::Pair } { 6 6 pair::Pair } { 7 7 pair::Pair } ]
 \eq list::= match {
-    False -> { "The lists did not match" io::println }
-    True -> { "The list matched" io::println }
+    False -> { "Ascending traversal did not match" io::println }
+    True -> { "Ascending traversal matched" io::println }
 }
+
+// Descending inserts force right rotations; same retrieval guarantee.
+[ { 7 7 pair::Pair } { 6 6 pair::Pair } { 5 5 pair::Pair } { 4 4 pair::Pair }
+  { 3 3 pair::Pair } { 2 2 pair::Pair } { 1 1 pair::Pair } ] \i64::cmp map::from_pair_list
+dup 1 map::get 1 assert_some
+dup 4 map::get 4 assert_some
+dup 7 map::get 7 assert_some
+dup 0 map::get assert_none
+drop
+
+// A zig-zag order exercises double rotations.
+[ { 5 5 pair::Pair } { 1 1 pair::Pair } { 4 4 pair::Pair } { 2 2 pair::Pair }
+  { 3 3 pair::Pair } ] \i64::cmp map::from_pair_list
+dup 1 map::get 1 assert_some
+dup 2 map::get 2 assert_some
+dup 3 map::get 3 assert_some
+dup 4 map::get 4 assert_some
+dup 5 map::get 5 assert_some
+drop

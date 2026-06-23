@@ -293,6 +293,7 @@ impl<'ctx> CompilerContext<'ctx> {
                 for (index, variant) in ty.variants.into_iter().enumerate() {
                     let (_, block) = blocks[index];
                     self.builder.position_at_end(block);
+                    let fields = variant.1.clone();
                     let variant_type =
                         custom_type_variant_struct(variant, generics_map.clone(), self)?;
                     if variant_type.count_fields() > 0 {
@@ -303,24 +304,32 @@ impl<'ctx> CompilerContext<'ctx> {
                             "payload_ptr",
                         )?;
 
-                        for field in 0..variant_type.count_fields() {
-                            match variant_type.get_field_type_at_index(field) {
-                                Some(BasicTypeEnum::PointerType(pointer_ty)) => {
-                                    let field_ptr = self.builder.build_struct_gep(
-                                        variant_type,
-                                        payload_ptr,
-                                        field,
-                                        "field",
-                                    )?;
-                                    let field_value = self.builder.build_load(
-                                        BasicTypeEnum::PointerType(pointer_ty),
-                                        field_ptr,
-                                        "field_value",
-                                    )?;
-                                    self.build_pool_free(field_value.into_pointer_value())?;
-                                }
-                                Some(_) => {}
-                                None => {}
+                        for (field, (_, field_ty)) in fields.iter().enumerate() {
+                            // Only reference-counted heap children (custom types)
+                            // are pool-allocated and must be freed. A pointer-typed
+                            // field that is NOT a custom type — notably a function
+                            // value (`UnitType::Type`, e.g. a comparator) — is not a
+                            // pool allocation; freeing it corrupts the allocator.
+                            let resolved = match field_ty {
+                                UnitType::Var(v) => generics_map
+                                    .get(v)
+                                    .cloned()
+                                    .unwrap_or_else(|| field_ty.clone()),
+                                other => other.clone(),
+                            };
+                            if matches!(resolved, UnitType::Custom { .. }) {
+                                let field_ptr = self.builder.build_struct_gep(
+                                    variant_type,
+                                    payload_ptr,
+                                    field as u32,
+                                    "field",
+                                )?;
+                                let field_value = self.builder.build_load(
+                                    self.context.ptr_type(AddressSpace::default()),
+                                    field_ptr,
+                                    "field_value",
+                                )?;
+                                self.build_pool_free(field_value.into_pointer_value())?;
                             }
                         }
                     }
