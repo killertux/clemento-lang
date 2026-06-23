@@ -2219,7 +2219,9 @@ impl<'ctx> CompilerContext<'ctx> {
             .ok_or(CompilerError::IfWithoutFunction)?;
         let merge_block = self.context.append_basic_block(current_function, "merge");
         match match_value.0.clone() {
-            UnitType::Literal(LiteralType::Number(_)) => {
+            // `Char` lowers to an i32 code point, so it shares the integer-switch
+            // path with numeric literals.
+            UnitType::Literal(LiteralType::Number(_) | LiteralType::Char) => {
                 let mut case_blocks = Vec::new();
                 let mut values_and_blocks = Vec::new();
                 for (index, _) in cases.iter().enumerate() {
@@ -2234,6 +2236,7 @@ impl<'ctx> CompilerContext<'ctx> {
                         Pattern::Number(n) => {
                             Ok(self.number_to_llvm_number(n.clone()).1.into_int_value())
                         }
+                        Pattern::Char(c) => Ok(self.context.i32_type().const_int(*c as u64, false)),
                         _ => Err(CompilerError::UnsupportedPattern),
                     })
                     .zip(case_blocks[0..case_blocks.len() - 1].iter().cloned())
@@ -2247,7 +2250,7 @@ impl<'ctx> CompilerContext<'ctx> {
                 for (index, case) in cases.into_iter().enumerate() {
                     let mut temp_stack = stack.clone();
                     match case.pattern {
-                        Pattern::Number(_) => {
+                        Pattern::Number(_) | Pattern::Char(_) => {
                             self.builder.position_at_end(case_blocks[index]);
                             let n_push_types = case.body.type_definition.push_types.len();
                             self.tail_position = outer_tail;
@@ -2296,6 +2299,16 @@ impl<'ctx> CompilerContext<'ctx> {
                 }
                 stack.pop_n(match_type.pop_types.len());
                 self.builder.position_at_end(merge_block);
+                // No arm falls through to the merge (every arm diverged or
+                // tail-call back-edged). The merge is dead: terminate it with
+                // `unreachable` and stop, rather than building a value-producing
+                // phi the caller would treat as a live edge. (At type level the
+                // match may "produce" a value, but a tail-recursive arm reaches
+                // the merge only at type level, not in codegen.)
+                if values_and_blocks.is_empty() {
+                    self.builder.build_unreachable()?;
+                    return Ok(());
+                }
                 // INVARIANT: every arm pushes the same number of values, each of
                 // the same LLVM type, in the same order. This is guaranteed by the
                 // type checker (TypeCheckerError::InvalidMatchBody rejects arms whose
@@ -2363,6 +2376,16 @@ impl<'ctx> CompilerContext<'ctx> {
 
                 stack.pop_n(match_type.pop_types.len() - 1);
                 self.builder.position_at_end(merge_block);
+                // No arm falls through to the merge (every arm diverged or
+                // tail-call back-edged). The merge is dead: terminate it with
+                // `unreachable` and stop, rather than building a value-producing
+                // phi (and a scrutinee release) the caller would treat as a live
+                // edge — that yields a phi whose incoming-block count disagrees
+                // with the merge's predecessors, which LLVM rejects.
+                if values_and_blocks.is_empty() {
+                    self.builder.build_unreachable()?;
+                    return Ok(());
+                }
                 // INVARIANT: every arm pushes the same number of values, each of the
                 // same LLVM type, in the same order (guaranteed by the type checker
                 // via InvalidMatchBody), so one phi per position is sound.

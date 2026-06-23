@@ -1,0 +1,17 @@
+import std::list
+import std::io
+import std::stack(drop)
+
+// `match` works on `Char` scrutinees: each arm is a char literal, with a
+// mandatory trailing wildcard (chars cannot be exhaustively enumerated).
+def classify (Char -> String) \{
+    match {
+        '#' -> "comment"
+        ' ' -> "space"
+        * -> "other"
+    }
+}
+
+'#' classify io::println
+' ' classify io::println
+'a' classify io::println

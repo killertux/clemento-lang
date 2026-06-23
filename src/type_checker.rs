@@ -1116,7 +1116,7 @@ impl TypeChecker {
         // anything), so the value-producing arms alone fix the result type.
         let mut all_diverge = true;
         match &match_type {
-            UnitType::Literal(LiteralType::Number(_)) => {
+            UnitType::Literal(LiteralType::Number(_) | LiteralType::Char) => {
                 let len = cases.len();
                 let mut result_cases = Vec::with_capacity(len);
                 for (pos, case) in cases.clone().into_iter().enumerate() {
@@ -1129,6 +1129,45 @@ impl TypeChecker {
                                 return Err(TypeCheckerError::InvalidPatternForType(
                                     Box::new(match_type.clone()),
                                     Box::new(Pattern::Number(number_pattern.clone())),
+                                    position.clone(),
+                                ));
+                            }
+                            let mut body_type = self.infer_type_definition(
+                                scope,
+                                type_stack_without_last_element.clone(),
+                                *case.body,
+                                module_path.clone(),
+                            )?;
+                            body_type.type_definition = substitute_types(
+                                type_stack_without_last_element,
+                                body_type.type_definition,
+                                position.clone(),
+                            )?;
+                            if !body_type.diverges {
+                                pattern_body_type = Some(check_branch_body_consistency(
+                                    &pattern_body_type,
+                                    &body_type.type_definition,
+                                    &position,
+                                )?);
+                            }
+                            all_diverge = all_diverge && body_type.diverges;
+                            result_cases.push(Case {
+                                pattern: case.pattern,
+                                body: Box::new(body_type.clone()),
+                            });
+                            match_effects = merge_effects(
+                                match_effects,
+                                body_type.type_definition.effects.clone(),
+                            );
+                        }
+                        Pattern::Char(_) => {
+                            // The scrutinee is already known to be `Char` (outer
+                            // guard), and a char literal pattern only matches a
+                            // `Char`, so no pattern/type check is needed.
+                            if match_type != UnitType::Literal(LiteralType::Char) {
+                                return Err(TypeCheckerError::InvalidPatternForType(
+                                    Box::new(match_type.clone()),
+                                    Box::new(case.pattern.clone()),
                                     position.clone(),
                                 ));
                             }
@@ -2377,6 +2416,39 @@ def main {
             result,
             "Invalid match body at 4:20. Expected ( -> std::list::List<Char>) but got ( -> I64)"
         );
+    }
+
+    #[test]
+    fn match_on_char_type_checks() {
+        let contents = r#"
+            import std::boolean(Boolean True False)
+
+            def is_hash (Char -> Boolean) \{
+                match {
+                    '#' -> True
+                    * -> False
+                }
+            }
+        "#;
+        let result = parse_and_type_check(contents, false);
+        assert!(result.is_ok(), "{:?}", result);
+    }
+
+    #[test]
+    fn match_on_char_without_wildcard_is_rejected() {
+        let contents = r#"
+            import std::boolean(Boolean True False)
+
+            def is_hash (Char -> Boolean) \{
+                match {
+                    '#' -> True
+                }
+            }
+        "#;
+        let result = parse_and_type_check(contents, false)
+            .unwrap_err()
+            .to_string();
+        assert!(result.starts_with("Missing wildcard match"), "{}", result);
     }
 
     #[test]

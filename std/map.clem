@@ -173,6 +173,10 @@ def insert (Map<k v> k v -> Map<k v>) \{
     }
 }
 
+def insert_pair (Map<k v> Pair<k v> -> Map<k v>) \{
+    first* second insert
+}
+
 def from_pair_list (List<Pair<k v>> (k k -> Ordering) -> Map<k v>) \{
     Empty \{ first* second insert } list::fold
 }

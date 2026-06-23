@@ -1,6 +1,26 @@
 import std::list
 import std::string
 import std::char
-import std::stack(drop)
+import std::stack(drop swap)
+import std::cmp
+import std::boolean
+import std::io
 
+defp assert_true (boolean::Boolean String -> !io::IO) \{
+    swap match {
+        True -> { drop "Expected value!" io::println }
+        False -> { "Assertion error! " io::print io::println }
+    }
+}
+
+// Split
 "The lazy fox jumps over brown dog" \{ ' ' char::= } string::split dbg drop
+
+// cmp
+
+"" "" string::cmp cmp::Equal cmp::= "Should be Equal" assert_true
+"a" "" string::cmp cmp::Greater cmp::= "Should be Greater" assert_true
+"" "a" string::cmp cmp::Less cmp::= "Should be Less" assert_true
+"a" "a" string::cmp cmp::Equal cmp::= "Should be Equal" assert_true
+"a" "b" string::cmp cmp::Less cmp::= "Should be Less" assert_true
+"b" "a" string::cmp cmp::Greater cmp::= "Should be Greater" assert_true

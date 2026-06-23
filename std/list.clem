@@ -1,5 +1,6 @@
 import std::stack(dup swap rot rotr drop touch)
 import std::boolean(Boolean True False &&)
+import std::cmp(Ordering)
 
 type List<a> {
     Empty
@@ -39,4 +40,23 @@ def fold (List<a> b (b a -> b) -> b) \{
 
 def rev (List<a> -> List<a>) \{
     Empty \{ List } fold
+}
+
+def cmp (List<a> List<a> (a a -> Ordering) -> Ordering) \{
+    rotr swap match {
+        Empty -> match {
+            Empty -> { drop cmp::Equal }
+            List  -> { drop cmp::Less }
+        }
+        List(next as l1 element as e1) -> match {
+            Empty -> { drop cmp::Greater }
+            List(next as l2 element as e2) -> {
+                dup e1 e2 rot apply match {
+                    cmp::Less -> { drop cmp::Less }
+                    cmp::Greater -> { drop cmp::Greater }
+                    cmp::Equal -> { l1 l2 rot cmp }
+                }
+            }
+        }
+    }
 }

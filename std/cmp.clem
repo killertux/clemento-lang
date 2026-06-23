@@ -1,5 +1,24 @@
+import std::boolean(Boolean True False)
+
 type Ordering {
     Less
     Equal
     Greater
+}
+
+def = (Ordering Ordering -> Boolean) \{
+    match {
+        Less -> match {
+            Less -> True
+            *    -> False
+        }
+        Equal -> match {
+            Equal -> True
+            *     -> False
+        }
+        Greater -> match {
+            Greater -> True
+            *       -> False
+        }
+    }
 }

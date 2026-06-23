@@ -101,6 +101,112 @@ mod tests {
     }
 
     #[test]
+    fn lex_char_hex_escape() {
+        let input = r#"'\x20'"#;
+        let mut lexer = Lexer::new(input, None);
+        assert_eq!(
+            lexer.next(),
+            Some(Ok(Token {
+                token_type: TokenType::Char(' '),
+                position: Position::new(1, 1, None),
+            }))
+        );
+    }
+
+    #[test]
+    fn lex_char_hex_escape_uppercase() {
+        let input = r#"'\x4A'"#;
+        let mut lexer = Lexer::new(input, None);
+        assert_eq!(
+            lexer.next(),
+            Some(Ok(Token {
+                token_type: TokenType::Char('J'),
+                position: Position::new(1, 1, None),
+            }))
+        );
+    }
+
+    #[test]
+    fn lex_string_hex_escape() {
+        let input = r#""\x48i\x21""#;
+        let mut lexer = Lexer::new(input, None);
+        assert_eq!(
+            lexer.next(),
+            Some(Ok(Token {
+                token_type: TokenType::String("Hi!".to_string()),
+                position: Position::new(1, 1, None),
+            }))
+        );
+    }
+
+    #[test]
+    fn lex_char_multibyte_hex_escape() {
+        // 0xC2 0xA0 is the UTF-8 encoding of U+00A0 (no-break space).
+        let input = r#"'\xc2\xa0'"#;
+        let mut lexer = Lexer::new(input, None);
+        assert_eq!(
+            lexer.next(),
+            Some(Ok(Token {
+                token_type: TokenType::Char('\u{a0}'),
+                position: Position::new(1, 1, None),
+            }))
+        );
+    }
+
+    #[test]
+    fn lex_string_multibyte_hex_escape() {
+        // 0xE2 0x82 0xAC is the UTF-8 encoding of U+20AC (€).
+        let input = r#""\xe2\x82\xac""#;
+        let mut lexer = Lexer::new(input, None);
+        assert_eq!(
+            lexer.next(),
+            Some(Ok(Token {
+                token_type: TokenType::String("€".to_string()),
+                position: Position::new(1, 1, None),
+            }))
+        );
+    }
+
+    #[test]
+    fn lex_char_too_many_code_points() {
+        let input = r#"'\x41\x42'"#;
+        let mut lexer = Lexer::new(input, None);
+        assert_eq!(
+            lexer.next(),
+            Some(Err(LexerError::UnexpectedToken(
+                "'AB'".to_string(),
+                Position::new(1, 1, None)
+            )))
+        );
+    }
+
+    #[test]
+    fn lex_char_invalid_utf8() {
+        let input = r#"'\xff'"#;
+        let mut lexer = Lexer::new(input, None);
+        assert_eq!(
+            lexer.next(),
+            Some(Err(LexerError::UnexpectedToken(
+                r#"'\xff'"#.to_string(),
+                Position::new(1, 1, None)
+            )))
+        );
+    }
+
+    #[test]
+    fn lex_char_hex_escape_invalid_digit() {
+        let input = r#"'\xZ0'"#;
+        let mut lexer = Lexer::new(input, None);
+        assert_eq!(
+            lexer.next(),
+            Some(Err(LexerError::UnexpectedToken(
+                r#"\xZ"#.to_string(),
+                Position::new(1, 3, None)
+            )))
+        );
+    }
+
+    #[test]
     fn lex_parentheses() {
         let input = r#"(Hello)"#;
         let lexer = Lexer::new(input, None);

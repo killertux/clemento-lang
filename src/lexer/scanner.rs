@@ -86,83 +86,105 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn lex_char(&mut self) -> Result<Option<Token>, LexerError> {
-        let position = Position::new(self.line, self.column, self.path.clone());
-        let value = match self.advance() {
-            Some('\\') => match self.advance() {
-                Some('\\') => '\\',
-                Some('\'') => '\'',
-                Some('"') => '"',
-                Some('n') => '\n',
-                Some('t') => '\t',
-                Some('r') => '\r',
-                Some('0') => '\0',
+    /// Reads the two hex digits of a `\xHH` byte escape and returns the raw
+    /// byte. The leading `\x` has already been consumed. A multi-byte code
+    /// point is written as a run of `\x` escapes (its UTF-8 encoding) and
+    /// decoded by the caller once the whole literal is collected.
+    fn lex_hex_byte(&mut self) -> Result<u8, LexerError> {
+        let mut value: u32 = 0;
+        for _ in 0..2 {
+            let position = Position::new(self.line, self.column, self.path.clone());
+            match self.advance() {
+                Some(c) if c.is_ascii_hexdigit() => {
+                    value = value * 16 + c.to_digit(16).expect("checked is_ascii_hexdigit");
+                }
                 Some(c) => {
-                    return Err(LexerError::UnexpectedToken(
-                        format!("\\{}", c),
-                        Position::new(self.line, self.column - 1, self.path.clone()),
-                    ));
+                    return Err(LexerError::UnexpectedToken(format!("\\x{}", c), position));
                 }
-                None => {
-                    return Err(LexerError::UnexpectedEndOfInput(Position::new(
-                        self.line,
-                        self.column,
-                        self.path.clone(),
-                    )));
-                }
-            },
-            Some('\'') => {
-                return Err(LexerError::UnexpectedToken("''".into(), position));
+                None => return Err(LexerError::UnexpectedEndOfInput(position)),
             }
-            Some(c) => c,
-            None => return Err(LexerError::UnexpectedEndOfInput(position)),
-        };
+        }
+        Ok(value as u8)
+    }
+
+    /// Reads the escape sequence following an already-consumed `\` and returns
+    /// the byte it denotes (simple escapes, or a `\xHH` byte).
+    fn lex_escape_byte(&mut self) -> Result<u8, LexerError> {
         match self.advance() {
-            Some('\'') => Ok(Some(Token {
-                token_type: TokenType::Char(value),
-                position,
-            })),
+            Some('\\') => Ok(b'\\'),
+            Some('\'') => Ok(b'\''),
+            Some('"') => Ok(b'"'),
+            Some('n') => Ok(b'\n'),
+            Some('t') => Ok(b'\t'),
+            Some('r') => Ok(b'\r'),
+            Some('0') => Ok(b'\0'),
+            Some('x') => self.lex_hex_byte(),
             Some(c) => Err(LexerError::UnexpectedToken(
-                c.to_string(),
-                Position::new(self.line, self.column, self.path.clone()),
+                format!("\\{}", c),
+                Position::new(self.line, self.column - 1, self.path.clone()),
             )),
-            None => Err(LexerError::UnexpectedEndOfInput(position)),
+            None => Err(LexerError::UnexpectedEndOfInput(Position::new(
+                self.line,
+                self.column,
+                self.path.clone(),
+            ))),
         }
     }
 
-    fn lex_string(&mut self) -> Result<Option<Token>, LexerError> {
-        let mut string = String::new();
+    fn lex_char(&mut self) -> Result<Option<Token>, LexerError> {
         let position = Position::new(self.line, self.column, self.path.clone());
+        // Collect the literal's raw UTF-8 bytes until the closing quote, then
+        // decode them as a single code point. A multi-byte char is written as a
+        // run of `\x` byte escapes, e.g. '\xc2\xa0' = U+00A0 (no-break space).
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 4];
+        loop {
+            match self.advance() {
+                Some('\'') => break,
+                Some('\\') => bytes.push(self.lex_escape_byte()?),
+                Some(c) => bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes()),
+                None => return Err(LexerError::UnexpectedEndOfInput(position)),
+            }
+        }
+        let text = std::str::from_utf8(&bytes).map_err(|_| {
+            LexerError::UnexpectedToken(format!("'{}'", format_hex_bytes(&bytes)), position.clone())
+        })?;
+        let mut chars = text.chars();
+        let value = match chars.next() {
+            Some(c) => c,
+            None => return Err(LexerError::UnexpectedToken("''".into(), position)),
+        };
+        // A char literal is exactly one code point; reject e.g. '\x41\x42'.
+        if chars.next().is_some() {
+            return Err(LexerError::UnexpectedToken(format!("'{}'", text), position));
+        }
+        Ok(Some(Token {
+            token_type: TokenType::Char(value),
+            position,
+        }))
+    }
+
+    fn lex_string(&mut self) -> Result<Option<Token>, LexerError> {
+        let position = Position::new(self.line, self.column, self.path.clone());
+        // Accumulate raw UTF-8 bytes so `\x` escapes can spell multi-byte code
+        // points (e.g. "\xc2\xa0"); decode the whole buffer on the closing quote.
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 4];
         while let Some(c) = self.advance() {
             match c {
                 '"' => {
+                    let string = std::str::from_utf8(&bytes)
+                        .map_err(|_| {
+                            LexerError::UnexpectedToken(format_hex_bytes(&bytes), position.clone())
+                        })?
+                        .to_string();
                     return Ok(Some(Token {
                         token_type: TokenType::String(string),
                         position,
                     }));
                 }
-                '\\' => match self.advance() {
-                    Some('\\') => string.push('\\'),
-                    Some('"') => string.push('"'),
-                    Some('n') => string.push('\n'),
-                    Some('t') => string.push('\t'),
-                    Some('r') => string.push('\r'),
-                    Some('0') => string.push('\0'),
-                    Some(c) => {
-                        return Err(LexerError::UnexpectedToken(
-                            format!("\\{}", c),
-                            Position::new(self.line, self.column - 1, self.path.clone()),
-                        ));
-                    }
-                    None => {
-                        return Err(LexerError::UnexpectedEndOfInput(Position::new(
-                            self.line,
-                            self.column,
-                            self.path.clone(),
-                        )));
-                    }
-                },
-                c => string.push(c),
+                '\\' => bytes.push(self.lex_escape_byte()?),
+                c => bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes()),
             }
         }
         Err(LexerError::UnexpectedEndOfInput(Position::new(
@@ -472,6 +494,12 @@ impl NumberTypeHint {
 
 fn is_separator(c: &char) -> bool {
     c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '\\')
+}
+
+/// Renders a raw byte buffer as `\xHH` escapes, for error messages about
+/// byte runs that did not decode to valid UTF-8.
+fn format_hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("\\x{:02x}", b)).collect()
 }
 
 impl<'a> Iterator for Lexer<'a> {

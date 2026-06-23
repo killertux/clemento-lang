@@ -2,6 +2,7 @@ import std::list
 import std::stack(swap touch dup rot rotr drop)
 import std::boolean(Boolean True False)
 import std::char
+import std::cmp(Ordering)
 
 // A String is a List<Char>. concat appends: (head:tail) ++ b = head : (tail ++ b).
 def concat (String String -> String) \{
@@ -57,4 +58,8 @@ def = (String String -> Boolean) \{
             }
         }
     }
+}
+
+def cmp (String String -> Ordering) \{
+    \char::cmp list::cmp
 }

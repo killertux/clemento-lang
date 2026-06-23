@@ -1,6 +1,7 @@
 import std::number::u32
 import std::boolean
 import std::stack(swap)
+import std::cmp
 
 defx from_code_point (U32 -> Char)
 defx to_code_point (Char -> U32)
@@ -13,4 +14,30 @@ def = (Char Char -> boolean::Boolean) \{
 
 def lt (Char Char -> boolean::Boolean) \{
     to_code_point swap to_code_point swap u32::lt
+}
+
+def cmp (Char Char -> cmp::Ordering) \{
+    to_code_point swap to_code_point swap u32::cmp
+}
+
+def is_whitespace (Char -> boolean::Boolean) \{
+    match {
+        '\x20'         -> boolean::True
+        '\x09'         -> boolean::True
+        '\x0a'         -> boolean::True
+        '\x0b'         -> boolean::True
+        '\x0c'         -> boolean::True
+        '\x0d'         -> boolean::True
+        '\xc2\xa0'     -> boolean::True
+        '\xe2\x80\x80' -> boolean::True
+        '\xe2\x80\x81' -> boolean::True
+        '\xe2\x80\x82' -> boolean::True
+        '\xe2\x80\x83' -> boolean::True
+        '\xe2\x80\x89' -> boolean::True
+        '\xe2\x80\x8a' -> boolean::True
+        '\xe2\x80\x8b' -> boolean::True
+        '\xe2\x80\xaf' -> boolean::True
+        '\xe3\x80\x80' -> boolean::True
+        *              -> boolean::False
+    }
 }

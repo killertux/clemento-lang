@@ -1,6 +1,8 @@
 import std::list
 import std::number::u64
-import std::boolean(Boolean)
+import std::boolean(Boolean True False)
+import std::cmp
+import std::stack(dup2 drop2)
 
 defx + (U32 U32 -> U32)
 defx - (U32 U32 -> U32)
@@ -15,3 +17,15 @@ defx gt (U32 U32 -> Boolean)
 defx lt (U32 U32 -> Boolean)
 defx = (U32 U32 -> Boolean)
 defx != (U32 U32 -> Boolean)
+
+def cmp (U32 U32 -> cmp::Ordering) \{
+    dup2 gt match {
+        True -> { drop2 cmp::Greater }
+        False -> {
+            lt match {
+                True -> cmp::Less
+                False -> cmp::Equal
+            }
+        }
+    }
+}
