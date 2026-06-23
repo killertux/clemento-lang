@@ -1,0 +1,16 @@
+import std::list
+import std::stack(swap drop dup)
+import std::number::i64
+import std::boolean(True False)
+import std::io
+
+defp assert_true (boolean::Boolean String -> !io::IO) \{
+    swap match {
+        True -> { drop "Expected value!" io::println }
+        False -> { "Assertion error! " io::print io::println }
+    }
+}
+
+[ 1 2 3 4 5 ] dup
+list::rev [ 5 4 3 2 1 ] \i64::= list::= "Reverse should work" assert_true
+list::rev list::rev [ 1 2 3 4 5 ] \i64::= list::= "Double reverse" assert_true

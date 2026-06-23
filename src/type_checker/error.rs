@@ -46,6 +46,13 @@ pub enum TypeCheckerError {
     EffectConflict(Position, Vec<Effect>, Vec<Effect>),
     #[error("Undeclared effect {1} at {0}. The function performs it but does not declare it (declared: [{d}])", d = fmt_effects(.2))]
     UndeclaredEffect(Position, Effect, Vec<Effect>),
+    #[error(
+        "Quotation captures `{0}` from an enclosing scope at {1}. A `\\{{ ... }}` quotation \
+         takes only stack arguments and captures nothing, so it cannot reference the binding \
+         `{0}` defined outside it. Pass the value on the stack instead (e.g. thread it through \
+         the accumulator), or use a named `def` that takes it as a parameter."
+    )]
+    QuotationCapture(String, Position),
 }
 
 fn fmt_effects(effects: &[Effect]) -> String {

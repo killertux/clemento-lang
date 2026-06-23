@@ -1,0 +1,6 @@
+import std::list
+import std::string
+import std::char
+import std::stack(drop)
+
+"The lazy fox jumps over brown dog" \{ ' ' char::= } string::split dbg drop

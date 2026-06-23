@@ -1,5 +1,5 @@
 import std::list
-import std::stack(swap touch)
+import std::stack(swap touch dup rot rotr drop)
 import std::boolean(Boolean True False)
 import std::char
 
@@ -9,6 +9,37 @@ def concat (String String -> String) \{
         [] -> touch
         [head ... tail] -> { tail swap concat head list::List }
     }
+}
+
+def split (String (Char -> Boolean) -> list::List<String>) \{
+    defp internal_split (String list::List<String> (Char -> Boolean) -> list::List<String>) \{
+        rot match {
+            [] -> { drop touch }
+            [c ... tail] -> {
+                dup rotr c swap apply match {
+                    False -> match {
+                        list::Empty -> {
+                            list::Empty list::Empty c list::List list::List
+                        }
+                        list::List(next element) -> {
+                            element c list::List next swap list::List
+                        }
+                    }
+                    True -> {
+                        match {
+                            list::Empty -> {
+                                list::Empty list::Empty list::List
+                            }
+                            list::List(next element) -> {
+                                next element list::List list::Empty list::List
+                            }
+                        }
+                    }
+                } swap tail rotr internal_split
+            }
+        }
+    }
+    swap list::rev swap [] swap internal_split
 }
 
 def = (String String -> Boolean) \{

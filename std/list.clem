@@ -36,3 +36,7 @@ def fold (List<a> b (b a -> b) -> b) \{
         }
     }
 }
+
+def rev (List<a> -> List<a>) \{
+    Empty \{ List } fold
+}

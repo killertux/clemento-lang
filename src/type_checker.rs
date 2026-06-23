@@ -596,6 +596,16 @@ impl TypeChecker {
                 ))
             }
             AstNodeType::Symbol(symbol) => {
+                // A quotation lowers to a standalone function with no closure, so a
+                // value binding from an enclosing scope cannot be referenced inside
+                // it. Reject the capture here with a clear message rather than
+                // emitting unresolvable IR.
+                if scope.is_captured_value(&symbol, false) {
+                    return Err(TypeCheckerError::QuotationCapture(
+                        symbol.clone(),
+                        node.position.clone(),
+                    ));
+                }
                 let (type_definition, freshenable) =
                     scope.get_definition(vec![symbol.clone()], false).ok_or(
                         TypeCheckerError::SymbolNotFound(symbol.clone(), node.position.clone(), {
@@ -714,6 +724,9 @@ impl TypeChecker {
                 // are inferred from its own body (under-flowed operands become
                 // parameters), never borrowed from the ambient stack.
                 let mut quotation_scope = TypeScope::with_parent(scope.clone());
+                // Mark the capture boundary: value bindings resolved above this
+                // scope would have to be captured, which quotations cannot do.
+                quotation_scope.mark_quotation_boundary();
                 let (sig, mut nodes) = self.type_check_block(
                     &mut quotation_scope,
                     Vec::new(),
@@ -1713,6 +1726,11 @@ struct InnerTypeScope {
     /// their current (privacy-free) qualified access, while member access enforces
     /// privacy.
     members: HashMap<String, TypeScope>,
+    /// Set on the scope of a `\{ ... }` quotation body. Quotations lower to
+    /// standalone functions that take only stack arguments (no closure), so a
+    /// value binding resolved *across* this boundary would have to be captured —
+    /// which is unsupported. Used by `is_captured_value` to reject such captures.
+    is_quotation_boundary: bool,
 }
 
 impl TypeScope {
@@ -1726,7 +1744,35 @@ impl TypeScope {
                 type_definitions: HashMap::new(),
                 effect_definitions: HashMap::new(),
                 members: HashMap::new(),
+                is_quotation_boundary: false,
             })),
+        }
+    }
+
+    /// Marks this scope as a quotation body boundary (see `is_quotation_boundary`).
+    fn mark_quotation_boundary(&self) {
+        self.inner.borrow_mut().is_quotation_boundary = true;
+    }
+
+    /// Whether `symbol` resolves to a *value binding* that lives beyond the
+    /// nearest enclosing quotation boundary — i.e. it would be captured. Function
+    /// definitions, constructors and imports (all `freshenable`, or top-level) are
+    /// fine; only value bindings (`freshenable == false`: eager `def`s and pattern
+    /// bindings) carry SSA values from the enclosing frame that a lifted quotation
+    /// cannot see. A binding local to the quotation (found before crossing the
+    /// boundary) is not a capture.
+    fn is_captured_value(&self, symbol: &str, crossed_quotation: bool) -> bool {
+        let inner = self.inner.borrow();
+        if let Some((_, _, freshenable)) = inner.definitions.get(symbol) {
+            return crossed_quotation && !*freshenable;
+        }
+        if inner.imported_functions.contains_key(symbol) {
+            return false;
+        }
+        let crossed = crossed_quotation || inner.is_quotation_boundary;
+        match inner.parent.as_ref() {
+            Some(parent) => parent.is_captured_value(symbol, crossed),
+            None => false,
         }
     }
 
@@ -1907,6 +1953,7 @@ impl TypeScope {
                 type_definitions: HashMap::new(),
                 effect_definitions: HashMap::new(),
                 members: HashMap::new(),
+                is_quotation_boundary: false,
             })),
         }
     }
@@ -3366,5 +3413,52 @@ def main {
         "#;
         let result = parse_and_type_check(contents, false).expect("should type-check");
         assert!(!result.contains('!'), "dbg must stay pure, got: {result}");
+    }
+
+    #[test]
+    fn quotation_capturing_enclosing_binding_is_rejected() {
+        // A quotation lowers to a standalone function with no closure, so it
+        // cannot reference `cmp`, an eager value binding from the enclosing
+        // function. This must be a clear type error, not broken codegen.
+        let contents = r#"
+            import std::number::i64
+            import std::boolean(Boolean)
+            import std::stack(touch)
+            def f (I64 (I64 -> Boolean) -> Boolean) \{
+                defp cmp touch
+                \{ cmp apply } apply
+            }
+        "#;
+        assert!(matches!(
+            parse_and_type_check(contents, false),
+            Err(TypeCheckerError::QuotationCapture(..))
+        ));
+    }
+
+    #[test]
+    fn quotation_referencing_module_function_is_allowed() {
+        // Referencing a top-level function (not a value binding) inside a
+        // quotation is fine — it lowers to a direct call, not a capture.
+        let contents = r#"
+            import std::list
+            import std::number::i64(+)
+            def sum (list::List<I64> -> I64) \{
+                0 \{ + } list::fold
+            }
+        "#;
+        assert!(parse_and_type_check(contents, false).is_ok());
+    }
+
+    #[test]
+    fn quotation_local_value_binding_is_not_a_capture() {
+        // A value binding *defined inside* the quotation is local, not captured.
+        let contents = r#"
+            import std::number::i64
+            import std::stack(drop)
+            def f ( -> ) \{
+                \{ def x { 5i64 } x drop } drop
+            }
+        "#;
+        assert!(parse_and_type_check(contents, false).is_ok());
     }
 }
