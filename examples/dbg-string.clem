@@ -1,0 +1,17 @@
+import std::list
+import std::io
+import std::option(Some None)
+import std::pair(Pair)
+import std::boolean
+import std::number::i64
+
+// `dbg_string` renders the same representation as `dbg`, but instead of printing
+// to stderr it returns the rendering as a String (consuming the value). Here we
+// print each result to stdout.
+42 dbg_string io::println              // 42
+5 option::Some dbg_string io::println   // Some(value: 5)
+1 2 pair::Pair dbg_string io::println   // Pair(first: 1, second: 2)
+1 1 i64::= dbg_string io::println       // True
+[ 1 2 3 ] dbg_string io::println        // [ 1 2 3]
+"hello world" dbg_string io::println    // "hello world"
+[ "ab" "cd" ] dbg_string io::println    // [ "ab" "cd"]

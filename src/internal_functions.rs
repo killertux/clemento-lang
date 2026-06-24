@@ -105,6 +105,14 @@ pub fn builtins_functions<'ctx>(
             void.fn_type(&[context.context.f64_type().into()], false),
             None,
         );
+        // `dbg_string` capture: redirect the dbg leaf-printers into a buffer,
+        // then turn the buffer into a Clemento String.
+        context
+            .module
+            .add_function("clem_dbg_capture_begin", void.fn_type(&[], false), None);
+        context
+            .module
+            .add_function("clem_dbg_capture_end", ptr_type.fn_type(&[], false), None);
     }
 
     let boolean_type = context

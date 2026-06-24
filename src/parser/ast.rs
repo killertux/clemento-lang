@@ -49,6 +49,10 @@ pub enum AstNodeType<T> {
     /// `dbg`: `<a>(a -> a)` identity that eprintln's a representation of the top
     /// of the stack. Pure (a debug escape hatch).
     Dbg,
+    /// `dbg_string`: `<a>(a -> String)` — renders the same representation as
+    /// `dbg` but, instead of printing to stderr, returns it as a `String`
+    /// (consuming the value). Pure.
+    DbgString,
 }
 
 impl<T> AstNodeType<T> {
@@ -265,6 +269,7 @@ where
             AstNodeType::Todo => write!(f, "todo"),
             AstNodeType::Panic => write!(f, "panic"),
             AstNodeType::Dbg => write!(f, "dbg"),
+            AstNodeType::DbgString => write!(f, "dbg_string"),
         }
     }
 }

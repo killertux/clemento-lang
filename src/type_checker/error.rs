@@ -30,7 +30,10 @@ pub enum TypeCheckerError {
     InvalidPatternForType(Box<UnitType>, Box<Pattern>, Position),
     #[error("Missing wildcard match at {0}")]
     MissingWildcardMatch(Position),
-    #[error("Invalid match body at {2}. Expected {0} but got {1}")]
+    #[error(
+        "Match arm at {2} has stack effect {1}, but the other arms have {0}. \
+         Every arm of a `match` must leave the stack the same way."
+    )]
     InvalidMatchBody(Box<Type>, Box<Type>, Position),
     #[error("Invalid match variant {0} at {1}")]
     InvalidMatchVariant(String, Position),

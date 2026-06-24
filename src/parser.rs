@@ -135,6 +135,11 @@ impl<'a> Parser<'a> {
                         position: token.position,
                         type_definition: None,
                     })),
+                    "dbg_string" => Ok(Some(AstNode {
+                        node_type: AstNodeType::DbgString,
+                        position: token.position,
+                        type_definition: None,
+                    })),
                     _ => Ok(Some(AstNode {
                         node_type: AstNodeType::Symbol(symbol),
                         position: token.position,

@@ -1034,6 +1034,22 @@ impl TypeChecker {
                     Type::new(vec![a.clone()], vec![a]),
                 ))
             }
+            // `dbg_string`: `<a>(a -> String)` — consumes the top value and
+            // pushes its `dbg` rendering as a `String` (= List<Char>). Pure.
+            AstNodeType::DbgString => {
+                let a = UnitType::Var(VarType::new());
+                Ok(AstNodeWithType::new(
+                    AstNodeType::DbgString,
+                    node.position.clone(),
+                    Type::new(
+                        vec![a],
+                        vec![UnitType::Custom {
+                            name: vec!["std".into(), "list".into(), "List".into()],
+                            generic_types: vec![UnitType::Literal(LiteralType::Char)],
+                        }],
+                    ),
+                ))
+            }
         }?;
         Ok(match node.type_definition.clone() {
             Some(ty) => {
@@ -1147,7 +1163,7 @@ impl TypeChecker {
                                 pattern_body_type = Some(check_branch_body_consistency(
                                     &pattern_body_type,
                                     &body_type.type_definition,
-                                    &position,
+                                    &body_type.position,
                                 )?);
                             }
                             all_diverge = all_diverge && body_type.diverges;
@@ -1186,7 +1202,7 @@ impl TypeChecker {
                                 pattern_body_type = Some(check_branch_body_consistency(
                                     &pattern_body_type,
                                     &body_type.type_definition,
-                                    &position,
+                                    &body_type.position,
                                 )?);
                             }
                             all_diverge = all_diverge && body_type.diverges;
@@ -1223,7 +1239,7 @@ impl TypeChecker {
                                 pattern_body_type = Some(check_branch_body_consistency(
                                     &pattern_body_type,
                                     &body_type.type_definition,
-                                    &position,
+                                    &body_type.position,
                                 )?);
                             }
                             all_diverge = all_diverge && body_type.diverges;
@@ -1298,7 +1314,7 @@ impl TypeChecker {
                         pattern_body_type = Some(check_branch_body_consistency(
                             &pattern_body_type,
                             &body_type.type_definition,
-                            &position,
+                            &body_type.position,
                         )?);
                     }
                     all_diverge = all_diverge && body_type.diverges;
@@ -2414,7 +2430,8 @@ def main {
 
         assert_eq!(
             result,
-            "Invalid match body at 4:20. Expected ( -> std::list::List<Char>) but got ( -> I64)"
+            "Match arm at 4:44 has stack effect ( -> I64), but the other arms have \
+             ( -> std::list::List<Char>). Every arm of a `match` must leave the stack the same way."
         );
     }
 
@@ -3485,6 +3502,22 @@ def main {
         "#;
         let result = parse_and_type_check(contents, false).expect("should type-check");
         assert!(!result.contains('!'), "dbg must stay pure, got: {result}");
+    }
+
+    #[test]
+    fn dbg_string_consumes_value_and_returns_string() {
+        // `dbg_string` is `<a>(a -> String)`: it consumes the value and yields
+        // its rendering as a String (= List<Char>), and stays pure.
+        let contents = r#"
+            import std::list
+            import std::number::i64
+            def f (I64 -> String) \{ dbg_string }
+        "#;
+        let result = parse_and_type_check(contents, false).expect("should type-check");
+        assert!(
+            !result.contains('!'),
+            "dbg_string must stay pure, got: {result}"
+        );
     }
 
     #[test]

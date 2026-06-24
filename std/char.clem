@@ -1,6 +1,6 @@
 import std::number::u32
-import std::boolean
-import std::stack(swap)
+import std::boolean(Boolean True False)
+import std::stack(swap drop dup)
 import std::cmp
 
 defx from_code_point (U32 -> Char)
@@ -39,5 +39,42 @@ def is_whitespace (Char -> boolean::Boolean) \{
         '\xe2\x80\xaf' -> boolean::True
         '\xe3\x80\x80' -> boolean::True
         *              -> boolean::False
+    }
+}
+
+def is_ascii (Char -> boolean::Boolean) \{
+    to_code_point 128u32 u32::lt
+}
+
+def is_extended_ascii (Char -> boolean::Boolean) \{
+    to_code_point 256u32 u32::lt
+}
+
+def is_ascii_alphanumeric (Char -> Boolean) \{
+    to_code_point dup 47u32 u32::gt match {
+        False -> { drop False }
+        True -> {
+            dup 58u32 u32::lt match {
+                True -> { drop True }
+                False -> {
+                    dup 64u32 u32::gt match {
+                        False -> { drop False }
+                        True -> {
+                            dup 91u32 u32::lt match {
+                                True -> { drop True }
+                                False -> {
+                                    dup 96u32 u32::gt match {
+                                        False -> { drop False }
+                                        True -> {
+                                            123u32 u32::lt
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

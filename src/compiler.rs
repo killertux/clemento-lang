@@ -1307,6 +1307,39 @@ impl<'ctx> CompilerContext<'ctx> {
                 self.tail_position = false;
                 Ok(())
             }
+            AstNodeType::DbgString => {
+                // Render the top value's representation into a capture buffer
+                // (same printers as `dbg`), turn it into a String, then consume
+                // the original value (the keyword is `<a>(a -> String)`).
+                let value = stack.pop().ok_or(CompilerError::StackUnderflow)?;
+                let begin = self.module.get_function("clem_dbg_capture_begin").ok_or(
+                    CompilerError::GetFunctionError("clem_dbg_capture_begin".into()),
+                )?;
+                self.builder.build_call(begin, &[], "")?;
+                // Borrow-only render (no refcount change) into the active sink.
+                self.emit_dbg(value.0.clone(), value.1)?;
+                let end = self.module.get_function("clem_dbg_capture_end").ok_or(
+                    CompilerError::GetFunctionError("clem_dbg_capture_end".into()),
+                )?;
+                let string = self
+                    .builder
+                    .build_call(end, &[], "dbg_string")?
+                    .try_as_basic_value()
+                    .left()
+                    .ok_or(CompilerError::UnexpectedType)?;
+                // The value is consumed by this keyword: release it now that its
+                // rendering has been captured.
+                self.drop_value(value.0, value.1)?;
+                stack.push((
+                    UnitType::Custom {
+                        name: vec!["std".into(), "list".into(), "List".into()],
+                        generic_types: vec![UnitType::Literal(LiteralType::Char)],
+                    },
+                    string,
+                ));
+                self.tail_position = false;
+                Ok(())
+            }
         }
     }
 

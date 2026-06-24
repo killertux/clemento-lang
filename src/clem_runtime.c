@@ -127,8 +127,19 @@ void *clem_payload(void *node) {
 // libc `putchar`; this mirrors it for stderr without depending on the `stderr`
 // symbol's name/ABI (it is a macro — e.g. `__stderrp` on macOS), which the
 // emitted IR can't portably reference.
+// When non-NULL, the dbg leaf-printers (clem_eprint_* and clem_putchar_err)
+// write here instead of stderr. The `dbg_string` keyword points this at a
+// memory stream so a value's rendering is captured as a String rather than
+// printed. Single-threaded; a `dbg_string` region wraps exactly one printer
+// call, so capture never nests.
+static FILE *clem_dbg_sink = NULL;
+static char *clem_dbg_buf = NULL;
+static size_t clem_dbg_len = 0;
+
+static FILE *clem_dbg_out(void) { return clem_dbg_sink ? clem_dbg_sink : stderr; }
+
 int clem_putchar_err(int c) {
-    return putc(c, stderr);
+    return putc(c, clem_dbg_out());
 }
 
 // --- `todo` / `panic` / `dbg` support -------------------------------------
@@ -147,10 +158,10 @@ void clem_panic(const char *msg, const char *loc) {
     exit(1);
 }
 
-void clem_eprint_cstr(const char *s) { fputs(s, stderr); }
-void clem_eprint_i64(int64_t v) { fprintf(stderr, "%lld", (long long)v); }
-void clem_eprint_u64(uint64_t v) { fprintf(stderr, "%llu", (unsigned long long)v); }
-void clem_eprint_f64(double v) { fprintf(stderr, "%g", v); }
+void clem_eprint_cstr(const char *s) { fputs(s, clem_dbg_out()); }
+void clem_eprint_i64(int64_t v) { fprintf(clem_dbg_out(), "%lld", (long long)v); }
+void clem_eprint_u64(uint64_t v) { fprintf(clem_dbg_out(), "%llu", (unsigned long long)v); }
+void clem_eprint_f64(double v) { fprintf(clem_dbg_out(), "%g", v); }
 
 // List<Char> payload accessors, used by the string helpers below.
 static void *cons_next(const void *node) {
@@ -229,6 +240,27 @@ void *clem_string_from_cstr(const char *s) {
     }
     free(cps);
     return acc;
+}
+
+// Begin capturing dbg output into an in-memory buffer (for `dbg_string`).
+void clem_dbg_capture_begin(void) {
+    clem_dbg_buf = NULL;
+    clem_dbg_len = 0;
+    clem_dbg_sink = open_memstream(&clem_dbg_buf, &clem_dbg_len);
+}
+
+// End capture and return the rendered text as an owned Clemento `String`
+// (refcount 1), resetting the sink back to stderr.
+void *clem_dbg_capture_end(void) {
+    if (clem_dbg_sink) {
+        fclose(clem_dbg_sink); // flushes and finalizes clem_dbg_buf
+        clem_dbg_sink = NULL;
+    }
+    void *result = clem_string_from_cstr(clem_dbg_buf ? clem_dbg_buf : "");
+    free(clem_dbg_buf);
+    clem_dbg_buf = NULL;
+    clem_dbg_len = 0;
+    return result;
 }
 
 // Render a Clemento `String` (List<Char>) into a freshly malloc'd, NUL-terminated
